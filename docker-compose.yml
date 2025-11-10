@@ -1,0 +1,71 @@
+version: '3.8'
+
+services:
+  # PostgreSQL数据库
+  postgres:
+    image: postgres:15-alpine
+    container_name: ai_fraud_postgres
+    environment:
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: ai_fraud_detection
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - ai_fraud_network
+
+  # Redis缓存
+  redis:
+    image: redis:7-alpine
+    container_name: ai_fraud_redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - ai_fraud_network
+
+  # MinIO对象存储
+  minio:
+    image: minio/minio:latest
+    container_name: ai_fraud_minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+    networks:
+      - ai_fraud_network
+
+  # FastAPI应用（可选，也可以本地运行）
+  # api:
+  #   build: .
+  #   container_name: ai_fraud_api
+  #   command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+  #   ports:
+  #     - "8000:8000"
+  #   environment:
+  #     - DATABASE_URL=postgresql+asyncpg://user:password@postgres:5432/ai_fraud_detection
+  #     - REDIS_URL=redis://redis:6379/0
+  #     - MINIO_ENDPOINT=minio:9000
+  #   depends_on:
+  #     - postgres
+  #     - redis
+  #     - minio
+  #   networks:
+  #     - ai_fraud_network
+
+volumes:
+  postgres_data:
+  redis_data:
+  minio_data:
+
+networks:
+  ai_fraud_network:
+    driver: bridge
