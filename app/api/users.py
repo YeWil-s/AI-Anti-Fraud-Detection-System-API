@@ -19,13 +19,11 @@ from app.core.security import verify_password, get_password_hash, create_access_
 
 router = APIRouter(prefix="/api/users", tags=["用户管理"])
 
-
 @router.post("/register",
             response_model=ResponseModel, 
             status_code=status.HTTP_201_CREATED)
 async def register(user_data: UserCreate, db: AsyncSession = Depends(get_db)):
     """用户注册"""
-    
     # TODO: 验证短信验证码
     # if not verify_sms_code(user_data.phone, user_data.sms_code):
     #     raise HTTPException(status_code=400, detail="验证码错误")

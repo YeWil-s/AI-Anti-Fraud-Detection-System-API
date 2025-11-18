@@ -43,10 +43,6 @@ pip install -r requirements.txt
 # 复制环境变量模板
 copy .env.example .env
 
-# 编辑.env文件，修改数据库配置:
-# DATABASE_URL=mysql+aiomysql://root:123456@localhost:3307/ai_fraud_detection
-```
-
 #### 3. 启动Docker服务 (MySQL + Redis + MinIO)
 ```bash
 # 启动MySQL容器 (映射到本地3307端口,避免与本地MySQL冲突)

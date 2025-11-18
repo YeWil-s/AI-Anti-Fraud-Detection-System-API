@@ -45,6 +45,7 @@ app.add_middleware(
 )
 
 # 注册路由
+# 用户路由
 app.include_router(users_router)
 
 
@@ -68,7 +69,7 @@ if __name__ == "__main__":
     import uvicorn
     uvicorn.run(
         "main:app",          # 指定运行的应用：main.py文件中的app实例
-        host="0.0.0.0",          # 监听所有网络
+        host="127.0.0.1",          # 监听所有网络
         port=8000,               # 服务端口（客户端通过8000端口访问）
         reload=settings.DEBUG    # 开发模式下热重载
     )

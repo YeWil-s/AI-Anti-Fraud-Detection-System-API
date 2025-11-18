@@ -15,8 +15,6 @@ from app.core.config import settings
 config = context.config
 
 # 设置数据库URL
-# MySQL: 移除 +asyncpg 或 +aiomysql 后缀，替换为 +pymysql
-# PostgreSQL: 移除 +asyncpg 后缀  
 database_url = settings.DATABASE_URL
 if "+aiomysql" in database_url:
     database_url = database_url.replace("+aiomysql", "+pymysql")
@@ -31,7 +29,6 @@ if config.config_file_name is not None:
 
 # 设置目标元数据
 target_metadata = Base.metadata
-
 
 def run_migrations_offline() -> None:
     """离线迁移模式"""
