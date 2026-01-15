@@ -6,6 +6,11 @@ import io
 import numpy as np
 from typing import Dict, Optional
 import asyncio
+# [新增] 导入日志工厂
+from app.core.logger import get_logger
+
+# [新增] 初始化模块级 logger
+logger = get_logger(__name__)
 
 
 class AudioProcessor:
@@ -24,13 +29,6 @@ class AudioProcessor:
     async def process_chunk(self, audio_data: str, user_id: Optional[int] = None) -> Dict:
         """
         处理音频数据块
-        
-        Args:
-            audio_data: Base64编码的音频数据
-            user_id: 用户ID
-            
-        Returns:
-            处理结果字典
         """
         try:
             # 解码base64数据
@@ -51,6 +49,8 @@ class AudioProcessor:
             }
             
         except Exception as e:
+            # [新增] 即使没有 print，也必须记录异常堆栈，否则无法排查为什么处理失败
+            logger.error(f"Process audio chunk failed: {e}", exc_info=True)
             return {
                 "status": "error",
                 "message": str(e)
@@ -59,12 +59,6 @@ class AudioProcessor:
     async def extract_features(self, audio_bytes: bytes) -> np.ndarray:
         """
         提取音频特征(MFCC等)
-        
-        Args:
-            audio_bytes: 音频字节数据
-            
-        Returns:
-            特征向量
         """
         # TODO: 使用librosa提取MFCC特征
         # import librosa

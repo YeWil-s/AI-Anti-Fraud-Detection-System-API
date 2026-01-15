@@ -36,9 +36,10 @@ def send_sms_code(phone: str) -> bool:
     # 生成验证码
     code = generate_sms_code()
     
+    try:
     # 存储到Redis,有效期5分钟
-    redis_key = f"sms_code:{phone}"
-    redis_client.setex(redis_key, 300, code)
+        redis_key = f"sms_code:{phone}"
+        redis_client.setex(redis_key, 300, code)
     
     # TODO: 接入真实短信服务商API (阿里云/腾讯云)
     # 示例: 阿里云短信SDK
@@ -63,9 +64,13 @@ def send_sms_code(phone: str) -> bool:
     #     print(f"短信发送失败: {e}")
     #     return False
     
-    # 开发环境: 直接打印验证码
-    print(f"[开发模式] 手机号 {phone} 的验证码是: {code}")
-    return True
+        logger.info(f"[DEV_MODE] 手机号 {phone} 的验证码是: {code}")
+        return True
+
+    except Exception as e:
+        # 记录 Redis 连接失败或短信 API 异常
+        logger.error(f"Failed to send SMS to {phone}: {e}", exc_info=True)
+        return False
 
 
 def verify_sms_code(phone: str, code: str) -> bool:
