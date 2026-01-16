@@ -4,14 +4,13 @@
 import base64
 import io
 import numpy as np
-from typing import Dict, Optional
+import librosa  # [新增] 引入音频处理库
+from typing import Dict, Optional, List
 import asyncio
-# [新增] 导入日志工厂
 from app.core.logger import get_logger
 
-# [新增] 初始化模块级 logger
+# 初始化模块级 logger
 logger = get_logger(__name__)
-
 
 class AudioProcessor:
     """音频流处理和切片"""
@@ -34,39 +33,60 @@ class AudioProcessor:
             # 解码base64数据
             audio_bytes = base64.b64decode(audio_data)
             
-            # TODO: 在这里添加实际的音频处理逻辑
-            # 1. 音频格式转换
-            # 2. 特征提取(MFCC)
-            # 3. 调用AI模型检测
+            # [修改] 尝试提取特征以验证音频有效性
+            # 注意：实际的检测逻辑通常在 Celery 任务中通过 model_service 完成
+            # 这里主要是确保上传的音频格式正确且不为空
+            features = await self.extract_features(audio_bytes)
             
-            # 当前返回模拟结果
+            if features is None:
+                return {
+                    "status": "warning",
+                    "message": "Audio extract failed or silent"
+                }
+            
+            # 返回基本信息，特征提取在检测任务中会再次调用(或者你可以选择在这里提取完传给Celery)
             return {
                 "status": "success",
                 "chunk_size": len(audio_bytes),
                 "timestamp": asyncio.get_event_loop().time(),
-                "confidence": 0.95,  # 模拟置信度
-                "is_fake": False  # 模拟检测结果
+                "confidence": 0.0,  # 占位符，实际结果由 Celery 异步推送
+                "is_fake": False
             }
             
         except Exception as e:
-            # [新增] 即使没有 print，也必须记录异常堆栈，否则无法排查为什么处理失败
+            # 记录异常堆栈
             logger.error(f"Process audio chunk failed: {e}", exc_info=True)
             return {
                 "status": "error",
                 "message": str(e)
             }
     
-    async def extract_features(self, audio_bytes: bytes) -> np.ndarray:
+    async def extract_features(self, audio_bytes: bytes) -> Optional[np.ndarray]:
         """
-        提取音频特征(MFCC等)
+        提取音频特征 (MFCC) - 对接 GNB/NMF 统计流模型
         """
-        # TODO: 使用librosa提取MFCC特征
-        # import librosa
-        # y, sr = librosa.load(io.BytesIO(audio_bytes))
-        # mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=13)
-        
-        # 当前返回模拟数据
-        return np.random.rand(13, 100)
+        try:
+            # 1. 加载音频
+            # io.BytesIO 将内存中的 bytes 转为文件对象供 librosa 读取
+            # sr=16000: 统一重采样到 16k，这是语音处理的标准采样率
+            y, sr = librosa.load(io.BytesIO(audio_bytes), sr=16000)
+            
+            # 过滤过短或静音音频
+            if len(y) < 100: 
+                return None
+
+            # 2. 提取 MFCC
+            # n_mfcc=20: 论文中常用的参数，用于捕捉精细的频谱包络
+            mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=20)
+            
+            # 3. 转置特征矩阵 (关键步骤!)
+            # librosa 输出形状是 (n_mfcc, n_frames) -> (20, Time)
+            # Sklearn (GNB/SVM) 模型需要的输入是 (n_samples, n_features) -> (Time, 20)
+            return mfcc.T
+            
+        except Exception as e:
+            logger.error(f"Feature extraction failed: {e}")
+            return None
     
     def add_to_buffer(self, user_id: int, audio_chunk: bytes):
         """添加音频块到缓冲区"""

@@ -8,6 +8,9 @@ import asyncio
 import json
 from datetime import datetime
 
+# [新增] 导入日志
+from app.core.logger import get_logger
+
 from app.db.database import get_db
 from app.core.security import get_current_user_id, decode_access_token
 from app.core.storage import upload_to_minio
@@ -17,83 +20,112 @@ from app.services.video_processor import VideoProcessor
 from app.models.call_record import CallRecord
 from app.schemas import ResponseModel
 
+# [新增] 导入 Celery 任务
+from app.tasks.detection_tasks import detect_video_task, detect_audio_task
+
 router = APIRouter(prefix="/api/detection", tags=["实时检测"])
+logger = get_logger(__name__)
 
-# 音频处理器
-audio_processor = AudioProcessor()
-# 视频处理器
-video_processor = VideoProcessor()
+# [修改] 移除全局处理器实例，改为在 WebSocket 连接内部实例化
+# audio_processor = AudioProcessor()
+# video_processor = VideoProcessor()
 
 
-@router.websocket("/ws/{user_id}")
+# [修改] 路径增加 call_id，用于任务追踪
+@router.websocket("/ws/{user_id}/{call_id}")
 async def websocket_endpoint(
     websocket: WebSocket, 
     user_id: int,
+    call_id: int,  # [新增] 通话ID
     token: str = Query(..., description="JWT认证Token")
 ):
     """
     WebSocket连接端点 - 实时音视频流处理
     
-    连接方式: ws://localhost:8000/api/detection/ws/{user_id}?token={access_token}
-    
-    鉴权:
-    1. 校验URL参数中的Token有效性
-    2. 校验Token中的用户ID是否与路径参数user_id一致
+    连接方式: ws://localhost:8000/api/detection/ws/{user_id}/{call_id}?token={access_token}
     """
-    # 1. 鉴权逻辑
+    # --- 1. 鉴权逻辑 ---
     payload = decode_access_token(token)
     
-    # Token无效或解析失败
     if payload is None:
-        # 使用 1008 Policy Violation 关闭连接
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason="Invalid Token")
         return
 
-    # 验证 Token 中的用户ID是否匹配
     token_user_id = payload.get("sub")
     if token_user_id is None or int(token_user_id) != user_id:
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason="User Identity Mismatch")
         return
 
-    # 2. 鉴权通过，建立连接
+    # --- 2. 建立连接 ---
     await connection_manager.connect(websocket, user_id)
     
+    # [关键] 为每个连接创建独立的处理器实例
+    # 这样可以确保每个通话的帧缓冲区(Buffer)是隔离的
+    # 视频: 设置 sequence_length=10 (积攒10帧才检测)
+    local_video_processor = VideoProcessor(sequence_length=10)
+    # 音频: 用于简单预处理或校验
+    local_audio_processor = AudioProcessor()
+
     try:
         while True:
             # 接收数据
             data = await websocket.receive_text()
             
             try:
-                # 尝试解析JSON命令
                 message = json.loads(data)
+                msg_type = message.get("type")
+                payload = message.get("data")
                 
-                if message.get("type") == "audio":
-                    # 处理音频数据
-                    audio_data = message.get("data")
-                    result = await audio_processor.process_chunk(audio_data, user_id)
+                # --- A. 音频处理 (Scheme B) ---
+                if msg_type == "audio":
+                    # 策略：简单的格式校验在本地做，繁重的 MFCC 提取和推理交给 Celery
+                    if payload:
+                        # 异步投递任务到 Celery 队列
+                        # 参数: (base64_str, user_id, call_id)
+                        detect_audio_task.delay(payload, user_id, call_id)
+                        
+                        # 仅回复接收确认，不等待 Celery 结果(结果会通过 send_personal_message 推送)
+                        await websocket.send_json({
+                            "type": "ack",
+                            "msg_type": "audio",
+                            "timestamp": datetime.now().isoformat()
+                        })
+
+                # --- B. 视频处理 (Scheme A) ---
+                elif msg_type == "video":
+                    # 1. 放入处理器积攒帧
+                    # result 包含: status, input_tensor(如果ready), etc.
+                    result = await local_video_processor.process_frame(payload, user_id)
+                    
+                    # 2. 检查缓冲区状态
+                    if result["status"] == "ready":
+                        # 缓冲区已满 (10帧)，数据准备就绪 -> 呼叫 Celery
+                        logger.info(f"Video batch ready (10 frames), sending to Celery. User: {user_id}")
+                        
+                        # numpy tensor 转 list 以便 JSON 序列化传给 Celery
+                        input_tensor_list = result["input_tensor"].tolist()
+                        
+                        detect_video_task.delay(input_tensor_list, user_id, call_id)
+                    
+                    elif result["status"] == "error":
+                        logger.error(f"Video process error: {result.get('message')}")
+
+                    # 回复确认
                     await websocket.send_json({
-                        "type": "audio_result",
-                        "result": result
+                        "type": "ack",
+                        "msg_type": "video",
+                        "status": result["status"], # buffering / ready
+                        "timestamp": datetime.now().isoformat()
                     })
                     
-                elif message.get("type") == "video":
-                    # 处理视频帧
-                    frame_data = message.get("data")
-                    result = await video_processor.process_frame(frame_data, user_id)
-                    await websocket.send_json({
-                        "type": "video_result",
-                        "result": result
-                    })
-                    
-                elif message.get("type") == "heartbeat":
-                    # 心跳响应
+                # --- C. 心跳维持 ---
+                elif msg_type == "heartbeat":
                     await websocket.send_json({
                         "type": "heartbeat_ack",
                         "timestamp": datetime.now().isoformat()
                     })
                     
             except json.JSONDecodeError:
-                # 如果不是JSON,当作原始数据处理
                 await websocket.send_json({
                     "type": "error",
                     "message": "Invalid message format"
@@ -101,11 +133,16 @@ async def websocket_endpoint(
                 
     except WebSocketDisconnect:
         connection_manager.disconnect(user_id)
-        # 移除该用户的缓冲区数据
-        audio_processor.clear_buffer(user_id)
-        video_processor.clear_buffer(user_id)
-        print(f"User {user_id} disconnected")
+        # [清理] 显式清理缓冲区 (虽然实例销毁也会释放，但这是一个好习惯)
+        local_video_processor.frame_buffers.pop(user_id, None)
+        logger.info(f"User {user_id} disconnected")
+        
+    except Exception as e:
+        logger.error(f"WebSocket error: {e}", exc_info=True)
+        await connection_manager.disconnect(user_id)
 
+
+# --- 以下上传接口逻辑保持不变，只需确保 processor 引用正确 ---
 
 @router.post("/upload/audio", response_model=ResponseModel)
 async def upload_audio(
@@ -114,23 +151,15 @@ async def upload_audio(
     current_user_id: int = Depends(get_current_user_id),
     db: AsyncSession = Depends(get_db)
 ):
-    """
-    上传音频文件到MinIO存储
-    
-    支持格式: mp3, wav, m4a, ogg
-    """
-    # 验证文件类型
-    allowed_types = ["audio/mpeg", "audio/wav", "audio/x-m4a", "audio/ogg"]
+    """上传音频文件到MinIO存储"""
+    allowed_types = ["audio/mpeg", "audio/wav", "audio/x-m4a", "audio/ogg", "audio/mp3"]
     if file.content_type not in allowed_types:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"不支持的音频格式: {file.content_type}"
         )
     
-    # 读取文件内容
     content = await file.read()
-    
-    # 上传到MinIO
     file_url = await upload_to_minio(
         content,
         f"audio/{current_user_id}/{file.filename}",
@@ -140,11 +169,7 @@ async def upload_audio(
     return ResponseModel(
         code=200,
         message="音频上传成功",
-        data={
-            "url": file_url,
-            "filename": file.filename,
-            "size": len(content)
-        }
+        data={"url": file_url, "filename": file.filename, "size": len(content)}
     )
 
 
@@ -155,12 +180,7 @@ async def upload_video(
     current_user_id: int = Depends(get_current_user_id),
     db: AsyncSession = Depends(get_db)
 ):
-    """
-    上传视频文件到MinIO存储
-    
-    支持格式: mp4, avi, mov, webm
-    """
-    # 验证文件类型
+    """上传视频文件到MinIO存储"""
     allowed_types = ["video/mp4", "video/x-msvideo", "video/quicktime", "video/webm"]
     if file.content_type not in allowed_types:
         raise HTTPException(
@@ -168,10 +188,7 @@ async def upload_video(
             detail=f"不支持的视频格式: {file.content_type}"
         )
     
-    # 读取文件内容
     content = await file.read()
-    
-    # 上传到MinIO
     file_url = await upload_to_minio(
         content,
         f"video/{current_user_id}/{file.filename}",
@@ -181,11 +198,7 @@ async def upload_video(
     return ResponseModel(
         code=200,
         message="视频上传成功",
-        data={
-            "url": file_url,
-            "filename": file.filename,
-            "size": len(content)
-        }
+        data={"url": file_url, "filename": file.filename, "size": len(content)}
     )
 
 
@@ -195,18 +208,12 @@ async def extract_video_frames(
     frame_rate: int = 1,
     current_user_id: int = Depends(get_current_user_id)
 ):
-    """
-    从视频中提取关键帧
+    """从视频中提取关键帧"""
+    # 临时实例化一个处理器用于处理此请求
+    temp_processor = VideoProcessor()
     
-    Args:
-        file: 视频文件
-        frame_rate: 每秒提取帧数,默认1帧/秒
-    """
-    # 读取视频内容
     content = await file.read()
-    
-    # 提取帧
-    frames = await video_processor.extract_frames(content, frame_rate)
+    frames = await temp_processor.extract_frames(content, frame_rate)
     
     return ResponseModel(
         code=200,
@@ -214,6 +221,6 @@ async def extract_video_frames(
         data={
             "frame_count": len(frames),
             "frame_rate": frame_rate,
-            "frames": frames  # 返回base64编码的帧
+            "frames": frames
         }
     )
