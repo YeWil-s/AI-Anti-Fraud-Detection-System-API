@@ -6,6 +6,10 @@ from app.services.model_service import model_service
 from app.services.websocket_manager import connection_manager
 # [新增] 引入音频处理器，用于在 Celery 内部提取特征
 from app.services.audio_processor import AudioProcessor
+from app.core.storage import upload_to_minio
+from app.core.config import settings
+import time
+import io
 
 import numpy as np
 import base64
@@ -19,6 +23,28 @@ logger = get_logger(__name__)
 # [新增] 实例化一个全局音频处理器工具 (专门用于 Celery 内部提取特征)
 celery_audio_processor = AudioProcessor()
 
+async def save_raw_data(data: bytes, user_id: int, call_id: int, data_type: str, ext: str):
+    """
+    将原始数据保存到 MinIO 的 dataset 目录
+    路径格式: dataset/{type}/{user_id}/{call_id}_{timestamp}.{ext}
+    """
+    if not settings.COLLECT_TRAINING_DATA:
+        return
+
+    try:
+        timestamp = int(time.time() * 1000) # 毫秒级时间戳
+        filename = f"dataset/{data_type}/{user_id}/{call_id}_{timestamp}.{ext}"
+        
+        # 这里的 content_type 可以稍微宽泛一点
+        content_type = "audio/wav" if data_type == "audio" else "application/octet-stream"
+        
+        # 上传 (不等待返回 URL，不需要阻塞太久)
+        await upload_to_minio(data, filename, content_type=content_type)
+        logger.debug(f"💾 Raw data collected: {filename}")
+        
+    except Exception as e:
+        # 数据采集失败不应影响主业务，仅记录 Warning
+        logger.warning(f"Failed to collect training data: {e}")
 
 @celery_app.task(name="detect_audio", bind=True)
 def detect_audio_task(self, audio_base64: str, user_id: int, call_id: int) -> Dict:
@@ -45,10 +71,15 @@ def detect_audio_task(self, audio_base64: str, user_id: int, call_id: int) -> Di
         # 2. 特征提取 (耗时操作，放在 Celery 中执行)
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-        
         try:
-            # 调用 AudioProcessor.extract_features (librosa)
-            # 注意：extract_features 是 async 函数，需要 run_until_complete
+            # 2. 数据采集 (保存原始音频)
+            # 放在特征提取之前，确保即使提取失败也能拿到原始数据用于分析原因
+            if settings.COLLECT_TRAINING_DATA:
+                loop.run_until_complete(
+                    save_raw_data(audio_bytes, user_id, call_id, "audio", "wav")
+                )
+
+            #   特征提取
             mfcc_features = loop.run_until_complete(
                 celery_audio_processor.extract_features(audio_bytes)
             )
@@ -125,7 +156,20 @@ def detect_video_task(self, frame_data: list, user_id: int, call_id: int) -> Dic
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         try:
-            # 2. 执行 AI 检测
+            # [新增] 2. 数据采集 (保存处理后的 Tensor 数据)
+            # 因为目前传入的是已经预处理过的 Tensor，我们先存为 .npy 格式
+            # 虽然不是最原始的图片，但对于调试 "Tensor -> Model" 这个环节非常有帮助
+            if settings.COLLECT_TRAINING_DATA:
+                # 使用 BytesIO 在内存中保存 npy
+                buffer = io.BytesIO()
+                np.save(buffer, video_tensor)
+                npy_bytes = buffer.getvalue()
+                
+                loop.run_until_complete(
+                    save_raw_data(npy_bytes, user_id, call_id, "video_tensor", "npy")
+                )
+
+            # 3. 执行 AI 检测
             result = loop.run_until_complete(model_service.predict_video(video_tensor))
             
             self.update_state(state='PROCESSING', meta={'progress': 80})

@@ -44,6 +44,22 @@ class Settings(BaseSettings):
     VOICE_MODEL_PATH: str = "./models/voice_detection.onnx"
     VIDEO_MODEL_PATH: str = "./models/video_detection.onnx"
     TEXT_MODEL_PATH: str = "./models/text_detection"
+    # [新增] 数据采集开关 (默认开启，用于积累数据)
+    COLLECT_TRAINING_DATA: bool = True
+
+    # [新增] 视频预处理标准 (ImageNet 标准)
+    # 以后如果模型换了输入尺寸(比如换成 256x256)，改这里就行
+    VIDEO_INPUT_SIZE: tuple = (224, 224) 
+    
+    # 归一化参数 (Mean, Std) - 对应 PyTorch 的 transforms.Normalize
+    VIDEO_NORM_MEAN: list = [0.485, 0.456, 0.406] 
+    VIDEO_NORM_STD: list = [0.229, 0.224, 0.225]
+
+    # [新增] AI 检测阈值配置
+    # 超过此值则判定为 Fake/Scam
+    VOICE_DETECTION_THRESHOLD: float = 0.5   # 声音通常 0.5
+    VIDEO_DETECTION_THRESHOLD: float = 0.6   # 视频误报高，建议 0.6-0.7
+    TEXT_DETECTION_THRESHOLD: float = 0.75   # 文本很容易误判，建议设高
     
     # WebSocket配置
     WS_HEARTBEAT_INTERVAL: int = 30

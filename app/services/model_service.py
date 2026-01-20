@@ -2,16 +2,59 @@
 AI模型服务层
 """
 import onnxruntime as ort
-import joblib  # [新增] 用于加载 sklearn 模型 (GNB, NMF, SVM)
+import joblib  # 用于加载 sklearn 模型 (GNB, NMF, SVM)
 import numpy as np
+import random
 from typing import Dict, Optional
 from pathlib import Path
-from transformers import AutoTokenizer  # [新增] 用于文本分词
+from transformers import AutoTokenizer  # 用于文本分词
 from app.core.config import settings
 from app.core.logger import get_logger
 
 # 初始化模块级 logger
 logger = get_logger(__name__)
+
+class MockInput:
+    """模拟 ONNX 输入节点信息"""
+    def __init__(self, name="input"):
+        self.name = name
+
+class MockOnnxSession:
+    """
+    伪造的 ONNX InferenceSession。
+    当真实模型文件不存在时，使用此类生成随机结果。
+    """
+    def __init__(self, model_type="unknown"):
+        self.model_type = model_type
+        
+    def get_inputs(self):
+        """模拟获取输入节点名称"""
+        # 返回一个带有 name 属性的对象列表，模拟 model.get_inputs()[0].name
+        return [MockInput(name="mock_input")]
+
+    def run(self, output_names, input_feed):
+        """
+        模拟推理过程
+        Args:
+            output_names: 不需要关注
+            input_feed: 字典 {input_name: input_tensor}
+        Returns:
+            list: [logits] (模拟原始输出)
+        """
+        # 1. 获取 Batch Size (通常是输入的第一维)
+        input_tensor = list(input_feed.values())[0]
+        batch_size = input_tensor.shape[0] if hasattr(input_tensor, 'shape') else 1
+        
+        # 2. 生成随机 Logits
+        # 假设是二分类 (Real vs Fake)，输出 shape 为 (Batch, 2)
+        # 生成两个随机数
+        val1 = random.uniform(-1, 1)
+        val2 = random.uniform(-1, 1)
+        
+        # 模拟 logits
+        mock_logits = np.array([[val1, val2]] * batch_size, dtype=np.float32)
+        
+        return [mock_logits]
 
 class ModelService:
     """AI模型加载与推理服务"""
@@ -46,10 +89,10 @@ class ModelService:
                 )
                 logger.info(f"✓ Voice Deep Model loaded: {settings.VOICE_MODEL_PATH}")
             else:
-                logger.warning(f"⚠ Voice Deep model not found: {settings.VOICE_MODEL_PATH}")
+                logger.warning(f"⚠ Voice Deep model not found at {settings.VOICE_MODEL_PATH}, using MOCK.")
+                self.voice_session = MockOnnxSession(model_type="voice")
             
             # B. 统计特征流 (Sklearn: GNB/NMF/SVM)
-            # 假设模型文件存放在 ./models/ml/ 目录下
             ml_path = Path("./models/ml")
             try:
                 if (ml_path / "gnb.pkl").exists():
@@ -70,32 +113,51 @@ class ModelService:
                 )
                 logger.info(f"✓ Video Model loaded: {settings.VIDEO_MODEL_PATH}")
             else:
-                logger.warning(f"⚠ Video model not found: {settings.VIDEO_MODEL_PATH}")
+                logger.warning(f"⚠ Video model not found at {settings.VIDEO_MODEL_PATH}, using MOCK.")
+                self.video_session = MockOnnxSession(model_type="video")
             
             # 3. 加载文本检测模型 (BERT ONNX + Tokenizer)
-            text_path = Path(settings.TEXT_MODEL_PATH) # 例如 ./models/text_bert_onnx
+            text_path = Path(settings.TEXT_MODEL_PATH)
             onnx_file = text_path / "model.onnx"
             
+            # 默认设为 Mock
+            self.text_session = MockOnnxSession(model_type="text") 
+
             if text_path.exists():
                 try:
-                    # 加载分词器 (从本地文件夹)
+                    # 尝试加载真实 Tokenizer
                     self.tokenizer = AutoTokenizer.from_pretrained(str(text_path))
                     
                     if onnx_file.exists():
+                        # 尝试加载真实 Session
                         self.text_session = ort.InferenceSession(
                             str(onnx_file),
                             providers=['CPUExecutionProvider']
                         )
                         logger.info(f"✓ Text Model loaded: {text_path}")
                     else:
-                        logger.warning(f"⚠ Text ONNX file missing: {onnx_file}")
+                        logger.warning(f"⚠ Text ONNX file missing, using Mock session.")
                 except Exception as e:
-                    logger.error(f"Failed to load Text model components: {e}")
+                    logger.error(f"Failed to load Text model components: {e}, using Mock.")
             else:
-                logger.warning(f"⚠ Text model path not found: {settings.TEXT_MODEL_PATH}")
-            
+                logger.warning(f"⚠ Text model path not found: {settings.TEXT_MODEL_PATH}, using Mock.")
+                
         except Exception as e:
             logger.error(f"Error loading models: {e}", exc_info=True)
+
+    # [新增] 辅助方法：计算风险等级
+    def _calculate_risk_level(self, probability: float, threshold: float) -> str:
+        """
+        根据概率和阈值计算风险等级
+        """
+        if probability >= 0.9:
+            return "critical"  # 极高风险
+        elif probability >= threshold:
+            return "high"      # 高风险 (判定为 Fake)
+        elif probability >= (threshold / 2):
+            return "medium"    # 中等风险 (可疑但未达阈值)
+        else:
+            return "low"       # 低风险
     
     async def predict_voice(self, features: np.ndarray) -> Dict:
         """
@@ -112,25 +174,18 @@ class ModelService:
         try:
             # 1. 统计流推理 (GNB -> NMF -> SVM)
             if self.gnb_model and self.nmf_model and self.svm_model:
-                # GNB: 特征 -> 概率空间 (n_frames, 2)
                 prob_feats = self.gnb_model.predict_proba(features)
-                # NMF: 概率空间 -> 潜在模式 (n_frames, n_components)
                 nmf_feats = self.nmf_model.transform(prob_feats)
-                # SVM: 对整段音频的平均特征进行分类
                 avg_feat = np.mean(nmf_feats, axis=0, keepdims=True)
-                score_ml = float(self.svm_model.predict_proba(avg_feat)[0][1]) # Index 1 是 Fake
+                score_ml = float(self.svm_model.predict_proba(avg_feat)[0][1])
                 has_ml = True
 
             # 2. 深度流推理 (ResNet/RawNet ONNX)
             if self.voice_session:
-                # 注意：深度模型通常需要特定的输入形状，例如 (1, 1, n_mels, time)
-                # 这里假设 features 已经适配或模型支持该输入，实际中可能需要 reshape
                 input_name = self.voice_session.get_inputs()[0].name
-                # 为了演示，这里假设模型接受 (Batch, Time, Feat)
                 dl_input = features[np.newaxis, ...].astype(np.float32)
                 output = self.voice_session.run(None, {input_name: dl_input})
                 
-                # Softmax
                 logits = output[0]
                 probs = np.exp(logits) / np.sum(np.exp(logits), axis=1, keepdims=True)
                 score_dl = float(probs[0][1])
@@ -141,7 +196,7 @@ class ModelService:
                 return {"confidence": 0.0, "is_fake": False, "message": "No models loaded"}
             
             if has_ml and has_dl:
-                # 加权融合: 0.4 * ML + 0.6 * DL
+                # 加权融合
                 final_score = 0.4 * score_ml + 0.6 * score_dl
                 method = "hybrid_fusion"
             elif has_ml:
@@ -151,9 +206,16 @@ class ModelService:
                 final_score = score_dl
                 method = "deep_learning_only"
 
+            # [修改] 使用配置阈值 & 计算风险等级
+            threshold = settings.VOICE_DETECTION_THRESHOLD
+            is_fake = final_score > threshold
+            risk_level = self._calculate_risk_level(final_score, threshold)
+
             return {
                 "confidence": final_score,
-                "is_fake": final_score > 0.5, # 阈值
+                "is_fake": is_fake,
+                "risk_level": risk_level,    # [新增]
+                "threshold": threshold,      # [新增]
                 "model_version": "v2.0-hybrid",
                 "method": method,
                 "details": {"ml_score": score_ml, "dl_score": score_dl}
@@ -178,20 +240,25 @@ class ModelService:
             input_name = self.video_session.get_inputs()[0].name
             
             # 2. 执行推理 (ONNX)
-            # 输出通常是 Logits (1, 2)
             outputs = self.video_session.run(None, {input_name: video_tensor})
             logits = outputs[0]
             
             # 3. Softmax 计算概率
-            # exp(x) / sum(exp(x))
-            exp_logits = np.exp(logits - np.max(logits)) # 减去最大值防止溢出
+            exp_logits = np.exp(logits - np.max(logits))
             probs = exp_logits / np.sum(exp_logits, axis=1, keepdims=True)
             
             fake_prob = float(probs[0][1]) # 假设 Index 1 是 Fake 类
             
+            # [修改] 使用配置阈值 & 计算风险等级
+            threshold = settings.VIDEO_DETECTION_THRESHOLD
+            is_deepfake = fake_prob > threshold
+            risk_level = self._calculate_risk_level(fake_prob, threshold)
+            
             return {
                 "confidence": fake_prob,
-                "is_deepfake": fake_prob > 0.6, # 视频检测阈值通常设高一点
+                "is_deepfake": is_deepfake,
+                "risk_level": risk_level,    # [新增]
+                "threshold": threshold,      # [新增]
                 "model_version": "v2.0-lstm",
                 "detection_type": "spatio_temporal"
             }
@@ -206,12 +273,32 @@ class ModelService:
         Args:
             text: 待检测文本
         """
+        # Mock 模式拦截
+        if isinstance(self.text_session, MockOnnxSession):
+             # 模拟随机结果
+            import random
+            prob = random.random()
+            
+            # [修改] Mock 模式也使用配置阈值
+            threshold = settings.TEXT_DETECTION_THRESHOLD
+            is_scam = prob > threshold
+            risk_level = self._calculate_risk_level(prob, threshold)
+            
+            return {
+                "confidence": prob,
+                "is_scam": is_scam,
+                "risk_level": risk_level,
+                "threshold": threshold,
+                "model_version": "mock-text-v1",
+                "keywords": ["mock_risk"] if is_scam else []
+            }
+
+        # 如果真的没加载，才返回错误
         if self.text_session is None or self.tokenizer is None:
             return {"confidence": 0.0, "is_scam": False, "message": "Text model not loaded"}
         
         try:
             # 1. 分词与编码
-            # return_tensors="np" 直接返回 numpy 数组供 ONNX 使用
             inputs = self.tokenizer(
                 text,
                 return_tensors="np",
@@ -221,19 +308,14 @@ class ModelService:
             )
             
             # 2. 准备 ONNX 输入
-            # BERT ONNX 通常需要 input_ids, attention_mask, token_type_ids
-            # 类型必须是 int64
             ort_inputs = {
                 "input_ids": inputs["input_ids"].astype(np.int64),
                 "attention_mask": inputs["attention_mask"].astype(np.int64),
             }
-            
-            # 部分模型可能不需要 token_type_ids，视导出配置而定
             if "token_type_ids" in inputs:
                 ort_inputs["token_type_ids"] = inputs["token_type_ids"].astype(np.int64)
 
             # 3. 执行推理
-            # 输出通常是 Logits (Batch, 2)
             outputs = self.text_session.run(None, ort_inputs)
             logits = outputs[0]
             
@@ -241,13 +323,20 @@ class ModelService:
             exp_logits = np.exp(logits - np.max(logits))
             probs = exp_logits / np.sum(exp_logits, axis=1, keepdims=True)
             
-            scam_prob = float(probs[0][1]) # 假设 Index 1 是 Scam
+            scam_prob = float(probs[0][1])
+            
+            # [修改] 使用配置阈值 & 计算风险等级
+            threshold = settings.TEXT_DETECTION_THRESHOLD
+            is_scam = scam_prob > threshold
+            risk_level = self._calculate_risk_level(scam_prob, threshold)
             
             return {
                 "confidence": scam_prob,
-                "is_scam": scam_prob > 0.7, # 文本误报较多，建议阈值高些
+                "is_scam": is_scam,
+                "risk_level": risk_level,    # [新增]
+                "threshold": threshold,      # [新增]
                 "model_version": "bert-base-finetuned",
-                "keywords": [] # 后续可接关键词匹配逻辑
+                "keywords": [] 
             }
             
         except Exception as e:
