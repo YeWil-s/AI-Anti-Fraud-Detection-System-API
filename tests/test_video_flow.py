@@ -7,7 +7,7 @@ import httpx
 import time
 
 # === 配置 ===
-VIDEO_PATH = "./assets/test_fake.mp4"  # 你的测试视频路径
+VIDEO_PATH = "./assets/fake.mp4"  # 你的测试视频路径
 API_URL = "http://localhost:8000"
 WS_URL = "ws://localhost:8000"
 PHONE = "13800138000"        # 确保数据库里有这个用户
