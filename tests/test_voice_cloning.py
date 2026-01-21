@@ -21,12 +21,12 @@ ASSETS_DIR = CURRENT_DIR / "assets"
 # 定义测试任务
 TEST_CASES = [
     {
-        "filename": "real_me.wav", 
+        "filename": "real_me (2).wav", 
         "description": "【真人母带】", 
         "expect": "Real"
     },
     {
-        "filename": "fake_me.wav", 
+        "filename": "fake_me (2).wav", 
         "description": "【AI克隆】", 
         "expect": "Fake"
     }
