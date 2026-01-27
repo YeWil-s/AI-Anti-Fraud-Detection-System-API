@@ -1,0 +1,54 @@
+# Web Framework
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+python-multipart==0.0.6
+
+# Database
+sqlalchemy==2.0.23
+alembic==1.12.1
+aiomysql==0.2.0
+pymysql==1.1.0
+
+# Redis & Celery
+redis==5.0.1
+celery==5.3.4
+
+# Authentication
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+pydantic[email]==2.5.0
+
+# AI & ML (Core)
+numpy==1.26.4
+torch==2.5.1
+torchvision==0.20.1
+
+# AI & ML (Inference & Processing)
+onnxruntime==1.20.0
+opencv-python==4.10.0.84
+librosa==0.10.2
+
+#视频/音频创新方案依赖
+mediapipe==0.10.13     # 视频预处理核心：FaceMesh
+scikit-learn==1.3.2    # 音频统计流核心：GNB, NMF, SVM
+joblib==1.3.2          # 加载 sklearn 模型
+
+#文本检测依赖
+transformers           # 文本 BERT Tokenizer
+optimum[onnxruntime]   # 用于将 BERT 导出并优化为 ONNX
+
+# WebSocket & Async
+websockets==12.0
+python-socketio==5.10.0
+
+# Storage
+minio==7.2.0
+
+# Utils
+python-dotenv==1.0.0
+pydantic-settings==2.1.0
+requests==2.31.0
+
+# Testing
+pytest==8.3.3
+httpx==0.25.2

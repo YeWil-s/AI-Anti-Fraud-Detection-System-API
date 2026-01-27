@@ -1,0 +1,94 @@
+一、	总体架构设计
+1. 系统概述
+该应用旨在实现AI伪造检测与诈骗预警，在电话、视频通话、语音聊天等实时场景中自动识别 deepfake 声音、图像与视频伪造内容，并在检测到风险时即时提醒用户。
+
+2. 系统组成
+前端（移动端 APP）
+平台：Android + iOS（推荐 Flutter 或 React Native）
+功能：用户交互、通话监听、实时提示、日志展示、家庭账号管理等
+后端（云端服务）
+语言：Python（FastAPI 或 Flask）
+功能：AI检测服务、数据处理、风控策略、日志管理、API接口
+AI 模型层
+模型类型：
+声音伪造检测（声纹匹配、频谱异常检测）
+图像/视频 deepfake 检测（CNN + Transformer）
+文本话术识别（LLM + 特征关键词匹配）
+数据库层
+结构化存储：PostgreSQL / MySQL（用户、通话记录、检测结果）
+非结构化存储：MongoDB / MinIO（语音、截图、视频数据）
+缓存层：Redis（实时检测队列与预警推送）
+
+技术选择
+层级	推荐技术
+前端	Flutter（跨平台）+ WebRTC + WebSocket
+后端	FastAPI + Celery + PostgreSQL / MySQL + Redis
+模型服务	PyTorch + TensorFlow + ONNXRuntime
+存储	PostgreSQL + MinIO + Elasticsearch
+消息推送	Firebase / 阿里云推送
+部署	Docker + Kubernetes + Nginx
+
+3.框架设计
+（1）前端设计路线
+模块	功能	关键实现
+登录/注册	用户身份验证（手机号/微信）	JWT 登录 + 短信验证
+首页	展示检测状态与最近通话安全记录	WebSocket 实时通信
+实时监测	在电话接入时进行AI检测	调用系统API监听通话状态
+家庭中心	查看家人账号风险情况	账号绑定 + 云端数据同步
+日志中心	查看历史检测结果	分页查询 + 图表展示
+设置	语音防护策略、自定义提醒	本地缓存 + 云同步配置
+（2）后端设计路线
+模块	功能	技术栈
+用户管理	注册、登录、绑定家人账号	JWT + PostgreSQL
+通话检测	接收实时语音/视频流并检测	WebRTC + FastAPI Streaming
+声音检测模型	检测伪造语音	PyTorch + MFCC 特征分析
+图像/视频检测模型	检测deepfake视频帧	OpenCV + EfficientNet-B7
+文本检测模型	识别诈骗话术	HuggingFace Transformers
+风险策略引擎	判断是否触发预警	规则引擎 + AI置信度融合
+通知服务	实时推送	WebSocket + Firebase
+日志与审计	存储检测与警告信息	PostgreSQL + Elasticsearch
+（3）数据字典（部分，后续看情况增加）
+表名		字段名	类型	描述
+user		user_id	int	用户唯一标识
+		phone	varchar	用户手机号
+		name	varchar	用户姓名
+		family_id	int	家庭组ID
+				
+call_record		call_id	int	通话唯一标识
+		user_id	int	所属用户
+		start_time	datetime	通话开始时间
+		duration	int	通话时长
+		detected_result	varchar	检测结果标签（safe/suspicious/fake）
+				
+ai_detection_log		log_id	int	检测记录ID
+		call_id	int	对应通话
+		voice_confidence	float	声音伪造置信度
+		video_confidence	float	图像伪造置信度
+		text_confidence	float	文本诈骗话术置信度
+		overall_score	float	综合风险评分
+				
+risk_rule		rule_id	int	风险规则ID
+		keyword	varchar	高危话术关键词
+		action	varchar	提醒动作（提示/拦截）
+				
+number_blacklist		number	varchar	电话号码
+		source	varchar	来源（官方库/用户标记）
+
+4.数据流说明
+（1）实时检测流程
+用户接到电话 →APP监听通话音频/视频流 →
+调用后端API上传音视频片段 →AI模型检测Deepfake痕迹 →
+检测结果返回（含置信度） →APP界面显示实时提示 →如风险高则自动播放防护语音 + 弹窗警告
+（2）事后审计流程
+通话结束 →APP上传录音摘要和关键帧 →
+云端AI再次检测（更高精度模型） →结果更新数据库 →用户与家庭成员收到报告通知
+（3）家庭预警数据流
+家庭组用户A接到高危电话 →后端触发WebSocket推送 →
+家庭成员B手机收到“风险预警”提示 →可查看通话摘要与防诈建议
+5.安全和隐私保护
+（1）通话内容加密存储（AES-256）
+（2）本地仅缓存必要元数据
+（3）用户可选择“隐私模式”禁用上传
+（4）所有检测模型仅分析特征，不反向还原语音或图像
+（5）定期同步官方反诈数据源
+
