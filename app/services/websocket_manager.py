@@ -59,14 +59,38 @@ class ConnectionManager:
             try:
                 await websocket.send_json(message)
             except Exception as e:
-                # [修改] print -> logger.error (广播异常需要重视，可能会阻塞后续发送)
                 logger.error(f"Failed to send broadcast to user {user_id}: {e}", exc_info=True)
     
     async def send_to_family(self, message: dict, family_id: int, family_members: List[int]):
         """发送消息给家庭组成员"""
         for user_id in family_members:
             await self.send_personal_message(message, user_id)
-    
+
+    async def handle_command(self, user_id: int, command_data: dict):
+        """处理控制指令"""
+        action = command_data.get("action")
+        
+        if action == "set_config":
+            # 例如: {"action": "set_config", "fps": 5, "sensitivity": 0.8}
+            fps = command_data.get("fps")
+            if fps:
+                await set_user_preference(user_id, "fps", str(fps))
+                logger.info(f"User {user_id} set FPS to {fps}")
+                
+            sensitivity = command_data.get("sensitivity")
+            if sensitivity:
+                await set_user_preference(user_id, "sensitivity", str(sensitivity))
+                
+            # 可以回执给前端
+            await self.send_personal_message(
+                {"type": "ack", "msg": "Config updated", "config": command_data},
+                user_id
+            )
+            
+        elif action == "pause_detection":
+            # 暂停/恢复检测逻辑 (配合 redis 标记位)
+            await set_user_preference(user_id, "status", "paused")
+
     def get_active_users(self) -> List[int]:
         """获取所有在线用户ID"""
         return list(self.active_connections.keys())

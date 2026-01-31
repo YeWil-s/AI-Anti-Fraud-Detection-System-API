@@ -20,7 +20,10 @@ from app.services.video_processor import VideoProcessor
 from app.models.call_record import CallRecord
 from app.schemas import ResponseModel
 
-# [修正 1] 补充导入 detect_text_task
+# [Day 8 新增] 导入 Redis 工具以恢复状态
+from app.core.redis import get_all_user_preferences
+
+# 导入检测任务
 from app.tasks.detection_tasks import detect_video_task, detect_audio_task, detect_text_task
 
 router = APIRouter(prefix="/api/detection", tags=["实时检测"])
@@ -34,7 +37,7 @@ async def websocket_endpoint(
     token: str = Query(..., description="JWT认证Token")
 ):
     """
-    WebSocket连接端点 - 实时音视频流处理
+    WebSocket连接端点 - 实时音视频流处理 + 控制指令支持
     """
     # --- 1. 鉴权逻辑 ---
     payload = decode_access_token(token)
@@ -51,6 +54,18 @@ async def websocket_endpoint(
     # --- 2. 建立连接 ---
     await connection_manager.connect(websocket, user_id)
     
+    # ==========================================
+    # [Day 8 新增] 连接建立时，从 Redis 恢复该用户的旧配置
+    # ==========================================
+    try:
+        user_prefs = await get_all_user_preferences(user_id)
+        if user_prefs:
+            logger.info(f"🔄 Restored preferences for user {user_id}: {user_prefs}")
+            # 可选: 将恢复的配置发送给前端
+            # await websocket.send_json({"type": "config_sync", "data": user_prefs})
+    except Exception as e:
+        logger.warning(f"Failed to restore user preferences: {e}")
+
     # [关键] 为每个连接创建独立的处理器实例
     # 视频: 设置 sequence_length=10 (积攒10帧才检测)
     local_video_processor = VideoProcessor(sequence_length=10)
@@ -67,6 +82,16 @@ async def websocket_endpoint(
                 msg_type = message.get("type")
                 payload = message.get("data")
                 
+                # ==========================================
+                # [Day 8 新增] 控制指令处理 (Control Plane)
+                # ==========================================
+                if msg_type == "control":
+                    # 前端发送: {"type": "control", "data": {"action": "set_config", "fps": 5}}
+                    logger.info(f"🎮 Received control command from {user_id}: {payload}")
+                    # 交给 Manager 统一处理 (写入 Redis, 回执 ACK)
+                    await connection_manager.handle_command(user_id, payload)
+                    continue
+
                 # --- A. 音频处理 (Scheme B) ---
                 if msg_type == "audio":
                     if payload:
@@ -95,7 +120,6 @@ async def websocket_endpoint(
                         
                         local_video_processor.clear_buffer(user_id) 
                         
-                    # [修正 2] 删除了重复的 error 判断块
                     elif result["status"] == "error":
                         logger.error(f"Video process error: {result.get('message')}")
 
