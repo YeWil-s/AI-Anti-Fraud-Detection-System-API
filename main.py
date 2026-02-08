@@ -145,7 +145,7 @@ app.include_router(users_router)
 app.include_router(detection_router)
 app.include_router(tasks_router)
 app.include_router(call_records_router)
-app.include_router(admin_router, prefix="/admin", tags=["Admin Management"])
+app.include_router(admin_router, prefix="/api/admin", tags=["Admin Management"])
 
 @app.get("/")
 async def root():

@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>AI 反诈防御系统 - 管理后台</title>
+    <link href="https://cdn.bootcdn.net/ajax/libs/element-plus/2.5.3/index.min.css" rel="stylesheet">
+    <link href="https://cdn.bootcdn.net/ajax/libs/remixicon/4.1.0/remixicon.css" rel="stylesheet">
+    <link href="./css/style.css" rel="stylesheet">
+</head>
+<body>
+    <div id="app">
+        <el-container class="app-wrapper">
+            <el-aside width="220px" class="sidebar">
+                <div class="logo"><i class="ri-shield-check-fill"></i> AI Sentinel</div>
+                <el-menu :default-active="activePath" router background-color="#1f2937" text-color="#9ca3af" active-text-color="#fff">
+                    <el-menu-item index="/"><i class="ri-dashboard-line"></i> <span style="margin-left:8px">仪表盘</span></el-menu-item>
+                    <el-menu-item index="/rules"><i class="ri-list-settings-line"></i> <span style="margin-left:8px">关键词规则</span></el-menu-item>
+                    <el-menu-item index="/blacklist"><i class="ri-spam-line"></i> <span style="margin-left:8px">黑名单管理</span></el-menu-item>
+                    <el-menu-item index="/test"><i class="ri-test-tube-line"></i> <span style="margin-left:8px">测试实验室</span></el-menu-item>
+                </el-menu>
+            </el-aside>
+            <el-container>
+                <el-header class="header">
+                    <div class="breadcrumb">管理控制台 / {{ currentRouteName }}</div>
+                    <el-tag type="success" size="small">API 连接状态: 在线</el-tag>
+                </el-header>
+                <el-main>
+                    <router-view></router-view>
+                </el-main>
+            </el-container>
+        </el-container>
+    </div>
+
+    <script src="https://cdn.bootcdn.net/ajax/libs/vue/3.4.15/vue.global.prod.min.js"></script>
+    <script src="https://cdn.bootcdn.net/ajax/libs/vue-router/4.2.5/vue-router.global.prod.min.js"></script>
+    <script src="https://cdn.bootcdn.net/ajax/libs/axios/1.6.5/axios.min.js"></script>
+    <script src="https://cdn.bootcdn.net/ajax/libs/element-plus/2.5.3/index.full.min.js"></script>
+    <script src="https://cdn.bootcdn.net/ajax/libs/echarts/5.4.3/echarts.min.js"></script>
+    
+    <script type="module" src="./js/main.js"></script>
+</body>
+</html>

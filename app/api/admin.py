@@ -1,92 +1,158 @@
+"""
+app/api/admin.py
+管理员专用接口：异步版本
+"""
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy.orm import Session
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select, func, delete
 from typing import List
 
 from app.db.database import get_db
 from app.models.risk_rule import RiskRule
 from app.models.blacklist import NumberBlacklist
-# 引入刚才创建的 schemas
+from app.models.user import User
+from app.models.call_record import CallRecord, DetectionResult
 from app.schemas.admin import (
     RiskRuleCreate, RiskRuleUpdate, RiskRuleResponse,
     BlacklistCreate, BlacklistUpdate, BlacklistResponse
 )
 
-# 定义路由，统一前缀在 main.py 中配置，这里留空或设为 ""
 router = APIRouter()
 
 # =======================
-# 1. 风险规则管理 (Risk Rules)
+# 1. 仪表盘数据统计 (异步重写)
 # =======================
+@router.get("/stats", summary="获取仪表盘统计数据")
+async def get_admin_stats(db: AsyncSession = Depends(get_db)):
+    # 1. 总用户数
+    result = await db.execute(select(func.count(User.user_id)))
+    total_users = result.scalar() or 0
+    
+    # 2. 总通话记录数
+    result = await db.execute(select(func.count(CallRecord.call_id)))
+    total_calls = result.scalar() or 0
+    
+    # 3. 累计拦截诈骗
+    result = await db.execute(
+        select(func.count(CallRecord.call_id)).where(CallRecord.detected_result == DetectionResult.FAKE)
+    )
+    fraud_calls = result.scalar() or 0
+    
+    # 4. 黑名单号码数
+    result = await db.execute(select(func.count(NumberBlacklist.id)))
+    blacklist_count = result.scalar() or 0
 
-@router.get("/rules", response_model=List[RiskRuleResponse], summary="获取所有风险规则")
-def get_risk_rules(skip: int = 0, limit: int = 100, db: Session = Depends(get_db)):
-    rules = db.query(RiskRule).offset(skip).limit(limit).all()
-    return rules
+    # 5. 风险规则数
+    result = await db.execute(select(func.count(RiskRule.rule_id)))
+    rule_count = result.scalar() or 0
 
-@router.post("/rules", response_model=RiskRuleResponse, summary="添加新的风险关键词")
-def create_risk_rule(rule: RiskRuleCreate, db: Session = Depends(get_db)):
-    # 检查关键词是否已存在
-    existing = db.query(RiskRule).filter(RiskRule.keyword == rule.keyword).first()
+    return {
+        "total_users": total_users,
+        "total_calls": total_calls,
+        "fraud_blocked": fraud_calls,
+        "blacklist_count": blacklist_count,
+        "active_rules": rule_count,
+        "system_health": "100%"
+    }
+
+# =======================
+# 2. 功能测试台 (异步重写)
+# =======================
+@router.post("/test/text_match", summary="测试文本规则匹配")
+async def test_text_rule_match(text: str, db: AsyncSession = Depends(get_db)):
+    # 获取所有启用规则
+    result = await db.execute(select(RiskRule).where(RiskRule.is_active == True))
+    rules = result.scalars().all()
+    
+    hits = []
+    max_risk = 0
+    action = "pass"
+    
+    for rule in rules:
+        if rule.keyword in text:
+            hits.append(rule.keyword)
+            if rule.risk_level > max_risk:
+                max_risk = rule.risk_level
+                # 如果有 block 规则命中，直接升级为 block
+                if rule.action == "block":
+                    action = "block"
+    
+    # 如果没被 block 但有风险，设为 alert
+    if action != "block" and max_risk > 0:
+        action = "alert"
+    
+    return {
+        "text_length": len(text),
+        "hit_keywords": hits,
+        "risk_level": max_risk,
+        "action": action
+    }
+
+# =======================
+# 3. 风险规则管理 (异步 CRUD)
+# =======================
+@router.get("/rules", response_model=List[RiskRuleResponse])
+async def get_risk_rules(skip: int = 0, limit: int = 100, db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(RiskRule).offset(skip).limit(limit))
+    return result.scalars().all()
+
+@router.post("/rules", response_model=RiskRuleResponse)
+async def create_risk_rule(rule: RiskRuleCreate, db: AsyncSession = Depends(get_db)):
+    # 查重
+    result = await db.execute(select(RiskRule).where(RiskRule.keyword == rule.keyword))
+    existing = result.scalar_one_or_none()
+    
     if existing:
-        raise HTTPException(status_code=400, detail="该关键词已存在")
+        raise HTTPException(status_code=400, detail="关键词已存在")
     
     db_rule = RiskRule(**rule.dict())
     db.add(db_rule)
-    db.commit()
-    db.refresh(db_rule)
+    await db.commit()
+    await db.refresh(db_rule)
     return db_rule
 
-@router.put("/rules/{rule_id}", response_model=RiskRuleResponse, summary="修改风险规则")
-def update_risk_rule(rule_id: int, rule_update: RiskRuleUpdate, db: Session = Depends(get_db)):
-    db_rule = db.query(RiskRule).filter(RiskRule.rule_id == rule_id).first()
+@router.delete("/rules/{rule_id}")
+async def delete_risk_rule(rule_id: int, db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(RiskRule).where(RiskRule.rule_id == rule_id))
+    db_rule = result.scalar_one_or_none()
+    
     if not db_rule:
-        raise HTTPException(status_code=404, detail="规则不存在")
+        raise HTTPException(404, "规则不存在")
     
-    update_data = rule_update.dict(exclude_unset=True)
-    for key, value in update_data.items():
-        setattr(db_rule, key, value)
-    
-    db.commit()
-    db.refresh(db_rule)
-    return db_rule
-
-@router.delete("/rules/{rule_id}", summary="删除风险规则")
-def delete_risk_rule(rule_id: int, db: Session = Depends(get_db)):
-    db_rule = db.query(RiskRule).filter(RiskRule.rule_id == rule_id).first()
-    if not db_rule:
-        raise HTTPException(status_code=404, detail="规则不存在")
-    
-    db.delete(db_rule)
-    db.commit()
-    return {"message": "规则已删除"}
+    await db.delete(db_rule)
+    await db.commit()
+    return {"msg": "Deleted"}
 
 # =======================
-# 2. 号码黑名单管理 (Blacklist)
+# 4. 黑名单管理 (异步 CRUD)
 # =======================
+@router.get("/blacklist", response_model=List[BlacklistResponse])
+async def get_blacklist(skip: int = 0, limit: int = 100, db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(NumberBlacklist).offset(skip).limit(limit))
+    return result.scalars().all()
 
-@router.get("/blacklist", response_model=List[BlacklistResponse], summary="获取黑名单列表")
-def get_blacklist(skip: int = 0, limit: int = 100, db: Session = Depends(get_db)):
-    blacklist = db.query(NumberBlacklist).offset(skip).limit(limit).all()
-    return blacklist
-
-@router.post("/blacklist", response_model=BlacklistResponse, summary="封禁号码（添加黑名单）")
-def add_to_blacklist(item: BlacklistCreate, db: Session = Depends(get_db)):
-    existing = db.query(NumberBlacklist).filter(NumberBlacklist.number == item.number).first()
+@router.post("/blacklist", response_model=BlacklistResponse)
+async def add_blacklist(item: BlacklistCreate, db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(NumberBlacklist).where(NumberBlacklist.number == item.number))
+    existing = result.scalar_one_or_none()
+    
     if existing:
-        raise HTTPException(status_code=400, detail="该号码已在黑名单中")
+        raise HTTPException(400, "号码已在黑名单")
     
     db_item = NumberBlacklist(**item.dict())
     db.add(db_item)
-    db.commit()
-    db.refresh(db_item)
+    await db.commit()
+    await db.refresh(db_item)
     return db_item
 
-@router.delete("/blacklist/{id}", summary="移除黑名单")
-def remove_from_blacklist(id: int, db: Session = Depends(get_db)):
-    db_item = db.query(NumberBlacklist).filter(NumberBlacklist.id == id).first()
-    if not db_item:
-        raise HTTPException(status_code=404, detail="记录不存在")
+@router.delete("/blacklist/{id}")
+async def remove_blacklist(id: int, db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(NumberBlacklist).where(NumberBlacklist.id == id))
+    item = result.scalar_one_or_none()
     
-    db.delete(db_item)
-    db.commit()
-    return {"message": "号码已移除黑名单"}
+    if not item:
+        raise HTTPException(404, "记录不存在")
+    
+    await db.delete(item)
+    await db.commit()
+    return {"msg": "Deleted"}

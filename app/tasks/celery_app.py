@@ -2,40 +2,43 @@
 Celery应用配置
 """
 from celery import Celery
+# [修正] 必须导入 crontab 才能使用定时任务调度
+from celery.schedules import crontab  
 from app.core.config import settings
 
-# 创建Celery应用实例
+# 初始化Celery应用
 celery_app = Celery(
-    "ai_fraud_detection",
-    broker=settings.CELERY_BROKER_URL,  # Redis作为消息代理
-    backend=settings.CELERY_RESULT_BACKEND  # Redis作为结果后端
+    "fraud_detection",
+    broker=settings.CELERY_BROKER_URL,
+    backend=settings.CELERY_RESULT_BACKEND
 )
 
-# Celery配置
+# 配置Celery
 celery_app.conf.update(
-    task_serializer='json',
-    accept_content=['json'],
-    result_serializer='json',
-    timezone='Asia/Shanghai',
+    task_serializer="json",
+    accept_content=["json"],
+    result_serializer="json",
+    timezone="Asia/Shanghai",
     enable_utc=False,
-    task_track_started=True,  # 追踪任务状态
-    task_time_limit=30 * 60,  # 任务超时时间30分钟
-    worker_prefetch_multiplier=4,  # Worker预取任务数
-    worker_max_tasks_per_child=200,  # Worker最大任务数后重启
+    # 任务过期时间 (防止任务堆积)
+    task_time_limit=1800,  # 30分钟
+    worker_max_tasks_per_child=200,  # 防止内存泄漏
 )
 
-# 定时任务调度配置 (Celery Beat)
+# 自动发现任务模块
+celery_app.autodiscover_tasks([
+    "app.tasks.detection_tasks",
+    "app.tasks.maintenance_tasks"  # 确保这个文件存在
+])
+
+# [修正] 定时任务配置 (Celery Beat)
+# 如果你还没有创建 maintenance_tasks.py，这段代码可能会导致 Celery 启动警告，
+# 但不会导致主程序 main.py 崩溃（只要 crontab 导入了就行）。
 celery_app.conf.beat_schedule = {
-    # 每天凌晨 3:00 执行一次清理任务
-    'clean-db-logs-every-night': {
-        'task': 'clean_old_logs',          # 任务名称 (对应 maintenance_tasks.py 中的 name)
-        'schedule': crontab(hour=3, minute=0), 
-        'args': (30,)                      # 参数: 保留 30 天数据
+    # 每天凌晨3点清理30天前的旧日志
+    'clean-old-logs-every-day': {
+        'task': 'app.tasks.maintenance_tasks.clean_old_logs',
+        'schedule': crontab(hour=3, minute=0),  # <--- 这里就是报错的地方
+        'args': (30,)  # 保留30天数据
     },
 }
-
-# 自动发现任务
-celery_app.autodiscover_tasks(['app.tasks.detection_tasks', 'app.tasks.maintenance_tasks'])
-
-if __name__ == '__main__':
-    celery_app.start()
