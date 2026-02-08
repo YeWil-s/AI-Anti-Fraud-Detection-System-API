@@ -8,17 +8,16 @@ import uuid
 import uvicorn
 import asyncio
 import json
-from redis import asyncio as aioredis  # [新增] 异步 Redis 客户端
-
+from redis import asyncio as aioredis  
 from app.core.config import settings
 from app.db.database import init_db
 from app.api import users_router, detection_router, tasks_router, call_records_router
-from app.services.websocket_manager import connection_manager  # [新增] 导入连接管理器
-
+from app.services.websocket_manager import connection_manager  
+from app.api.admin import router as admin_router
 from app.core.logger import setup_logging, logger, request_id_ctx
 
 # =========================================================
-# [新增] Redis 监听服务 (核心桥梁)
+#  Redis 监听服务 (桥梁)
 # =========================================================
 async def redis_listener():
     """
@@ -146,7 +145,7 @@ app.include_router(users_router)
 app.include_router(detection_router)
 app.include_router(tasks_router)
 app.include_router(call_records_router)
-
+app.include_router(admin_router, prefix="/admin", tags=["Admin Management"])
 
 @app.get("/")
 async def root():

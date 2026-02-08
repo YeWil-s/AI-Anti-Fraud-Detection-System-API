@@ -8,7 +8,8 @@ import enum
 
 class CallPlatform(str, enum.Enum):
     PHONE = "phone"      # 传统电话
-    WECHAT = "wechat"    # 微信
+    WECHAT = "wechat"    # 微信音频
+    VIDEO_CALL = "video_call" # [新增] 视频通话
     QQ = "qq"            # QQ
     OTHER = "other"
 
@@ -31,12 +32,18 @@ class CallRecord(Base):
     start_time = Column(DateTime(timezone=True), nullable=False, comment="通话开始时间")
     end_time = Column(DateTime(timezone=True), nullable=True, comment="通话结束时间")
     duration = Column(Integer, default=0, comment="通话时长(秒)")
+    
     detected_result = Column(
         SQLEnum(DetectionResult),
         default=DetectionResult.SAFE,
         comment="检测结果(safe/suspicious/fake)"
     )
+    
+    # [新增/修改] 媒体存储字段
     audio_url = Column(String(500), nullable=True, comment="录音文件URL")
+    video_url = Column(String(500), nullable=True, comment="视频文件URL(如果是视频通话)") # 新增
+    cover_image = Column(String(500), nullable=True, comment="视频封面/关键帧截图") # 新增
+    
     created_at = Column(DateTime(timezone=True), server_default=func.now(), comment="创建时间")
     
     def __repr__(self):
