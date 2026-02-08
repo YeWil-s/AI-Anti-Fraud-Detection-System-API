@@ -5,6 +5,7 @@ import random
 import redis
 from typing import Optional
 from app.core.config import settings
+from app.core.logger import get_logger
 
 # 创建Redis客户端(用于存储验证码)
 redis_client = redis.Redis.from_url(settings.REDIS_URL, decode_responses=True)  # type: ignore[assignment]
@@ -111,3 +112,28 @@ def get_remaining_time(phone: str) -> Optional[int]:
     redis_key = f"sms_code:{phone}"
     ttl = redis_client.ttl(redis_key)
     return ttl if ttl > 0 else None
+
+def send_fraud_alert_sms(phone: str, name: str, risk_level: str, time_str: str) -> bool:
+    """
+    [新增] 发送诈骗预警短信给家庭管理员
+    
+    Args:
+        phone: 接收者手机号
+        name: 正在通话的用户姓名
+        risk_level: 风险等级
+        time_str: 发生时间
+    """
+    try:
+        # 模拟短信模板: 
+        # "【反诈预警】您的家人{name}正在进行一笔{risk_level}风险通话，请立即确认安全！时间:{time_str}"
+        msg = f"【反诈预警】您的家人 {name} 正在进行 {risk_level} 风险通话，系统判定为高危，请立即干预！"
+        
+        # 实际对接阿里云/腾讯云短信API
+        # ... API 调用代码 ...
+        
+        # 开发环境直接打日志
+        logger.critical(f"📨 [SMS SENT] To: {phone} | Content: {msg}")
+        return True
+    except Exception as e:
+        logger.error(f"Failed to send alert SMS to {phone}: {e}")
+        return False

@@ -6,6 +6,11 @@ from sqlalchemy.sql import func
 from app.db.database import Base
 import enum
 
+class CallPlatform(str, enum.Enum):
+    PHONE = "phone"      # 传统电话
+    WECHAT = "wechat"    # 微信
+    QQ = "qq"            # QQ
+    OTHER = "other"
 
 class DetectionResult(str, enum.Enum):
     """检测结果枚举"""
@@ -21,6 +26,8 @@ class CallRecord(Base):
     call_id = Column(Integer, primary_key=True, index=True, autoincrement=True)
     user_id = Column(Integer, ForeignKey("users.user_id"), nullable=False, index=True, comment="所属用户")
     caller_number = Column(String(20), nullable=True, comment="来电号码")
+    platform = Column(SQLEnum(CallPlatform), default=CallPlatform.PHONE, comment="通话平台")
+    target_name = Column(String(100), nullable=True, comment="对方昵称/备注")
     start_time = Column(DateTime(timezone=True), nullable=False, comment="通话开始时间")
     end_time = Column(DateTime(timezone=True), nullable=True, comment="通话结束时间")
     duration = Column(Integer, default=0, comment="通话时长(秒)")

@@ -1,23 +1,27 @@
 """
-数据库连接配置
+数据库连接配置 - 修复版
+解决 Celery 异步任务中 "Event loop is closed" 问题
 """
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from sqlalchemy.orm import declarative_base
+from sqlalchemy.pool import NullPool  # [新增] 导入 NullPool
 from app.core.config import settings
-# [新增] 导入日志
 from app.core.logger import get_logger
 
-# [新增] 初始化模块级 logger
+# 初始化模块级 logger
 logger = get_logger(__name__)
 
-# 创建异步引擎
+# [修改] 创建异步引擎
+# 关键修改：使用 poolclass=NullPool 禁用连接池
+# 原因：Celery 每个任务会创建独立的 asyncio loop，连接池中的连接如果绑定了旧 loop 会导致 "Event loop is closed" 错误。
 engine = create_async_engine(
     settings.DATABASE_URL,
     echo=settings.DEBUG,
     future=True,
-    pool_pre_ping=True,
-    pool_size=10,
-    max_overflow=20
+    poolclass=NullPool,  # [核心修复] 禁用连接池，每次请求创建新连接
+    # pool_pre_ping=True, # NullPool 不需要预检测
+    # pool_size=10,       # NullPool 不使用这些参数
+    # max_overflow=20
 )
 
 # 创建异步会话工厂
@@ -40,8 +44,7 @@ async def get_db():
             yield session
             await session.commit()
         except Exception as e:
-            # [修改] 发生异常回滚前，记录具体的数据库错误堆栈
-            # 这对于排查 SQL 语法错误、约束冲突非常关键
+            # 发生异常回滚前，记录具体的数据库错误堆栈
             logger.error(f"Database transaction failed, rolling back: {e}", exc_info=True)
             await session.rollback()
             raise
@@ -54,10 +57,7 @@ async def init_db():
     try:
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
-        # [新增] 记录数据库初始化成功
         logger.info("Database schema initialized successfully")
     except Exception as e:
-        # [新增] 启动时连接数据库失败通常是致命的，使用 critical 级别
         logger.critical(f"Database initialization failed: {e}", exc_info=True)
-        # 这里继续抛出异常，阻止应用在数据库未就绪的情况下启动
         raise

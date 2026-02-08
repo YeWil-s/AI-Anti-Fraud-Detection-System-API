@@ -5,10 +5,12 @@ from fastapi import APIRouter, Depends, HTTPException, status, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, and_, func
 from typing import Optional
+from datetime import datetime  
 
 from app.db.database import get_db
 from app.core.security import get_current_user_id
-from app.models.call_record import CallRecord, DetectionResult
+
+from app.models.call_record import CallRecord, DetectionResult, CallPlatform
 from app.models.ai_detection_log import AIDetectionLog
 from app.models.user import User
 from app.schemas import ResponseModel
@@ -24,18 +26,12 @@ async def get_my_call_records(
     current_user_id: int = Depends(get_current_user_id),
     db: AsyncSession = Depends(get_db)
 ):
-    """
-    获取当前用户的通话记录
-    
-    **数据隔离**: 只返回当前登录用户的通话记录
-    """
-    # 核心:强制按user_id过滤
+    """获取当前用户的通话记录"""
     query = select(CallRecord).where(CallRecord.user_id == current_user_id)
     
     if result_filter:
         query = query.where(CallRecord.detected_result == result_filter)
     
-    # 排序和分页
     query = query.order_by(CallRecord.created_at.desc())
     query = query.offset((page - 1) * page_size).limit(page_size)
     
@@ -55,6 +51,8 @@ async def get_my_call_records(
             "records": [
                 {
                     "call_id": r.call_id,
+                    "platform": r.platform.value if r.platform else "phone", # [新增] 返回平台
+                    "target_name": r.target_name,       # [新增] 返回昵称
                     "caller_number": r.caller_number,
                     "start_time": r.start_time.isoformat() if r.start_time else None,
                     "end_time": r.end_time.isoformat() if r.end_time else None,
@@ -74,6 +72,35 @@ async def get_my_call_records(
         }
     )
 
+@router.post("/start", response_model=dict)
+async def start_call(
+    platform: str, 
+    target_identifier: str, # 电话号或微信名
+    user_id: int = Depends(get_current_user_id),
+    db: AsyncSession = Depends(get_db)
+):
+    """开始通话 (App端调用)"""
+    
+    # 简单的参数校验，防止枚举报错
+    try:
+        platform_enum = CallPlatform(platform)
+    except ValueError:
+        platform_enum = CallPlatform.OTHER
+
+    new_call = CallRecord(
+        user_id=user_id,
+        platform=platform_enum,
+        # 如果是电话，存 caller_number；如果是微信/QQ，存 target_name
+        caller_number=target_identifier if platform_enum == CallPlatform.PHONE else None,
+        target_name=target_identifier if platform_enum != CallPlatform.PHONE else None,
+        start_time=datetime.now(),
+        detected_result=DetectionResult.SAFE
+    )
+    db.add(new_call)
+    await db.commit()
+    await db.refresh(new_call)
+    
+    return {"call_id": new_call.call_id, "status": "started"}
 
 @router.get("/record/{call_id}", response_model=ResponseModel)
 async def get_call_record_detail(
@@ -81,27 +108,19 @@ async def get_call_record_detail(
     current_user_id: int = Depends(get_current_user_id),
     db: AsyncSession = Depends(get_db)
 ):
-    """
-    获取单个通话记录详情
-    
-    **数据隔离**: 验证通话记录所有权,防止越权访问
-    """
-    # 核心:同时检查call_id和user_id
+    """获取单个通话记录详情"""
     result = await db.execute(
         select(CallRecord).where(
             and_(
                 CallRecord.call_id == call_id,
-                CallRecord.user_id == current_user_id  # 确保只能访问自己的记录
+                CallRecord.user_id == current_user_id
             )
         )
     )
     record = result.scalar_one_or_none()
     
     if not record:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="通话记录不存在或无权访问"  # 不泄露具体原因
-        )
+        raise HTTPException(status_code=404, detail="记录不存在")
     
     # 查询AI检测日志
     log_result = await db.execute(
@@ -115,23 +134,22 @@ async def get_call_record_detail(
         data={
             "call_record": {
                 "call_id": record.call_id,
+                "platform": record.platform.value if record.platform else "phone",
+                "target_name": record.target_name,
                 "caller_number": record.caller_number,
                 "start_time": record.start_time.isoformat() if record.start_time else None,
                 "end_time": record.end_time.isoformat() if record.end_time else None,
                 "duration": record.duration,
-                "detected_result": record.detected_result.value if record.detected_result else None,
+                "detected_result": record.detected_result.value,
                 "audio_url": record.audio_url,
-                "created_at": record.created_at.isoformat() if record.created_at else None
+                "created_at": record.created_at.isoformat()
             },
+            # 详情页通常需要更详细的AI数据
             "detection_log": {
-                "log_id": detection_log.log_id,
-                "voice_confidence": detection_log.voice_confidence,
-                "video_confidence": detection_log.video_confidence,
-                "text_confidence": detection_log.text_confidence,
                 "overall_score": detection_log.overall_score,
-                "detected_keywords": detection_log.detected_keywords,
-                "model_version": detection_log.model_version,
-                "created_at": detection_log.created_at.isoformat() if detection_log.created_at else None
+                "voice_conf": detection_log.voice_confidence,
+                "video_conf": detection_log.video_confidence,
+                "keywords": detection_log.detected_keywords
             } if detection_log else None
         }
     )

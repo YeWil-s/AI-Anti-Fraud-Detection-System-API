@@ -46,6 +46,7 @@ logs/
 models/*.pth
 models/*.pt
 models/*.onnx
+models/
 
 # Uploads
 uploads/
