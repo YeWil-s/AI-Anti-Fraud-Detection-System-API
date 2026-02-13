@@ -19,6 +19,8 @@ class UserCreate(UserBase):
     password: str = Field(..., min_length=6, max_length=20, description="密码")
     sms_code: str = Field(..., min_length=4, max_length=6, description="短信验证码")
 
+class PhoneRequest(BaseModel):
+    phone: str = Field(..., min_length=11, max_length=11, description="手机号")
 
 class UserLogin(BaseModel):
     """用户登录模型"""

@@ -56,7 +56,7 @@ async def test_single_file(file_path: Path, description: str, expect: str, token
 
     # 建立 WebSocket 连接
     call_id = random.randint(10000, 99999)
-    ws_url = f"ws://localhost:8000/api/detection/ws/{user_id}/{call_id}?token={token}"
+    ws_url = f"ws://127.0.0.1:8000/api/detection/ws/{user_id}/{call_id}?token={token}"
 
     try:
         async with websockets.connect(ws_url) as ws:
@@ -72,7 +72,8 @@ async def test_single_file(file_path: Path, description: str, expect: str, token
                 while True:
                     res = await asyncio.wait_for(ws.recv(), timeout=15.0)
                     msg = json.loads(res)
-                    
+                    data_payload = msg.get("data", {})
+
                     # 收到 ACK 忽略，继续等结果
                     if msg.get("type") == "ack":
                         continue
@@ -80,7 +81,7 @@ async def test_single_file(file_path: Path, description: str, expect: str, token
                     # === 收到检测结果 ===
                     if msg.get("type") == "alert":
                         # AI 判定为假
-                        confidence = msg.get('confidence', 0.0)
+                        confidence = data_payload.get('confidence', 0.0)
                         print(f"   🤖 模型判定: {Colors.RED}[伪造/FAKE]{Colors.ENDC} (置信度: {confidence:.4f})")
                         
                         if expect == "Fake":
@@ -91,7 +92,7 @@ async def test_single_file(file_path: Path, description: str, expect: str, token
                     
                     elif msg.get("type") == "info":
                         # AI 判定为真
-                        confidence = msg.get('confidence', 0.0)
+                        confidence = data_payload.get('confidence', 0.0)
                         print(f"   🤖 模型判定: {Colors.GREEN}[真人/REAL]{Colors.ENDC} (置信度: {confidence:.4f})")
                         
                         if expect == "Real":

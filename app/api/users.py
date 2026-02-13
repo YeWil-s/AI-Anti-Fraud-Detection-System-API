@@ -5,7 +5,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from typing import List
-
+from pydantic import BaseModel
 from app.db.database import get_db
 from app.models.user import User
 from app.schemas import (
@@ -13,6 +13,7 @@ from app.schemas import (
     UserLogin,
     UserResponse,
     TokenResponse,
+    PhoneRequest,
     ResponseModel
 )
 from app.core.security import verify_password, get_password_hash, create_access_token, get_current_user_id
@@ -26,9 +27,10 @@ logger = get_logger(__name__)
 router = APIRouter(prefix="/api/users", tags=["用户管理"])
 
 @router.post("/send-code", response_model=ResponseModel)
-async def send_verification_code(phone: str):
+async def send_verification_code(request: PhoneRequest):
     """发送短信验证码"""
     # 验证手机号格式
+    phone = request.phone
     if len(phone) != 11 or not phone.isdigit():
         logger.debug(f"Invalid phone format: {phone}")
         raise HTTPException(
