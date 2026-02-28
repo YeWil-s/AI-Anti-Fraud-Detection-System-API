@@ -6,6 +6,7 @@ from .call_record import CallRecord, DetectionResult
 from .ai_detection_log import AIDetectionLog
 from .risk_rule import RiskRule
 from .blacklist import NumberBlacklist
+from .message_log import MessageLog
 
 __all__ = [
     "User",
@@ -14,4 +15,5 @@ __all__ = [
     "AIDetectionLog",
     "RiskRule",
     "NumberBlacklist",
+    "MessageLog",
 ]

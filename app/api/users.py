@@ -5,7 +5,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from typing import List
-
+from pydantic import BaseModel
 from app.db.database import get_db
 from app.models.user import User
 from app.schemas import (
@@ -13,7 +13,9 @@ from app.schemas import (
     UserLogin,
     UserResponse,
     TokenResponse,
-    ResponseModel
+    PhoneRequest,
+    ResponseModel,
+    UserUpdateProfile
 )
 from app.core.security import verify_password, get_password_hash, create_access_token, get_current_user_id
 from app.core.sms import verify_sms_code, send_sms_code
@@ -26,9 +28,10 @@ logger = get_logger(__name__)
 router = APIRouter(prefix="/api/users", tags=["用户管理"])
 
 @router.post("/send-code", response_model=ResponseModel)
-async def send_verification_code(phone: str):
+async def send_verification_code(request: PhoneRequest):
     """发送短信验证码"""
     # 验证手机号格式
+    phone = request.phone
     if len(phone) != 11 or not phone.isdigit():
         logger.debug(f"Invalid phone format: {phone}")
         raise HTTPException(
@@ -92,7 +95,9 @@ async def register(user_data: UserCreate, db: AsyncSession = Depends(get_db)):
         phone=user_data.phone,
         username=user_data.username,
         name=user_data.name,
-        password_hash=get_password_hash(user_data.password)
+        password_hash=get_password_hash(user_data.password),
+        role_type=user_data.role_type,
+        guardian_phone=user_data.guardian_phone
     )
     
     try:
@@ -252,4 +257,47 @@ async def unbind_family(
         code=200,
         message="解绑成功",
         data={"user_id": user.user_id}
+    )
+
+@router.put("/profile", response_model=ResponseModel)
+async def update_user_profile(
+    profile_data: UserUpdateProfile,
+    current_user_id: int = Depends(get_current_user_id),
+    db: AsyncSession = Depends(get_db)
+):
+    """[大赛新增] 更新用户画像与监护人信息"""
+    bind_context(user_id=current_user_id)
+    
+    # 查询当前用户
+    result = await db.execute(select(User).where(User.user_id == current_user_id))
+    user = result.scalar_one_or_none()
+    
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="用户不存在"
+        )
+    
+    # 动态更新字段
+    if profile_data.role_type is not None:
+        user.role_type = profile_data.role_type
+    if profile_data.guardian_phone is not None:
+        user.guardian_phone = profile_data.guardian_phone
+        
+    try:
+        await db.commit()
+        await db.refresh(user)
+        logger.info(f"User {current_user_id} profile updated: role={user.role_type}, guardian={user.guardian_phone}")
+    except Exception as e:
+        logger.error(f"Failed to update profile for user {current_user_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="更新画像失败")
+    
+    return ResponseModel(
+        code=200,
+        message="用户画像更新成功",
+        data={
+            "user_id": user.user_id,
+            "role_type": user.role_type,
+            "guardian_phone": user.guardian_phone
+        }
     )

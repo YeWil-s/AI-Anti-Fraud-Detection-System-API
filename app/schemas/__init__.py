@@ -12,6 +12,10 @@ class UserBase(BaseModel):
     phone: str = Field(..., min_length=11, max_length=11, description="手机号")
     username: str = Field(..., min_length=3, max_length=50, description="用户名")
     name: Optional[str] = Field(None, min_length=2, max_length=50, description="用户姓名")
+    
+    # [大赛新增字段: 用户画像与联动]
+    role_type: Optional[str] = Field("青壮年", description="角色类型(如老人、儿童、学生、青壮年)")
+    guardian_phone: Optional[str] = Field(None, min_length=11, max_length=11, description="监护人手机号")
 
 
 class UserCreate(UserBase):
@@ -20,10 +24,20 @@ class UserCreate(UserBase):
     sms_code: str = Field(..., min_length=4, max_length=6, description="短信验证码")
 
 
+class PhoneRequest(BaseModel):
+    phone: str = Field(..., min_length=11, max_length=11, description="手机号")
+
+
 class UserLogin(BaseModel):
     """用户登录模型"""
     phone: str = Field(..., min_length=11, max_length=11, description="手机号")
     password: str = Field(..., min_length=6, max_length=20, description="密码")
+
+
+class UserUpdateProfile(BaseModel):
+    """用户画像更新模型"""
+    role_type: Optional[str] = Field(None, description="角色类型(如老人、儿童、学生、青壮年)")
+    guardian_phone: Optional[str] = Field(None, min_length=11, max_length=11, description="监护人手机号")
 
 
 class UserResponse(UserBase):
@@ -95,7 +109,7 @@ class AIDetectionLogResponse(AIDetectionLogBase):
     model_version: Optional[str] = None
     created_at: datetime
     
-    # 核心修复：合并配置，删除 class Config
+    # 修复：合并配置，删除 class Config
     model_config = ConfigDict(
         from_attributes=True,
         protected_namespaces=()

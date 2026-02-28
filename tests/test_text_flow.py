@@ -120,7 +120,7 @@ async def main():
     print(f"{Colors.BOLD}🚀 开始【文本反诈】对抗测试{Colors.ENDC}")
     
     # 1. 登录获取 Token (使用默认测试账号)
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(trust_env=False, timeout=10.0) as client:
         try:
             # 确保这里使用你数据库中存在的账号
             login_data = {"phone": "13800138000", "password": "123456"}

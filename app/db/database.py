@@ -18,7 +18,7 @@ engine = create_async_engine(
     settings.DATABASE_URL,
     echo=settings.DEBUG,
     future=True,
-    poolclass=NullPool,  # [核心修复] 禁用连接池，每次请求创建新连接
+    poolclass=NullPool,  # 禁用连接池，每次请求创建新连接
     # pool_pre_ping=True, # NullPool 不需要预检测
     # pool_size=10,       # NullPool 不使用这些参数
     # max_overflow=20

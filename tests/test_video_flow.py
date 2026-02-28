@@ -5,11 +5,11 @@ import cv2
 import base64
 import httpx
 import time
-
+import traceback
 # === 配置 ===
 VIDEO_PATH = "./assets/fake.mp4"  # 你的测试视频路径
-API_URL = "http://localhost:8000"
-WS_URL = "ws://localhost:8000"
+API_URL = "http://127.0.0.1:8000"
+WS_URL = "ws://127.0.0.1:8000"
 PHONE = "13800138000"        # 确保数据库里有这个用户
 PASSWORD = "123456"
 
@@ -19,20 +19,28 @@ total_frames = 0         # 视频总帧数
 sent_frames = 0          # 已发送帧数
 
 async def login():
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(trust_env=False, timeout=10.0) as client:
         try:
+            print(f"🔄 正在尝试连接: {API_URL}/api/users/login ...")
             resp = await client.post(f"{API_URL}/api/users/login", json={
                 "phone": PHONE, "password": PASSWORD
             })
+            
             if resp.status_code == 200:
                 data = resp.json()
-                print("✅ 登录成功")  # 精简登录输出
+                print("✅ 登录成功")
                 return data["access_token"], data["user"]["user_id"]
             else:
-                print(f"❌ 登录失败: {resp.text}")
+                print(f"❌ 登录失败 (状态码 {resp.status_code}): {resp.text}")
                 return None, None
+        except httpx.ConnectError as e:
+            print(f"❌ 连接被拒绝: 请检查后端服务是否已在 {API_URL} 启动。")
+            print(f"   错误详情: {e}")
+            return None, None
         except Exception as e:
-            print(f"❌ 连接API失败: {e}")
+            print(f"❌ 发生未知错误: {repr(e)}") # 使用 repr 打印对象详情
+            print("👇 错误堆栈:")
+            traceback.print_exc() # 打印完整堆栈
             return None, None
 
 async def send_video_stream(token, user_id):

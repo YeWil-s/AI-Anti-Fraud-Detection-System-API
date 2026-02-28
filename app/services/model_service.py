@@ -255,7 +255,7 @@ class ModelService:
             logger.error(f"Video prediction failed: {e}", exc_info=True)
             return {"confidence": 0.0, "is_deepfake": False, "error": str(e)}
 
-    def predict_text(self, text: str) -> dict:
+    async def predict_text(self, text: str) -> dict:
         """文本诈骗检测"""
         # 1. 检查模型是否加载
         if not self.text_session or not self.tokenizer or isinstance(self.text_session, MockOnnxSession):
