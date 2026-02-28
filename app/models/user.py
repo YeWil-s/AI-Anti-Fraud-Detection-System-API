@@ -16,9 +16,10 @@ class User(Base):
     name = Column(String(50), nullable=True, comment="用户姓名")
     password_hash = Column(String(255), nullable=False, comment="密码哈希")
     family_id = Column(Integer, nullable=True, index=True, comment="家庭组ID")
+    role_type = Column(String(20), default="青壮年", index=True, comment="角色类型(如老人、儿童、学生、青壮年)")
     is_active = Column(Boolean, default=True, comment="账号是否激活")
     created_at = Column(DateTime(timezone=True), server_default=func.now(), comment="创建时间")
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), comment="更新时间")
     
     def __repr__(self):
-        return f"<User(user_id={self.user_id}, username={self.username}, phone={self.phone})>"
+        return f"<User(user_id={self.user_id}, username={self.username}, role={self.role_type}, phone={self.phone})>"
