@@ -17,6 +17,8 @@ from datetime import datetime
 from sqlalchemy import select
 from app.models.call_record import CallRecord
 
+from app.services.llm_service import llm_service
+from app.models.user import User
 from app.tasks.celery_app import celery_app
 from app.services.model_service import model_service
 from app.services.video_processor import VideoProcessor
@@ -392,7 +394,7 @@ def detect_text_task(self, text: str, user_id: int, call_id: int) -> Dict:
                 # 1. 规则引擎优先匹配
                 rule_hit = None
                 try:
-                    rule_hit = await security_service.match_risk_rules(text, db) 
+                    rule_hit = await security_service.match_risk_rules(text) 
                 except Exception as e:
                     logger.error(f"Risk rule matching failed: {e}")
 
