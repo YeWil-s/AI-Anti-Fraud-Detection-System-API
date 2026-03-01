@@ -1,8 +1,5 @@
 """
-AI检测异步任务 (Celery Worker) - 深度优化版
-1. 消息通知：边缘触发 + 10s冷却 (防止刷屏)
-2. 技术日志：动态采样 (Safe=10s/次, Risk=0.5s/次)
-3. 状态机防抖：集成 Redis 滑动窗口
+AI检测异步任务 (Celery Worker) 
 """
 import redis
 import json
@@ -13,10 +10,12 @@ import time
 import numpy as np
 from typing import Dict, List, Union, Optional
 from datetime import datetime
+from asgiref.sync import async_to_sync
 
 from sqlalchemy import select
 from app.models.call_record import CallRecord
 
+from app.services.memory_service import memory_service
 from app.services.llm_service import llm_service
 from app.models.user import User
 from app.tasks.celery_app import celery_app
@@ -74,9 +73,8 @@ async def ensure_call_record_exists(db, call_id: int, user_id: int) -> datetime:
         logger.error(f"Failed to ensure call record: {e}")
         return datetime.now()
 
-# =========================================================
+
 # [核心辅助函数] 发布控制指令
-# =========================================================
 def publish_control_command(user_id: int, payload: dict):
     """发送控制指令 (如升级防御等级、挂断通话)"""
     try:
@@ -85,9 +83,7 @@ def publish_control_command(user_id: int, payload: dict):
     except Exception as e:
         logger.error(f"Failed to publish control command: {e}")
 
-# =========================================================
 # [核心辅助函数] 视频结果防抖与状态机逻辑
-# =========================================================
 def apply_video_debounce(user_id: int, call_id: int, raw_is_fake: bool) -> dict:
     """
     使用 Redis 实现滑动窗口防抖和状态机
@@ -157,8 +153,6 @@ def detect_audio_task(self, audio_base64: str, user_id: int, call_id: int) -> Di
 
                 if settings.COLLECT_TRAINING_DATA:
                     await save_raw_data(audio_bytes, user_id, call_id, "audio", "wav")
-
-                self.update_state(state='PROCESSING', meta={'progress': 50})
                 
                 result = await model_service.predict_voice(audio_bytes)
                 is_fake = result.get('is_fake', False)
@@ -201,17 +195,16 @@ def detect_audio_task(self, audio_base64: str, user_id: int, call_id: int) -> Di
                 logger.error(f"Audio task failed: {e}", exc_info=True)
                 return {"status": "error", "message": str(e)}
 
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
     try:
-        return loop.run_until_complete(_process())
-    finally:
-        loop.close()
+        return async_to_sync(_process)()
+    except Exception as e:
+        logger.error(f"Task wrapper failed: {e}")
+        return {"status": "error", "message": str(e)}
 
 
 @celery_app.task(name="detect_video", bind=True)
 def detect_video_task(self, frame_data: list, user_id: int, call_id: int) -> Dict:
-    """视频检测任务 (包含 双重DB优化逻辑)"""
+    """视频检测任务 (包含双重DB优化逻辑)"""
     bind_context(user_id=user_id, call_id=call_id)
     # logger.info("Task started: Detect video batch")
 
@@ -369,17 +362,16 @@ def detect_video_task(self, frame_data: list, user_id: int, call_id: int) -> Dic
                 logger.error(f"Video task failed: {e}", exc_info=True)
                 return {"status": "error", "message": str(e)}
 
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
     try:
-        return loop.run_until_complete(_process())
-    finally:
-        loop.close()
+        return async_to_sync(_process)()
+    except Exception as e:
+        logger.error(f"Task wrapper failed: {e}")
+        return {"status": "error", "message": str(e)}
 
 
 @celery_app.task(name="detect_text", bind=True)
 def detect_text_task(self, text: str, user_id: int, call_id: int) -> Dict:
-    """文本检测任务 (Agent重构版)"""
+    """文本检测任务 (Agent重构版 + 长短期记忆池)"""
     bind_context(user_id=user_id, call_id=call_id)
     logger.info(f"Task started: Detect text via Agent (Len: {len(text)})")
 
@@ -387,9 +379,8 @@ def detect_text_task(self, text: str, user_id: int, call_id: int) -> Dict:
         async with AsyncSessionLocal() as db:
             try:
                 await ensure_call_record_exists(db, call_id, user_id)
-                self.update_state(state='PROCESSING', meta={'progress': 0})
                 
-                # 1. 规则引擎优先匹配
+                # 1. 规则引擎优先匹配 (毫秒级阻断)
                 rule_hit = None
                 try:
                     rule_hit = await security_service.match_risk_rules(text)
@@ -399,7 +390,6 @@ def detect_text_task(self, text: str, user_id: int, call_id: int) -> Dict:
                 if rule_hit:
                     logger.warning(f"规则匹配: {rule_hit['keyword']}")
                     risk_level_code = rule_hit.get('risk_level', 1)
-                    
                     await notification_service.handle_detection_result(
                         db=db, user_id=user_id, call_id=call_id,
                         detection_type="文本(规则)", is_risk=True, confidence=1.0,
@@ -408,17 +398,23 @@ def detect_text_task(self, text: str, user_id: int, call_id: int) -> Dict:
                     )
                     return {"status": "success", "result": {"is_fraud": True, "source": "rule"}}
 
-                # 2. 查询用户画像以实现个性化 Prompt
+                # 2. 查询用户画像
                 user_stmt = select(User).where(User.user_id == user_id)
                 user_result = await db.execute(user_stmt)
                 user = user_result.scalar_one_or_none()
                 role_type = user.role_type if user and user.role_type else "青壮年"
                 
-                self.update_state(state='PROCESSING', meta={'progress': 40})
+
+                memory_service.add_message(call_id, text)
+                chat_history = memory_service.get_context(call_id)
                 
-                # 3. 核心：调用 LLM 智能体进行 RAG 检索与意图推理
-                llm_result = await llm_service.analyze_text_risk(text, role_type)
-                self.update_state(state='PROCESSING', meta={'progress': 80})
+                # 3. 调用 LLM 智能体，把“历史记录”一起喂给它！
+                llm_result = await llm_service.analyze_text_risk(
+                    user_input=text, 
+                    chat_history=chat_history, # 传入记忆池参数
+                    role_type=role_type
+                )
+                
                 
                 is_fraud = llm_result.get('is_fraud', False)
                 confidence = llm_result.get('confidence', 0.0)
@@ -432,8 +428,7 @@ def detect_text_task(self, text: str, user_id: int, call_id: int) -> Dict:
                     details=f"AI意图分析: {llm_result.get('analysis')[:50]}..."
                 )
 
-                if is_fraud and risk_level in ['high', 'critical']:
-                    # 发送控制指令，可以在这里把 LLM 给出的 advice 展示给前端
+                if is_fraud and risk_level in ['high', 'critical', 'fake', 'suspicious']:
                     payload_control = {
                         "type": "control", "action": "upgrade_level", "target_level": 2,
                         "config": {
@@ -449,13 +444,11 @@ def detect_text_task(self, text: str, user_id: int, call_id: int) -> Dict:
                 logger.error(f"Text detection task failed: {e}", exc_info=True)
                 return {"status": "error", "message": str(e), "call_id": call_id}
 
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
     try:
-        return loop.run_until_complete(_process())
-    finally:
-        loop.close()
-
+        return async_to_sync(_process)()
+    except Exception as e:
+        logger.error(f"Task wrapper failed: {e}")
+        return {"status": "error", "message": str(e), "call_id": call_id}
 @celery_app.task(name="get_task_status")
 def get_task_status(task_id: str) -> Dict:
     res = celery_app.AsyncResult(task_id)
@@ -474,7 +467,6 @@ def multi_modal_fusion_task(self, text: str, audio_conf: float, video_conf: floa
         async with AsyncSessionLocal() as db:
             try:
                 await ensure_call_record_exists(db, call_id, user_id)
-                self.update_state(state='PROCESSING', meta={'progress': 10})
                 
                 # 1. 优先执行规则匹配
                 rule_hit = None
@@ -498,17 +490,17 @@ def multi_modal_fusion_task(self, text: str, audio_conf: float, video_conf: floa
                 user_result = await db.execute(user_stmt)
                 user = user_result.scalar_one_or_none()
                 role_type = user.role_type if user and user.role_type else "青壮年"
-                
-                self.update_state(state='PROCESSING', meta={'progress': 40})
-                
+
+                memory_service.add_message(call_id, text)
+                chat_history = memory_service.get_context(call_id)
                 # 3. 核心：调用 LLM 大模型进行多模态融合裁定
                 llm_result = await llm_service.analyze_multimodal_risk(
                     user_input=text, 
+                    chat_history=chat_history,  # [关键新增] 传入记忆池参数
                     role_type=role_type, 
                     audio_conf=audio_conf, 
                     video_conf=video_conf
                 )
-                self.update_state(state='PROCESSING', meta={'progress': 80})
                 
                 is_fraud = llm_result.get('is_fraud', False)
                 risk_level = llm_result.get('risk_level', 'safe')
@@ -542,9 +534,8 @@ def multi_modal_fusion_task(self, text: str, audio_conf: float, video_conf: floa
                 logger.error(f"多模态融合任务彻底崩溃: {e}", exc_info=True)
                 return {"status": "error", "message": str(e), "call_id": call_id}
 
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
     try:
-        return loop.run_until_complete(_process())
-    finally:
-        loop.close()
+        return async_to_sync(_process)()
+    except Exception as e:
+        logger.error(f"Task wrapper failed: {e}")
+        return {"status": "error", "message": str(e), "call_id": call_id}
