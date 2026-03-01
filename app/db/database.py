@@ -1,39 +1,34 @@
 """
-数据库连接配置 - 修复版
-解决 Celery 异步任务中 "Event loop is closed" 问题
+数据库连接配置 
 """
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from sqlalchemy.orm import declarative_base
-from sqlalchemy.pool import NullPool  # [新增] 导入 NullPool
+from sqlalchemy.pool import NullPool 
 from app.core.config import settings
 from app.core.logger import get_logger
-
+import sys
 # 初始化模块级 logger
 logger = get_logger(__name__)
 
-# [修改] 创建异步引擎
-# 关键修改：使用 poolclass=NullPool 禁用连接池
-# 原因：Celery 每个任务会创建独立的 asyncio loop，连接池中的连接如果绑定了旧 loop 会导致 "Event loop is closed" 错误。
+IS_CELERY = "celery" in sys.argv[0] or "celery" in sys.modules
+# 针对不同环境应用不同的连接池策略
+if IS_CELERY:
+    logger.info("运行Celery: 使用 NullPool.")
+    pool_kwargs = {"poolclass": NullPool}
+else:
+    logger.info("运行在 Web 环境: 使用标准连接池.")
+    pool_kwargs = {"pool_pre_ping": True, "pool_size": 20, "max_overflow": 20}
+
 engine = create_async_engine(
     settings.DATABASE_URL,
     echo=settings.DEBUG,
     future=True,
-    poolclass=NullPool,  # 禁用连接池，每次请求创建新连接
-    # pool_pre_ping=True, # NullPool 不需要预检测
-    # pool_size=10,       # NullPool 不使用这些参数
-    # max_overflow=20
+    **pool_kwargs
 )
 
-# 创建异步会话工厂
 AsyncSessionLocal = async_sessionmaker(
-    engine,
-    class_=AsyncSession,
-    expire_on_commit=False,
-    autocommit=False,
-    autoflush=False
+    engine, class_=AsyncSession, expire_on_commit=False, autocommit=False, autoflush=False
 )
-
-# 创建基类
 Base = declarative_base()
 
 

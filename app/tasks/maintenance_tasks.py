@@ -8,7 +8,7 @@ from app.models.ai_detection_log import AIDetectionLog
 from app.models.message_log import MessageLog
 from sqlalchemy import delete
 from datetime import datetime, timedelta
-import asyncio
+from asgiref.sync import async_to_sync  #导入同步转换工具
 from app.core.logger import get_logger
 
 logger = get_logger(__name__)
@@ -26,7 +26,7 @@ def clean_old_logs_task(days_to_keep: int = 30):
             try:
                 cutoff_date = datetime.now() - timedelta(days=days_to_keep)
                 
-                # 1. 清理 AI 检测流水日志 (量最大)
+                # 1. 清理 AI 检测流水日志 
                 result_ai = await db.execute(
                     delete(AIDetectionLog).where(AIDetectionLog.created_at < cutoff_date)
                 )
@@ -40,7 +40,7 @@ def clean_old_logs_task(days_to_keep: int = 30):
                 
                 await db.commit()
                 
-                logger.info(f"Cleanup finished. Deleted: {deleted_ai_count} AI logs, {deleted_msg_count} messages.")
+                logger.info(f"清理完成. 删除: {deleted_ai_count} AI 日志, {deleted_msg_count} 消息.")
                 return {"status": "success", "deleted_ai": deleted_ai_count, "deleted_msg": deleted_msg_count}
                 
             except Exception as e:
@@ -48,10 +48,11 @@ def clean_old_logs_task(days_to_keep: int = 30):
                 await db.rollback()
                 return {"status": "error", "message": str(e)}
 
-    # 在 Celery 同步环境中运行异步 DB 操作
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
+
+    # [修改] 使用 async_to_sync 代替手动的 loop 管理
+    # 这能确保在 Celery 的多线程环境（-P threads）中安全运行异步 DB 操作
     try:
-        return loop.run_until_complete(_process())
-    finally:
-        loop.close()
+        return async_to_sync(_process)()
+    except Exception as e:
+        logger.error(f"Maintenance task wrapper failed: {e}")
+        return {"status": "error", "message": str(e)}
