@@ -54,3 +54,11 @@ temp/
 
 # Docker
 docker-compose.override.yml
+
+# 忽略 Chroma 数据目录/文件
+chroma_data/
+*.bin
+# 若有随机命名的 Chroma 目录（如 UUID 命名），补充：
+[0-9a-f]*-[0-9a-f]*-[0-9a-f]*-[0-9a-f]*-[0-9a-f]*/
+
+tests/
