@@ -1,5 +1,5 @@
 """
-短信验证码服务
+短信验证码服务-未接入SDK（阿里云/腾讯云）
 """
 import random
 import redis

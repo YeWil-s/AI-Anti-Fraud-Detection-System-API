@@ -6,10 +6,9 @@ from typing import Dict, List
 import asyncio
 from datetime import datetime
 from app.core.redis import set_user_preference
-# [新增] 导入日志工厂
 from app.core.logger import get_logger
 
-# [新增] 初始化模块级 logger
+# 初始化模块级 logger
 logger = get_logger(__name__)
 
 
@@ -31,11 +30,9 @@ class ConnectionManager:
         self.connection_times[user_id] = datetime.now()
         # 初始防御等级为 Level 0 (安全/待机)
         self.user_levels[user_id] = 0
-
-        # 记录当前在线人数，这是非常关键的运维指标
+        # 记录当前在线人数
         logger.info(f"User {user_id} connected. Total connections: {len(self.active_connections)}")
 
-   
     def disconnect(self, user_id: int):
         """断开连接"""
         if user_id in self.user_levels:
@@ -45,7 +42,6 @@ class ConnectionManager:
         if user_id in self.connection_times:
             del self.connection_times[user_id]
             
-        # [修改] print -> logger.info
         logger.info(f"User {user_id} disconnected. Total connections: {len(self.active_connections)}")
 
     # 设置防御等级并同步给前端   
@@ -62,7 +58,7 @@ class ConnectionManager:
             message = {
                 "type": "level_sync",
                 "level": level,  # 0, 1, 2
-                "config": config or {}, # 包含 fps, sensitive 等配置
+                "config": config or {}, 
                 "timestamp": datetime.now().isoformat()
             }
             try:
@@ -82,7 +78,8 @@ class ConnectionManager:
     
     async def broadcast(self, message: dict, exclude_user: int = None):
         """广播消息给所有连接(可排除某个用户)"""
-        for user_id, websocket in self.active_connections.items():
+        # 加上 list() 转换为静态列表，防止字典在迭代期间被修改导致崩溃
+        for user_id, websocket in list(self.active_connections.items()):
             if exclude_user and user_id == exclude_user:
                 continue
             try:
@@ -92,7 +89,8 @@ class ConnectionManager:
     
     async def send_to_family(self, message: dict, family_id: int, family_members: List[int]):
         """发送消息给家庭组成员"""
-        for user_id in family_members:
+        # 为了安全，套上 list()
+        for user_id in list(family_members):
             await self.send_personal_message(message, user_id)
 
     async def handle_command(self, user_id: int, command_data: dict):
@@ -100,7 +98,6 @@ class ConnectionManager:
         action = command_data.get("action")
         
         if action == "set_config":
-            # 例如: {"action": "set_config", "fps": 5, "sensitivity": 0.8}
             fps = command_data.get("fps")
             if fps:
                 await set_user_preference(user_id, "fps", str(fps))
@@ -110,14 +107,12 @@ class ConnectionManager:
             if sensitivity:
                 await set_user_preference(user_id, "sensitivity", str(sensitivity))
                 
-            # 可以回执给前端
             await self.send_personal_message(
                 {"type": "ack", "msg": "Config updated", "config": command_data},
                 user_id
             )
             
         elif action == "pause_detection":
-            # 暂停/恢复检测逻辑 (配合 redis 标记位)
             await set_user_preference(user_id, "status", "paused")
 
     def get_active_users(self) -> List[int]:
@@ -149,8 +144,6 @@ class ConnectionManager:
                         "timestamp": datetime.now().isoformat()
                     })
                 except Exception:
-                    # 连接已断开，加入清理列表
-                    # [可选] 这里不需要 log error，因为心跳检测的目的就是发现断连
                     logger.debug(f"Heartbeat failed for user {user_id}, marking for cleanup")
                     disconnected_users.append(user_id)
             
