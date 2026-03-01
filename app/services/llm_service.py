@@ -35,21 +35,30 @@ class LLMService:
 
         # 核心：多模态反诈智能体系统提示词
         self.prompt_template = ChatPromptTemplate.from_messages([
-            ("system", """你是一个国家级的反诈智能体助手，具备强大的意图识别与推理能力。
-你的任务是保护用户免受电信网络诈骗。
+            ("system", """你是一个国家级的多模态反诈智能体助手，具备强大的意图识别与复杂逻辑推理能力。
+你的任务是综合分析【用户对话文本】和【底层AI鉴伪模型的视觉/听觉特征得分】，保护用户免受欺诈。
 
 【当前用户的角色画像】：{role_type}
-注意：请严格根据用户的角色画像动态调整你的风险容忍度和审查重点。以下是不同人群的易受骗场景，当输入内容触发对应场景时，请直接提高风险等级：
-- 针对“老人”：要对推销特效药/保健品、高息养老投资理财、冒充公检法恐吓扣款、以及冒充亲友遭遇车祸/疾病等紧急情况要求转账的信息极度敏感。
-- 针对“学生”：要对网络兼职刷单赚佣金、声称注销校园贷/修复不良征信、非官方渠道低价售卖演唱会门票、以及游戏账号/装备私下交易类信息高度警惕。
-- 针对“孩子（儿童）”：要对免费领取游戏皮肤/道具、承诺解除防沉迷系统、诱导索要父母手机验证码/扫码付款、以及冒充网警恐吓要抓捕父母的信息实施“零容忍”级别的拦截。
-- 针对“青壮年”：要对所谓内部渠道的高回报投资（杀猪盘）、无需征信的虚假网络贷款平台、冒充电商或快递客服主动理赔退款、以及冒充公司领导/老板要求紧急过桥垫资类信息保持严密防范。
+注意：请严格根据用户的角色画像动态调整你的风险容忍度、审查重点和提醒的方式。以下是不同人群的易受骗场景：
+- 老人：对推销特效药、高息养老理财、冒充公检法恐吓、冒充亲友要求转账极度敏感。
+- 学生：对兼职刷单、注销校园贷、非官方低价票、游戏账号交易高度警惕。
+- 孩子：对免费领游戏皮肤、解除防沉迷、诱导索要父母验证码零容忍。
+- 青壮年：对内部高回报投资(杀猪盘)、虚假网贷、冒充老板过桥垫资保持防范。
+
 【知识库参考案例（RAG检索结果）】：
 {context}
 
-请分析用户的输入，判断是否存在诈骗风险，并严格按照 JSON 格式输出结果。
+【底层AI模型多模态特征分析结果】（极其重要！）：
+- 语音伪造(Voice Clone)置信度：{audio_conf} （0~1.0，>0.7通常代表极有可能是AI合成变声）
+- 视频伪造(Deepfake)置信度：{video_conf} （0~1.0，>0.75通常代表画面经过AI换脸或唇形篡改）
+
+【多模态融合决策规则】：
+1. 交叉验证：如果文本内容是“我是你领导/亲人，快打钱”，且【语音/视频伪造置信度】处于高位，这必定是极其危险的 AI 拟声/换脸诈骗，必须判定为 is_fraud=True，risk_level="critical"。
+2. 纠正误报：如果【语音置信度】较高（比如0.72），但对话文本完全是正常业务（例如快递员送件“喂你的快递到了”），请结合常识判定为安全，纠正底层音频模型的误报。
+
+请综合推理，并严格按照 JSON 格式输出最终裁定结果。
 {format_instructions}"""),
-            ("human", "【用户输入内容】：{user_input}")
+            ("human", "【用户输入内容(含语音转写)】：{user_input}")
         ])
 
     async def analyze_text_risk(self, user_input: str, role_type: str = "青壮年") -> dict:
@@ -57,10 +66,10 @@ class LLMService:
         全链路文本风控分析
         """
         try:
-            # 1. 检索 ChromaDB 获取相似案例 (Day 2 的成果)
+            # 1. 检索 ChromaDB 获取相似案例
             context = vector_db.get_context_for_llm(user_input, n_results=2)
             
-            # 2. 构建处理链条 (Chain)
+            # 2. 构建处理链条 
             chain = self.prompt_template | self.llm | self.output_parser
             
             # 3. 异步调用大模型
@@ -68,14 +77,16 @@ class LLMService:
                 "role_type": role_type,
                 "context": context,
                 "user_input": user_input,
+                "audio_conf": f"{audio_conf:.4f}",
+                "video_conf": f"{video_conf:.4f}",
                 "format_instructions": self.output_parser.get_format_instructions()
             })
             
-            logger.info(f"LLM Assessment Success: {response['risk_level']} | Fraud: {response['is_fraud']}")
+            logger.info(f"融合决策完成: 判定诈骗={response['is_fraud']} | 等级={response['risk_level']} | A_conf={audio_conf:.2f} | V_conf={video_conf:.2f}")
             return response
             
         except Exception as e:
-            logger.error(f"LLM Service Error: {e}")
+            logger.error(f"LLM 融合分析异常: {e}")
             # 降级处理：模型报错时默认返回安全
             return {
                 "is_fraud": False, "risk_level": "safe", "confidence": 0.0,

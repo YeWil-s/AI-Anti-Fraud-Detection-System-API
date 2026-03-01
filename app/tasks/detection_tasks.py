@@ -379,60 +379,71 @@ def detect_video_task(self, frame_data: list, user_id: int, call_id: int) -> Dic
 
 @celery_app.task(name="detect_text", bind=True)
 def detect_text_task(self, text: str, user_id: int, call_id: int) -> Dict:
-    """文本检测任务"""
+    """文本检测任务 (Agent重构版)"""
     bind_context(user_id=user_id, call_id=call_id)
-    # logger.info(f"Task started: Detect text (Len: {len(text)})")
+    logger.info(f"Task started: Detect text via Agent (Len: {len(text)})")
 
     async def _process():
         async with AsyncSessionLocal() as db:
             try:
-                # [关键修复] 确保 CallRecord 存在
                 await ensure_call_record_exists(db, call_id, user_id)
-
                 self.update_state(state='PROCESSING', meta={'progress': 0})
                 
                 # 1. 规则引擎优先匹配
                 rule_hit = None
                 try:
-                    rule_hit = await security_service.match_risk_rules(text) 
+                    rule_hit = await security_service.match_risk_rules(text)
                 except Exception as e:
                     logger.error(f"Risk rule matching failed: {e}")
 
                 if rule_hit:
-                    # logger.warning(f"⚠️ RISK RULE MATCHED: {rule_hit['keyword']}")
+                    logger.warning(f"规则匹配: {rule_hit['keyword']}")
                     risk_level_code = rule_hit.get('risk_level', 1)
                     
                     await notification_service.handle_detection_result(
-                        db=db,
-                        user_id=user_id,
-                        call_id=call_id,
-                        detection_type="文本(规则)",
-                        is_risk=True,
-                        confidence=1.0,
+                        db=db, user_id=user_id, call_id=call_id,
+                        detection_type="文本(规则)", is_risk=True, confidence=1.0,
                         risk_level="high" if risk_level_code >= 4 else "medium",
                         details=f"触发敏感词: {rule_hit['keyword']}"
                     )
-                    return {"status": "success", "result": "rule_hit"}
+                    return {"status": "success", "result": {"is_fraud": True, "source": "rule"}}
 
-                # 2. AI 模型推理
-                result = await model_service.predict_text(text)
+                # 2. 查询用户画像以实现个性化 Prompt
+                user_stmt = select(User).where(User.user_id == user_id)
+                user_result = await db.execute(user_stmt)
+                user = user_result.scalar_one_or_none()
+                role_type = user.role_type if user and user.role_type else "青壮年"
+                
+                self.update_state(state='PROCESSING', meta={'progress': 40})
+                
+                # 3. 核心：调用 LLM 智能体进行 RAG 检索与意图推理
+                llm_result = await llm_service.analyze_text_risk(text, role_type)
                 self.update_state(state='PROCESSING', meta={'progress': 80})
                 
-                is_fraud = (result.get('label') == 'fraud')
-                confidence = result.get('confidence', 0.0)
+                is_fraud = llm_result.get('is_fraud', False)
+                confidence = llm_result.get('confidence', 0.0)
+                risk_level = llm_result.get('risk_level', 'safe')
 
+                # 4. 通知服务
                 await notification_service.handle_detection_result(
-                    db=db,
-                    user_id=user_id,
-                    call_id=call_id,
-                    detection_type="文本(AI)",
-                    is_risk=is_fraud,
-                    confidence=confidence,
-                    risk_level="high" if is_fraud else "safe",
-                    details=f"AI语义分析: {result.get('label')}"
+                    db=db, user_id=user_id, call_id=call_id,
+                    detection_type="文本(大模型)", is_risk=is_fraud, confidence=confidence,
+                    risk_level=risk_level,
+                    details=f"AI意图分析: {llm_result.get('analysis')[:50]}..."
                 )
 
-                return {"status": "success", "result": result, "call_id": call_id}
+                if is_fraud and risk_level in ['high', 'critical']:
+                    # 发送控制指令，可以在这里把 LLM 给出的 advice 展示给前端
+                    payload_control = {
+                        "type": "control", "action": "upgrade_level", "target_level": 2,
+                        "config": {
+                            "ui_message": f"智能体预警: {llm_result.get('advice')}",
+                            "warning_mode": "modal"
+                        }
+                    }
+                    publish_control_command(user_id, payload_control)
+
+                return {"status": "success", "result": llm_result, "call_id": call_id}
                 
             except Exception as e:
                 logger.error(f"Text detection task failed: {e}", exc_info=True)
@@ -449,3 +460,91 @@ def detect_text_task(self, text: str, user_id: int, call_id: int) -> Dict:
 def get_task_status(task_id: str) -> Dict:
     res = celery_app.AsyncResult(task_id)
     return {"task_id": task_id, "status": res.status, "result": res.result if res.successful() else None}
+
+@celery_app.task(name="multi_modal_fusion", bind=True)
+def multi_modal_fusion_task(self, text: str, audio_conf: float, video_conf: float, user_id: int, call_id: int) -> Dict:
+    """
+    多模态融合决策引擎任务
+    接收 ASR 文本、音频鉴伪分数、视频鉴伪分数，交由 LLM 智能体综合裁定
+    """
+    bind_context(user_id=user_id, call_id=call_id)
+    logger.info(f"Task started: Multi-Modal Fusion (A:{audio_conf:.2f}, V:{video_conf:.2f}, TextLen:{len(text)})")
+
+    async def _process():
+        async with AsyncSessionLocal() as db:
+            try:
+                await ensure_call_record_exists(db, call_id, user_id)
+                self.update_state(state='PROCESSING', meta={'progress': 10})
+                
+                # 1. 优先执行规则匹配
+                rule_hit = None
+                try:
+                    rule_hit = await security_service.match_risk_rules(text)
+                except Exception as e:
+                    logger.error(f"融合引擎 - 规则匹配异常: {e}")
+
+                if rule_hit:
+                    logger.warning(f"融合引擎 - 触发高危强规则: {rule_hit['keyword']}")
+                    # 直接触发告警，无需消耗大模型 Token
+                    await notification_service.handle_detection_result(
+                        db=db, user_id=user_id, call_id=call_id,
+                        detection_type="多模态(强规则)", is_risk=True, confidence=1.0,
+                        risk_level="critical", details=f"命中强规则: {rule_hit['keyword']}"
+                    )
+                    return {"status": "success", "result": {"is_fraud": True, "source": "rule"}}
+
+                # 2. 查询用户画像，为 LLM 提供个性化参数
+                user_stmt = select(User).where(User.user_id == user_id)
+                user_result = await db.execute(user_stmt)
+                user = user_result.scalar_one_or_none()
+                role_type = user.role_type if user and user.role_type else "青壮年"
+                
+                self.update_state(state='PROCESSING', meta={'progress': 40})
+                
+                # 3. 核心：调用 LLM 大模型进行多模态融合裁定
+                llm_result = await llm_service.analyze_multimodal_risk(
+                    user_input=text, 
+                    role_type=role_type, 
+                    audio_conf=audio_conf, 
+                    video_conf=video_conf
+                )
+                self.update_state(state='PROCESSING', meta={'progress': 80})
+                
+                is_fraud = llm_result.get('is_fraud', False)
+                risk_level = llm_result.get('risk_level', 'safe')
+
+                # 4. 记录最终决策日志并通知前端
+                await notification_service.handle_detection_result(
+                    db=db, user_id=user_id, call_id=call_id,
+                    detection_type="多模态(Agent融合)", is_risk=is_fraud, 
+                    confidence=llm_result.get('confidence', 0.0),
+                    risk_level=risk_level,
+                    details=f"Agent裁定: {llm_result.get('analysis')[:60]}..."
+                )
+
+                # 5. 如果判定为中高危，发布 websocket 控制指令到前端 APP
+                if is_fraud and risk_level in ['suspicious', 'fake']:
+                    payload_control = {
+                        "type": "control", 
+                        "action": "upgrade_level", 
+                        "target_level": 2 if risk_level == 'fake' else 1,
+                        "config": {
+                            "ui_message": f"智能防诈守卫: {llm_result.get('advice')}",
+                            "warning_mode": "modal",
+                            "block_call": (risk_level == 'fake')
+                        }
+                    }
+                    publish_control_command(user_id, payload_control)
+
+                return {"status": "success", "result": llm_result, "call_id": call_id}
+                
+            except Exception as e:
+                logger.error(f"多模态融合任务彻底崩溃: {e}", exc_info=True)
+                return {"status": "error", "message": str(e), "call_id": call_id}
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        return loop.run_until_complete(_process())
+    finally:
+        loop.close()
