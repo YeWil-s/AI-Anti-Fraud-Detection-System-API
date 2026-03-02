@@ -7,11 +7,13 @@ import asyncio
 from langchain_openai import ChatOpenAI
 from langchain.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import JsonOutputParser
-from pydantic.v1 import BaseModel, Field  # [关键修复] 兼容 Pydantic V2
-
+from pydantic.v1 import BaseModel, Field 
+from typing import List
 from app.core.config import settings
 from app.core.logger import get_logger
 from app.services.vector_db_service import vector_db
+from app.models.user import User
+from app.models.call_record import CallRecord
 
 logger = get_logger(__name__)
 
@@ -118,5 +120,73 @@ class LLMService:
                 "is_fraud": False, "risk_level": "safe", "confidence": 0.0,
                 "analysis": "大模型调用异常，降级通过", "advice": "系统繁忙"
             }
+    
+    async def generate_security_report(self, user: User, recent_calls: List[CallRecord]) -> str:
+        """
+        生成个人安全监测报告
+        根据用户的画像和近期通话记录，生成 Markdown 格式的反诈总结报告
+        """
+        # 1. 整理用户的近期通话摘要
+        call_summary = ""
+        risk_count = 0
+        
+        if not recent_calls:
+            call_summary = "该用户近期无通话记录。"
+        else:
+            for call in recent_calls:
+                # 提取风险判定状态
+                status = "高风险(诈骗)" if call.detected_result.name == 'FAKE' else "安全"
+                if status == "高风险(诈骗)":
+                    risk_count += 1
+                
+                start_time_str = call.start_time.strftime("%Y-%m-%d %H:%M:%S") if call.start_time else "未知时间"
+                
+                call_summary += (
+                    f"- 时间：{start_time_str}\n"
+                    f"  号码：{call.target_number}\n"
+                    f"  判定结果：{status}\n"
+                    f"  检测详情：{call.detection_details or '无'}\n\n"
+                )
+
+        # 2. 构建 Prompt
+        system_prompt = """你是一个国家级的反诈风控专家。
+请根据提供的【用户画像】和【近期通话检测记录】，为该用户生成一份专属的《个人反诈安全监测报告》。
+
+报告要求：
+1. 必须使用 Markdown 格式排版，包含标题、加粗、列表等元素，使其美观易读。
+2. 结构建议包含：
+   -  核心评估结论（综合安全评级：如优秀、良好、极度危险）
+   -  近期风险数据回顾（拦截了几次，主要是什么类型的诈骗）
+   -  暴露的薄弱点分析（根据被骗的话术和人群特征分析）
+   -  专属防骗建议（必须结合该用户的【角色类型】给出定制化、可操作的建议）
+3. 语气要专业、关怀，像一个贴心的私人安全顾问。如果风险很高，语气要严厉警示。"""
+
+        user_content = f"""
+【用户画像】
+- 用户姓名：{user.name or user.username}
+- 角色类型：{user.role_type} (如老人、学生、青壮年等)
+- 监护人已绑定：{'是' if user.guardian_phone else '否'}
+
+【近期通话检测记录】(共 {len(recent_calls)} 条，其中高风险 {risk_count} 条)
+{call_summary}
+"""
+        # 3. 调用大模型
+        try:
+            messages = [
+                ("system", system_prompt),
+                ("human", user_content)
+            ]
+            
+            # 使用一个普通的会话链（不需要 JSON 解析器，直接输出文本）
+            from langchain.prompts import ChatPromptTemplate
+            prompt = ChatPromptTemplate.from_messages(messages)
+            chain = prompt | self.llm
+            
+            response = await chain.ainvoke({})
+            return response.content
+            
+        except Exception as e:
+            logger.error(f"Failed to generate security report: {e}")
+            return "## 报告生成失败\n系统当前繁忙，无法生成安全报告，请稍后再试。"
 
 llm_service = LLMService()

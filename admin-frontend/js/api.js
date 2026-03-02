@@ -27,5 +27,11 @@ export default {
     delBlacklist: (id) => api.delete(`/admin/blacklist/${id}`),
 
     // 测试台
-    testTextMatch: (text) => api.post('/admin/test/text_match', null, { params: { text } })
+    testTextMatch: (text) => api.post('/admin/test/text_match', null, { params: { text } }),
+
+    // ===================================
+    // 诈骗案例学习管理 (Day 7 新增)
+    // ===================================
+    getFraudCases: () => api.get('/admin/fraud-cases'),
+    learnCase: (callId) => api.post(`/admin/fraud-cases/${callId}/learn`)
 };

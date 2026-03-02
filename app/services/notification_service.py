@@ -102,6 +102,7 @@ class NotificationService:
         family_members = await db.execute(
             select(User).where(
                 User.family_id == victim.family_id,
+                User.is_admin == True,
                 User.user_id != current_user_id
             )
         )
