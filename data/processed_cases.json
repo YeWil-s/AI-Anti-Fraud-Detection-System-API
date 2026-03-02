@@ -51,7 +51,7 @@
         "content": "【语音转写】女士，我是抖音平台的工作人员，给你致电是想通知你一下，你在上个月2月6号申请的抖音直播会员，今天审核已经通过银联中心的话，会对你们银行卡，信用卡进行扣除。这个直播会员的费用一个月是扣除800元的费用，一年12个月是扣除9600元的费用，我这边给你来电是想跟你核实一下是不是你本人自愿申请的，女士？",
         "risk_level": "极高危",
         "source": "搜狗微信搜索'反诈'案例",
-        "file_path": "/tests/assets/fake_audio_01.mp3"
+        "file_path": "/tests/assets/fake_audio_01.wav"
       },
       {
         "id": "case_audio_002",
@@ -60,7 +60,7 @@
         "content": "【语音转写】协助调查公文，但是你可能要和公安局配合调查，协助调查。我并没有说你犯法了，你现在是不能过来咱们公安局是不是？那刘女士，骗子并不会叫你过来公安局的，你有这种防范意识非常的好。但是真的假的你要分清楚理解吗？我骗你过来公安局干什么呢？[对方自称是赣州市公安局的办案民警，说刘女士涉及到一起今年2月份侦办的非法集资案，其中有一张银行卡属于刘女士。]那当时开办这张卡登记的身份证号，我念给你听，360731***，请问有没有通知过你。你怎么说你没有办过这张卡，是什么情况？那你办这张卡是办来做什么使用的？",
         "risk_level": "极高危",
         "source": "搜狗微信搜索'反诈'案例",
-        "file_path": "/tests/assets/fake_audio_02.mp3"
+        "file_path": "/tests/assets/fake_audio_02.wav"
       },
       {
         "id": "case_audio_003",
@@ -69,7 +69,7 @@
         "content": "【语音转写】您好，先生，我这边是深圳航空客服中心的，很抱歉的通知您。您明天的从深圳宝安飞往北京首都的航班，因为机械故障取消了。请问一下您这边是需要帮您改签还是退票？",
         "risk_level": "极高危",
         "source": "搜狗微信搜索'反诈'案例",
-        "file_path": "/tests/assets/fake_audio_03.mp3"
+        "file_path": "/tests/assets/fake_audio_03.wav"
       },
       {
         "id": "case_audio_004",
@@ -78,7 +78,7 @@
         "content": "【语音转写】这边是圆通快递，您在网上买了个衣服给你弄丢了，从湖北武汉寄到甘肃武威的。运单尾号3243。对我都跟你说给你弄丢了。你看你是买多少钱，我们加一个运费险一起赔付给您。我们这边加一个运费险，赔你150块钱，赔你150块钱，您自己再买一下可以吗？给您对接到我们财务这边，由我们财务的工作人员给您转账过去。您这边有没有用这个UC link。云会议你以前用听过没有？这个云会议是我们财务用的一个办公会议。我们财务他没用微信，也没用支付宝，他是我们财务这边是系统转账，就是需要您加入到我们财务的会议窗口以后，财务这边给您转账过去。",
         "risk_level": "极高危",
         "source": "搜狗微信搜索'反诈'案例",
-        "file_path": "/tests/assets/fake_audio_04.mp3"
+        "file_path": "/tests/assets/fake_audio_04.wav"
       },
       {
         "id": "case_audio_005",
@@ -87,7 +87,7 @@
         "content": "【语音转写】王伯伯，我开车刮蹭到别人车子了，需要赔偿5000块钱，可是我身上也没有现金。刚刚在给您买补品的时候，信用卡额度都用完了，怎么办，王伯伯。",
         "risk_level": "高危",
         "source": "搜狗微信搜索'反诈'案例",
-        "file_path": "/tests/assets/fake_audio_05.mp3"
+        "file_path": "/tests/assets/fake_audio_05.wav"
       },
       {
         "id": "case_video_001",
@@ -182,7 +182,7 @@
         "content": "【语音转写】拿好你的票，我们到家得十一点多了吧。差不多。",
         "risk_level": "安全",
         "source": "日常模拟录制",
-        "file_path": "/tests/assets/real_audio_01.mp4"
+        "file_path": "/tests/assets/real_audio_01.wav"
       },
       {
         "id": "case_white_007",
@@ -191,7 +191,7 @@
         "content": "【语音转写】农夫山泉，我们不生产水，我们只是大自然的搬运工。",
         "risk_level": "安全",
         "source": "日常录制",
-        "file_path": "/tests/assets/real_audio_02.mp4"
+        "file_path": "/tests/assets/real_audio_02.wav"
       },
       {
         "id": "case_white_008",
@@ -200,7 +200,7 @@
         "content": "【语音转写】喂，您好美团外卖，您的外卖到了，在门口了。",
         "risk_level": "安全",
         "source": "日常录制",
-        "file_path": "/tests/assets/real_audio_03.mp4"
+        "file_path": "/tests/assets/real_audio_03.wav"
       },
       {
         "id": "case_white_009",
@@ -209,7 +209,7 @@
         "content": "【语音转写】您好先生，打扰您一下，您的房子最近有出售或出租的打算吗？好嘞，抱歉，打扰您了。",
         "risk_level": "安全",
         "source": "日常录制",
-        "file_path": "/tests/assets/real_audio_04.mp4"
+        "file_path": "/tests/assets/real_audio_04.wav"
       },
       {
         "id": "case_white_010",
@@ -218,7 +218,7 @@
         "content": "【语音转写】这是我给你买的最近网上爆火的杨枝甘露固体版。",
         "risk_level": "安全",
         "source": "日常录制",
-        "file_path": "/tests/assets/real_audio_05.mp4"
+        "file_path": "/tests/assets/real_audio_05.wav"
       },
       {
         "id": "case_white_011",
