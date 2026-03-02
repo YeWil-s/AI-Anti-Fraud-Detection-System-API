@@ -10,8 +10,8 @@ from datetime import datetime
 
 # 导入日志
 from app.core.logger import get_logger
-
-from app.db.database import get_db
+from sqlalchemy import select
+from app.db.database import get_db, AsyncSessionLocal
 from app.core.security import get_current_user_id, decode_access_token
 from app.core.storage import upload_to_minio
 from app.services.websocket_manager import connection_manager
@@ -53,10 +53,8 @@ async def websocket_endpoint(
 
     # --- 2. 建立连接 ---
     await connection_manager.connect(websocket, user_id)
-    
-    # ==========================================
-    # [Day 8 新增] 连接建立时，从 Redis 恢复该用户的旧配置
-    # ==========================================
+
+    # 连接建立时，从 Redis 恢复该用户的旧配置
     try:
         user_prefs = await get_all_user_preferences(user_id)
         if user_prefs:
@@ -82,17 +80,15 @@ async def websocket_endpoint(
                 msg_type = message.get("type")
                 payload = message.get("data")
                 
-                # ==========================================
-                # [Day 8 新增] 控制指令处理 (Control Plane)
-                # ==========================================
+                # 控制指令处理 
                 if msg_type == "control":
                     # 前端发送: {"type": "control", "data": {"action": "set_config", "fps": 5}}
-                    logger.info(f"🎮 Received control command from {user_id}: {payload}")
+                    logger.info(f"Received control command from {user_id}: {payload}")
                     # 交给 Manager 统一处理 (写入 Redis, 回执 ACK)
                     await connection_manager.handle_command(user_id, payload)
                     continue
 
-                # --- A. 音频处理 (Scheme B) ---
+                # --- A. 音频处理 ---
                 if msg_type == "audio":
                     if payload:
                         # 异步投递任务到 Celery
@@ -105,7 +101,7 @@ async def websocket_endpoint(
                             "timestamp": datetime.now().isoformat()
                         })
 
-                # --- B. 视频处理 (Scheme A) ---
+                # --- B. 视频处理 ---
                 elif msg_type == "video":
                     # 1. 放入处理器积攒帧
                     result = await local_video_processor.process_frame(payload, user_id)
@@ -131,7 +127,7 @@ async def websocket_endpoint(
                         "timestamp": datetime.now().isoformat()
                     })
 
-                # --- C. 文本处理 (实时通话转录) ---
+                # --- C. 文本处理 ---
                 elif msg_type == "text":
                     # [修正 3] 兼容 payload 是字符串或字典的情况
                     text_content = ""
@@ -166,10 +162,18 @@ async def websocket_endpoint(
                 
     except WebSocketDisconnect:
         connection_manager.disconnect(user_id)
-        # 清理资源
         local_video_processor.clear_buffer(user_id)
         logger.info(f"User {user_id} disconnected")
-        
+        async def _fallback_end_call():
+            async with AsyncSessionLocal() as db:
+                result = await db.execute(select(CallRecord).where(CallRecord.call_id == call_id))
+                record = result.scalar_one_or_none()
+                if record and record.end_time is None:
+                    record.end_time = datetime.now()
+                    record.duration = int((record.end_time - record.start_time).total_seconds())
+                    await db.commit()
+        await _fallback_end_call()
+
     except Exception as e:
         logger.error(f"WebSocket error: {e}", exc_info=True)
         await connection_manager.disconnect(user_id)

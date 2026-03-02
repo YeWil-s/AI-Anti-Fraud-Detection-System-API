@@ -159,11 +159,19 @@ def detect_audio_task(self, audio_base64: str, user_id: int, call_id: int) -> Di
                 confidence = result.get('confidence', 0.0)
                 risk_level = result.get('risk_level', 'low')
 
+                # 提取高风险音频片段作为证据
+                evidence_url = ""
+                if confidence > AUDIO_DETECTION_THRESHOLD:
+                    evidence_url = await save_audit_evidence(
+                        audio_bytes, user_id, call_id, "audio", "wav"
+                    )
+                
                 # 音频频率(3-5秒一次)
                 ai_log = AIDetectionLog(
                     call_id=call_id,
                     voice_confidence=confidence,
                     overall_score=confidence * 100,
+                    evidence_snapshot=evidence_url,
                     model_version="v1.0"
                 )
                 db.add(ai_log)
@@ -240,19 +248,27 @@ def detect_video_task(self, frame_data: list, user_id: int, call_id: int) -> Dic
                 raw_result = await model_service.predict_video(video_tensor)
                 raw_is_fake = raw_result.get('is_deepfake', False)
                 raw_conf = raw_result.get('confidence', 0.0)
-
+                # 如果判定风险较高，保存当前 Batch 的第一帧作为截图证据
+                evidence_url = ""
+                if raw_conf > VIDEO_DETECTION_THRESHOLD:  # 阈值可按需调整
+                    try:
+                        # frame_data[0] 是 Base64 编码的 JPG
+                        first_frame_bytes = base64.b64decode(frame_data[0])
+                        evidence_url = await save_audit_evidence(
+                            first_frame_bytes, user_id, call_id, "video", "jpg"
+                        )
+                    except Exception as e:
+                        logger.error(f"视频证据提取失败: {e}")
                 # 4. 防抖处理
                 debounce_data = apply_video_debounce(user_id, call_id, raw_is_fake)
                 
                 # 初始化 Redis (供后续两步使用)
                 r = redis.from_url(settings.REDIS_URL)
 
-                # =======================================================
-                # 5. [DB优化 A] 技术流水日志动态采样 (Dynamic Sampling)
-                # =======================================================
-                # 策略：高风险(>0.6)每0.5秒记一次；低风险每10秒记一次
+                # 5. [DB优化] 技术流水日志动态采样
+                # 策略：高风险(>VIDEO_DETECTION_THRESHOLD)每0.5秒记一次；低风险每10秒记一次
                 tech_log_key = f"detect:tech_log_throttle:{call_id}"
-                log_interval = 0.5 if raw_conf > 0.6 else 10.0
+                log_interval = 0.5 if raw_conf > VIDEO_DETECTION_THRESHOLD else 10.0
                 
                 last_tech_ts = r.get(tech_log_key)
                 now_ts = now.timestamp()
@@ -268,6 +284,7 @@ def detect_video_task(self, frame_data: list, user_id: int, call_id: int) -> Dic
                         video_confidence=raw_conf,
                         overall_score=raw_conf * 100,
                         time_offset=time_offset,
+                        evidence_snapshot=evidence_url,
                         model_version=raw_result.get("model_version", "v1.0")
                     )
                     db.add(ai_log)
@@ -539,3 +556,18 @@ def multi_modal_fusion_task(self, text: str, audio_conf: float, video_conf: floa
     except Exception as e:
         logger.error(f"Task wrapper failed: {e}")
         return {"status": "error", "message": str(e), "call_id": call_id}
+
+# 新增保存审计证据的函数，返回文件的 MinIO URL
+async def save_audit_evidence(data: bytes, user_id: int, call_id: int, data_type: str, ext: str) -> str:
+    """保存审计证据到 MinIO 并返回访问路径"""
+    try:
+        timestamp = int(time.time() * 1000)
+        # 将路径改为 audit，方便后续做权限隔离和生命周期管理
+        filename = f"audit/{data_type}/{user_id}/{call_id}_{timestamp}.{ext}"
+        content_type = "audio/wav" if data_type == "audio" else "image/jpeg"
+        
+        file_url = await upload_to_minio(data, filename, content_type=content_type)
+        return file_url
+    except Exception as e:
+        logger.error(f"审计证据保存失败: {e}")
+        return ""
