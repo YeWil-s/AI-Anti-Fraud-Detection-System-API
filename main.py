@@ -9,7 +9,9 @@ from contextlib import asynccontextmanager
 import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy import text
 
+from app.db.database import engine
 from app.api import users_router, detection_router, tasks_router, call_records_router
 from app.api.admin import router as admin_router
 from app.core.config import settings

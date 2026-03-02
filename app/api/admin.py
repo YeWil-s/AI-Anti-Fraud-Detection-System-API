@@ -156,3 +156,72 @@ async def remove_blacklist(id: int, db: AsyncSession = Depends(get_db)):
     await db.delete(item)
     await db.commit()
     return {"msg": "Deleted"}
+
+@router.get("/fraud-cases", summary="获取被判定为诈骗的通话记录")
+async def get_fraud_cases(skip: int = 0, limit: int = 50, db: AsyncSession = Depends(get_db)):
+    """
+    供管理员审核，获取那些 detected_result 为 FAKE 的高危通话
+    """
+    result = await db.execute(
+        select(CallRecord)
+        .where(CallRecord.detected_result == DetectionResult.FAKE)
+        .order_by(CallRecord.start_time.desc())
+        .offset(skip).limit(limit)
+    )
+    cases = result.scalars().all()
+    
+    # 格式化返回数据，提取有用的信息
+    response_data = []
+    for case in cases:
+        response_data.append({
+            "call_id": case.call_id,
+            "user_id": case.user_id,
+            "target_number": case.target_number,
+            "start_time": case.start_time.isoformat() if case.start_time else None,
+            "duration": case.duration,
+            "risk_level": "高危",  # 简单映射
+            "fraud_type": "未分类拦截", # 真实环境可根据 AI 日志提取，这里暂用默认
+            # 如果你有保存最终的话术，可以展示在这里。这里假设你保存了检测详情
+            "details": case.detection_details or f"检测到来自 {case.target_number} 的风险通话" 
+        })
+    return response_data
+
+@router.post("/fraud-cases/{call_id}/learn", summary="将案例加入待学习队列")
+async def learn_fraud_case(call_id: int, db: AsyncSession = Depends(get_db)):
+    """
+    管理员核实后，将此记录转换为 JSON 文件，放入 pending_cases 目录
+    供 maintenance_tasks 每天凌晨自动学习
+    """
+    result = await db.execute(select(CallRecord).where(CallRecord.call_id == call_id))
+    case = result.scalar_one_or_none()
+    
+    if not case:
+        raise HTTPException(status_code=404, detail="未找到该通话记录")
+    if case.detected_result != DetectionResult.FAKE:
+         raise HTTPException(status_code=400, detail="该通话并非诈骗，无需学习")
+
+    # 1. 组装学习数据格式 (必须符合我们在 maintenance_tasks.py 中约定的格式)
+    learn_data = [{
+        "modality": "audio", # 假设电话拦截默认是音频转写
+        "fraud_type": f"管理员标记案例_{case.target_number}",
+        "risk_level": "高危",
+        "content": case.detection_details or f"系统拦截了与 {case.target_number} 的高危通话，判定为疑似欺诈。",
+        "source": f"管理员人工核实 (CallID:{call_id})"
+    }]
+
+    # 2. 确定文件保存路径
+    BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    PENDING_DIR = os.path.join(BASE_DIR, "data", "pending_cases")
+    os.makedirs(PENDING_DIR, exist_ok=True)
+    
+    file_name = f"manual_learn_{call_id}_{datetime.now().strftime('%Y%m%d%H%M%S')}.json"
+    file_path = os.path.join(PENDING_DIR, file_name)
+    
+    # 3. 写入 JSON 文件
+    try:
+        with open(file_path, 'w', encoding='utf-8') as f:
+            json.dump(learn_data, f, ensure_ascii=False, indent=2)
+            
+        return {"msg": "成功加入待学习队列", "file": file_name}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"文件生成失败: {str(e)}")

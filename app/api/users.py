@@ -1,6 +1,8 @@
 """
 用户管理API路由
 """
+from app.models.call_record import CallRecord
+from app.services.llm_service import llm_service
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
@@ -19,10 +21,8 @@ from app.schemas import (
 )
 from app.core.security import verify_password, get_password_hash, create_access_token, get_current_user_id
 from app.core.sms import verify_sms_code, send_sms_code
-# [新增] 导入日志和上下文绑定
 from app.core.logger import get_logger, bind_context
 
-# [新增] 初始化模块级 logger
 logger = get_logger(__name__)
 
 router = APIRouter(prefix="/api/users", tags=["用户管理"])
@@ -301,3 +301,36 @@ async def update_user_profile(
             "guardian_phone": user.guardian_phone
         }
     )
+
+# 个人安全报告生成
+@router.get("/{user_id}/security-report", summary="生成用户专属安全监测报告")
+async def get_user_security_report(user_id: int, db: AsyncSession = Depends(get_db)):
+    """
+    分析该用户近期的通话记录，调用大模型生成 Markdown 格式的专属防诈报告
+    """
+    # 1. 校验用户是否存在
+    result = await db.execute(select(User).where(User.user_id == user_id))
+    user = result.scalar_one_or_none()
+    
+    if not user:
+        raise HTTPException(status_code=404, detail="用户不存在")
+
+    # 2. 查询该用户近期通话记录 (最多取最近 10 条进行分析，避免超出大模型上下文限制)
+    calls_result = await db.execute(
+        select(CallRecord)
+        .where(CallRecord.user_id == user_id)
+        .order_by(CallRecord.start_time.desc())
+        .limit(10)
+    )
+    recent_calls = calls_result.scalars().all()
+
+    # 3. 调用 LLM 生成报告
+    report_markdown = await llm_service.generate_security_report(user, recent_calls)
+
+    # 4. 返回 JSON 数据
+    return {
+        "user_id": user_id,
+        "username": user.username,
+        "report_generated_at": datetime.now().isoformat(),
+        "report_content": report_markdown
+    }

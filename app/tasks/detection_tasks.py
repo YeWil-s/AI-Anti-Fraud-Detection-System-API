@@ -159,7 +159,7 @@ def detect_audio_task(self, audio_base64: str, user_id: int, call_id: int) -> Di
                 confidence = result.get('confidence', 0.0)
                 risk_level = result.get('risk_level', 'low')
 
-                # 音频频率较低(3-5秒一次)，通常不需要像视频那样强力的采样优化
+                # 音频频率(3-5秒一次)
                 ai_log = AIDetectionLog(
                     call_id=call_id,
                     voice_confidence=confidence,
@@ -493,10 +493,10 @@ def multi_modal_fusion_task(self, text: str, audio_conf: float, video_conf: floa
 
                 memory_service.add_message(call_id, text)
                 chat_history = memory_service.get_context(call_id)
-                # 3. 核心：调用 LLM 大模型进行多模态融合裁定
+                # 3. 调用 LLM 大模型进行多模态融合裁定
                 llm_result = await llm_service.analyze_multimodal_risk(
                     user_input=text, 
-                    chat_history=chat_history,  # [关键新增] 传入记忆池参数
+                    chat_history=chat_history,  # 传入记忆池参数
                     role_type=role_type, 
                     audio_conf=audio_conf, 
                     video_conf=video_conf

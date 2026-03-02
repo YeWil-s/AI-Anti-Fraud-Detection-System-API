@@ -62,7 +62,7 @@ class Settings(BaseSettings):
 
     # LLM 大模型智能体配置
     LLM_MODEL_NAME: str = "deepseek-chat"
-    LLM_API_KEY: str = "sk-d99efeb8065f4b6d9afbd3b1cee4bda5"
+    LLM_API_KEY: str = ""
     LLM_BASE_URL: str = "https://api.deepseek.com/v1"
     
     # Pydantic V2 规范的配置写法：忽略额外变量，读取 .env
