@@ -1,6 +1,9 @@
 """
-FastAPI主应用入口 - 优化版
+FastAPI主应用入口
 """
+import os
+os.environ["ANONYMIZED_TELEMETRY"] = "False"
+
 import asyncio
 import json
 import uuid
@@ -12,7 +15,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
 
 from app.db.database import engine
-from app.api import users_router, detection_router, tasks_router, call_records_router
+from app.api import users_router, detection_router, tasks_router, call_records_router,family
 from app.api.admin import router as admin_router
 from app.core.config import settings
 from app.core.logger import setup_logging, logger, request_id_ctx
@@ -139,6 +142,7 @@ app.include_router(users_router)
 app.include_router(detection_router)
 app.include_router(tasks_router)
 app.include_router(call_records_router)
+app.include_router(family.router)
 app.include_router(admin_router, prefix="/api/admin", tags=["Admin Management"])
 
 @app.get("/")

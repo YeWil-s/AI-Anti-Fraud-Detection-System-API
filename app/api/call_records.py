@@ -6,7 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, and_, func
 from typing import Optional
 from datetime import datetime  
-
+from pydantic import BaseModel
 from app.db.database import get_db
 from app.core.security import get_current_user_id
 
@@ -260,4 +260,60 @@ async def delete_call_record(
         code=200,
         message="删除成功",
         data={"call_id": call_id}
+    )
+
+# 定义接收前端请求的数据结构
+class CallRecordEndRequest(BaseModel):
+    audio_url: Optional[str] = None
+    video_url: Optional[str] = None
+    cover_image: Optional[str] = None
+
+@router.post("/{call_id}/end", response_model=ResponseModel)
+async def end_call_record(
+    call_id: int,
+    payload: CallRecordEndRequest,
+    current_user_id: int = Depends(get_current_user_id),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    结束通话监测，更新最终音视频文件URL并计算总时长
+    """
+    # 1. 验证所有权，确保只能操作自己的记录
+    result = await db.execute(
+        select(CallRecord).where(
+            and_(
+                CallRecord.call_id == call_id,
+                CallRecord.user_id == current_user_id
+            )
+        )
+    )
+    record = result.scalar_one_or_none()
+    
+    if not record:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, 
+            detail="通话记录不存在或无权限"
+        )
+    
+    # 2. 更新结束时间和通话时长
+    record.end_time = datetime.now()
+    if record.start_time:
+        # 计算时长(秒)
+        record.duration = int((record.end_time - record.start_time).total_seconds())
+        
+    # 3. 更新完整的音视频文件和封面 URL
+    if payload.audio_url:
+        record.audio_url = payload.audio_url
+    if payload.video_url:
+        record.video_url = payload.video_url
+    if payload.cover_image:
+        record.cover_image = payload.cover_image
+        
+    await db.commit()
+    
+    # 4. 返回符合项目中统一 ResponseModel 格式的结果
+    return ResponseModel(
+        code=200, 
+        message="通话记录归档成功", 
+        data={"duration": record.duration}
     )

@@ -40,7 +40,7 @@ async def send_verification_code(request: PhoneRequest):
         )
     
     # 发送验证码
-    success = send_sms_code(phone)
+    success = await send_sms_code(phone)
     if not success:
         # 日志已在 send_sms_code 内部记录，这里只需抛出异常
         raise HTTPException(
@@ -243,7 +243,7 @@ async def update_user_profile(
     try:
         await db.commit()
         await db.refresh(user)
-        logger.info(f"User {current_user_id} profile updated: role={user.role_type}, guardian={user.guardian_phone}")
+        logger.info(f"User {current_user_id} profile updated: role={user.role_type}")
     except Exception as e:
         logger.error(f"Failed to update profile for user {current_user_id}: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="更新画像失败")
@@ -254,7 +254,6 @@ async def update_user_profile(
         data={
             "user_id": user.user_id,
             "role_type": user.role_type,
-            "guardian_phone": user.guardian_phone
         }
     )
 

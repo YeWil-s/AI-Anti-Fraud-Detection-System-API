@@ -170,7 +170,8 @@ async def websocket_endpoint(
                 record = result.scalar_one_or_none()
                 if record and record.end_time is None:
                     record.end_time = datetime.now()
-                    record.duration = int((record.end_time - record.start_time).total_seconds())
+                    if record.start_time:
+                        record.duration = int((record.end_time - record.start_time).total_seconds())
                     await db.commit()
         await _fallback_end_call()
 

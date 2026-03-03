@@ -161,7 +161,7 @@ def detect_audio_task(self, audio_base64: str, user_id: int, call_id: int) -> Di
 
                 # 提取高风险音频片段作为证据
                 evidence_url = ""
-                if confidence > AUDIO_DETECTION_THRESHOLD:
+                if confidence > settings.VOICE_DETECTION_THRESHOLD:
                     evidence_url = await save_audit_evidence(
                         audio_bytes, user_id, call_id, "audio", "wav"
                     )
@@ -250,7 +250,7 @@ def detect_video_task(self, frame_data: list, user_id: int, call_id: int) -> Dic
                 raw_conf = raw_result.get('confidence', 0.0)
                 # 如果判定风险较高，保存当前 Batch 的第一帧作为截图证据
                 evidence_url = ""
-                if raw_conf > VIDEO_DETECTION_THRESHOLD:  # 阈值可按需调整
+                if raw_conf > settings.VIDEO_DETECTION_THRESHOLD:  # 阈值可按需调整
                     try:
                         # frame_data[0] 是 Base64 编码的 JPG
                         first_frame_bytes = base64.b64decode(frame_data[0])
@@ -268,7 +268,7 @@ def detect_video_task(self, frame_data: list, user_id: int, call_id: int) -> Dic
                 # 5. [DB优化] 技术流水日志动态采样
                 # 策略：高风险(>VIDEO_DETECTION_THRESHOLD)每0.5秒记一次；低风险每10秒记一次
                 tech_log_key = f"detect:tech_log_throttle:{call_id}"
-                log_interval = 0.5 if raw_conf > VIDEO_DETECTION_THRESHOLD else 10.0
+                log_interval = 0.5 if raw_conf > settings.VIDEO_DETECTION_THRESHOLD else 10.0
                 
                 last_tech_ts = r.get(tech_log_key)
                 now_ts = now.timestamp()

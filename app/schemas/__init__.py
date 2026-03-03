@@ -12,11 +12,7 @@ class UserBase(BaseModel):
     phone: str = Field(..., min_length=11, max_length=11, description="手机号")
     username: str = Field(..., min_length=3, max_length=50, description="用户名")
     name: Optional[str] = Field(None, min_length=2, max_length=50, description="用户姓名")
-    
-    # [大赛新增字段: 用户画像与联动]
     role_type: Optional[str] = Field("青壮年", description="角色类型(如老人、儿童、学生、青壮年)")
-    guardian_phone: Optional[str] = Field(None, min_length=11, max_length=11, description="监护人手机号")
-
 
 class UserCreate(UserBase):
     """用户创建模型"""
@@ -37,7 +33,6 @@ class UserLogin(BaseModel):
 class UserUpdateProfile(BaseModel):
     """用户画像更新模型"""
     role_type: Optional[str] = Field(None, description="角色类型(如老人、儿童、学生、青壮年)")
-    guardian_phone: Optional[str] = Field(None, min_length=11, max_length=11, description="监护人手机号")
 
 
 class UserResponse(UserBase):
@@ -46,8 +41,6 @@ class UserResponse(UserBase):
     family_id: Optional[int] = None
     is_active: bool
     created_at: datetime
-    
-    # 修改为 V2 写法
     model_config = ConfigDict(from_attributes=True)
 
 
@@ -79,8 +72,6 @@ class CallRecordResponse(CallRecordBase):
     detected_result: str
     audio_url: Optional[str] = None
     created_at: datetime
-    
-    # 修改为 V2 写法
     model_config = ConfigDict(from_attributes=True)
 
 
@@ -108,8 +99,6 @@ class AIDetectionLogResponse(AIDetectionLogBase):
     detected_keywords: Optional[str] = None
     model_version: Optional[str] = None
     created_at: datetime
-    
-    # 修复：合并配置，删除 class Config
     model_config = ConfigDict(
         from_attributes=True,
         protected_namespaces=()
