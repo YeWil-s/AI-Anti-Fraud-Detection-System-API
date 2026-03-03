@@ -97,7 +97,6 @@ async def register(user_data: UserCreate, db: AsyncSession = Depends(get_db)):
         name=user_data.name,
         password_hash=get_password_hash(user_data.password),
         role_type=user_data.role_type,
-        guardian_phone=user_data.guardian_phone
     )
     
     try:
@@ -183,47 +182,6 @@ async def get_current_user_info(
     return UserResponse.model_validate(user)
 
 
-@router.put("/family/{family_id}", response_model=ResponseModel)
-async def bind_family(
-    family_id: int,
-    current_user_id: int = Depends(get_current_user_id),
-    db: AsyncSession = Depends(get_db)
-):
-    """绑定家庭组"""
-    bind_context(user_id=current_user_id)
-    
-    # 查询用户
-    result = await db.execute(select(User).where(User.user_id == current_user_id))
-    user = result.scalar_one_or_none()
-    
-    if not user:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="用户不存在"
-        )
-    
-    # 更新家庭组ID
-    old_family_id = user.family_id
-    user.family_id = family_id  # type: ignore[assignment]
-    
-    try:
-        await db.commit()
-        await db.refresh(user)
-        logger.info(f"User {current_user_id} family changed: {old_family_id} -> {family_id}")
-    except Exception as e:
-        logger.error(f"Failed to bind family for user {current_user_id}: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail="绑定失败")
-    
-    return ResponseModel(
-        code=200,
-        message="绑定成功",
-        data={
-            "user_id": user.user_id,
-            "family_id": user.family_id
-        }
-    )
-
-
 @router.delete("/family", response_model=ResponseModel)
 async def unbind_family(
     current_user_id: int = Depends(get_current_user_id),
@@ -265,7 +223,7 @@ async def update_user_profile(
     current_user_id: int = Depends(get_current_user_id),
     db: AsyncSession = Depends(get_db)
 ):
-    """[大赛新增] 更新用户画像与监护人信息"""
+    """更新用户画像与监护人信息"""
     bind_context(user_id=current_user_id)
     
     # 查询当前用户
@@ -281,9 +239,7 @@ async def update_user_profile(
     # 动态更新字段
     if profile_data.role_type is not None:
         user.role_type = profile_data.role_type
-    if profile_data.guardian_phone is not None:
-        user.guardian_phone = profile_data.guardian_phone
-        
+
     try:
         await db.commit()
         await db.refresh(user)
@@ -334,3 +290,46 @@ async def get_user_security_report(user_id: int, db: AsyncSession = Depends(get_
         "report_generated_at": datetime.now().isoformat(),
         "report_content": report_markdown
     }
+
+@router.get("/guardian", summary="获取当前用户的监护人信息")
+async def get_user_guardian(
+    current_user_id: int = Depends(get_current_user_id),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    通过查询家庭组，动态获取监护人的手机号和信息
+    """
+    # 1. 查询当前用户的 family_id
+    result = await db.execute(select(User).where(User.user_id == current_user_id))
+    user = result.scalar_one_or_none()
+    
+    if not user or not user.family_id:
+        return ResponseModel(code=200, message="未绑定家庭组", data={"guardian": None})
+        
+    # 2. 在同一家庭组中，查找 is_admin=True 的用户（即监护人）
+    guardian_result = await db.execute(
+        select(User).where(
+            User.family_id == user.family_id,
+            User.is_admin == True,
+            User.user_id != current_user_id  # 排除自己
+        )
+    )
+    guardians = guardian_result.scalars().all()
+    
+    if not guardians:
+         return ResponseModel(code=200, message="家庭组内未设置监护人", data={"guardian": None})
+         
+    # 3. 返回监护人信息 (如果有多个监护人，这里返回列表)
+    guardian_data = [
+        {
+            "user_id": g.user_id, 
+            "name": g.name or g.username, 
+            "phone": g.phone
+        } for g in guardians
+    ]
+    
+    return ResponseModel(
+        code=200, 
+        message="获取监护人成功", 
+        data={"guardians": guardian_data}
+    )
