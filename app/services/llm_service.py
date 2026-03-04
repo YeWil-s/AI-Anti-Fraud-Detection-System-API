@@ -8,12 +8,13 @@ from langchain_openai import ChatOpenAI
 from langchain.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import JsonOutputParser
 from pydantic.v1 import BaseModel, Field 
-from typing import List
+from typing import List, Tuple, Optional
 from app.core.config import settings
 from app.core.logger import get_logger
 from app.services.vector_db_service import vector_db
 from app.models.user import User
 from app.models.call_record import CallRecord
+from app.models.ai_detection_log import AIDetectionLog
 
 logger = get_logger(__name__)
 
@@ -140,12 +141,25 @@ class LLMService:
                     risk_count += 1
                 
                 start_time_str = call.start_time.strftime("%Y-%m-%d %H:%M:%S") if call.start_time else "未知时间"
-                
+                details_str = "未检测到异常"
+                if call.log:
+                    details_list = []
+                    if call.log.overall_score and call.log.overall_score > 0:
+                        details_list.append(f"综合风险得分: {call.log.overall_score:.1f}/100")
+                    if call.log.detected_keywords:
+                        details_list.append(f"触发敏感词: {call.log.detected_keywords}")
+                    if call.log.voice_confidence and call.log.voice_confidence > 0:
+                        details_list.append(f"声音伪造概率: {call.log.voice_confidence:.2f}")
+                    if call.log.video_confidence and call.log.video_confidence > 0:
+                        details_list.append(f"画面伪造概率: {call.log.video_confidence:.2f}")
+
+                    if details_list:
+                        details_str = " | ".join(details_list)
                 call_summary += (
                     f"- 时间：{start_time_str}\n"
                     f"  号码：{call.target_name}\n"
                     f"  判定结果：{status}\n"
-                    f"  检测详情：{call.detection_details or '无'}\n\n"
+                    f"  检测详情：{details_str}\n\n"
                 )
 
         # 2. 构建 Prompt

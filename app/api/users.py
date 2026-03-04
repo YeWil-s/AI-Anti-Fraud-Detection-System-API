@@ -10,6 +10,7 @@ from typing import List
 from pydantic import BaseModel
 from app.db.database import get_db
 from app.models.user import User
+from app.models.ai_detection_log import AIDetectionLog
 from app.schemas import (
     UserCreate,
     UserLogin,
@@ -272,15 +273,16 @@ async def get_user_security_report(user_id: int, db: AsyncSession = Depends(get_
 
     # 2. 查询该用户近期通话记录 (最多取最近 10 条进行分析，避免超出大模型上下文限制)
     calls_result = await db.execute(
-        select(CallRecord)
+        select(CallRecord, AIDetectionLog)
+        .outerjoin(AIDetectionLog, CallRecord.call_id == AIDetectionLog.call_id)
         .where(CallRecord.user_id == user_id)
         .order_by(CallRecord.start_time.desc())
         .limit(10)
     )
-    recent_calls = calls_result.scalars().all()
+    recent_calls_with_logs = calls_result.all()
 
     # 3. 调用 LLM 生成报告
-    report_markdown = await llm_service.generate_security_report(user, recent_calls)
+    report_markdown = await llm_service.generate_security_report(user, recent_calls_with_logs)
 
     # 4. 返回 JSON 数据
     return {
