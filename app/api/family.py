@@ -23,7 +23,7 @@ async def create_family_group(
     if user and user.family_id:
         return ResponseModel(code=400, message="您已在一个家庭组中")
 
-    # 2. 创建群组 (请根据你 FamilyGroup 实际的字段名修改，比如 group_name 或 name)
+    # 2. 创建群组 
     new_family = FamilyGroup(group_name=name, admin_id=current_user_id) 
     db.add(new_family)
     await db.commit()

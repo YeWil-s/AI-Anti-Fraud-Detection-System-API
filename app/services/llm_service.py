@@ -143,7 +143,7 @@ class LLMService:
                 
                 call_summary += (
                     f"- 时间：{start_time_str}\n"
-                    f"  号码：{call.target_number}\n"
+                    f"  号码：{call.target_name}\n"
                     f"  判定结果：{status}\n"
                     f"  检测详情：{call.detection_details or '无'}\n\n"
                 )

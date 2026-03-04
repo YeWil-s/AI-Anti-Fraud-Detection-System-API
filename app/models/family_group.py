@@ -14,7 +14,7 @@ class FamilyGroup(Base):
     
     id = Column(Integer, primary_key=True, index=True, autoincrement=True)
     group_name = Column(String(100), nullable=False, comment="家庭组名称")
-    owner_id = Column(Integer, ForeignKey("users.user_id"), nullable=False, comment="组长/创建者ID")
+    admin_id = Column(Integer, ForeignKey("users.user_id"), nullable=False, comment="组长/创建者ID")
     created_at = Column(DateTime(timezone=True), server_default=func.now(), comment="创建时间")
 
 class FamilyApplication(Base):
