@@ -15,6 +15,7 @@ from app.services.vector_db_service import vector_db
 from app.models.user import User
 from app.models.call_record import CallRecord
 from app.models.ai_detection_log import AIDetectionLog
+from langchain_core.messages import SystemMessage, HumanMessage
 
 logger = get_logger(__name__)
 
@@ -122,39 +123,53 @@ class LLMService:
                 "analysis": "大模型调用异常，降级通过", "advice": "系统繁忙"
             }
     
-    async def generate_security_report(self, user: User, recent_calls: List[CallRecord]) -> str:
+    async def generate_security_report(self, user: User, recent_calls_with_logs: list) -> str:
         """
         生成个人安全监测报告
-        根据用户的画像和近期通话记录，生成 Markdown 格式的反诈总结报告
+        根据用户的画像和近期通话检测记录，生成 Markdown 格式的反诈总结报告
         """
         # 1. 整理用户的近期通话摘要
         call_summary = ""
         risk_count = 0
         
-        if not recent_calls:
+        if not recent_calls_with_logs:
             call_summary = "该用户近期无通话记录。"
         else:
-            for call in recent_calls:
-                # 提取风险判定状态
-                status = "高风险(诈骗)" if call.detected_result.name == 'FAKE' else "安全"
-                if status == "高风险(诈骗)":
-                    risk_count += 1
+            for item in recent_calls_with_logs:
+                # 【修复 1】：正确解包 SQLAlchemy 的 Row 对象 (支持单表和联表两种结果)
+                if isinstance(item, tuple) or hasattr(item, '_mapping'):
+                    call = item[0]
+                    log = item[1] if len(item) > 1 else None
+                else:
+                    call = item
+                    log = None
+
+                # 【修复 2】：安全读取枚举值，防止空值报错
+                status = "安全"
+                if call.detected_result:
+                    val = getattr(call.detected_result, 'name', str(call.detected_result))
+                    if 'FAKE' in val:
+                        status = "高风险(诈骗)"
+                        risk_count += 1
                 
                 start_time_str = call.start_time.strftime("%Y-%m-%d %H:%M:%S") if call.start_time else "未知时间"
+                
+                # 提取 AI 检测细节
                 details_str = "未检测到异常"
-                if call.log:
+                if log:
                     details_list = []
-                    if call.log.overall_score and call.log.overall_score > 0:
-                        details_list.append(f"综合风险得分: {call.log.overall_score:.1f}/100")
-                    if call.log.detected_keywords:
-                        details_list.append(f"触发敏感词: {call.log.detected_keywords}")
-                    if call.log.voice_confidence and call.log.voice_confidence > 0:
-                        details_list.append(f"声音伪造概率: {call.log.voice_confidence:.2f}")
-                    if call.log.video_confidence and call.log.video_confidence > 0:
-                        details_list.append(f"画面伪造概率: {call.log.video_confidence:.2f}")
-
+                    if getattr(log, 'overall_score', 0) > 0:
+                        details_list.append(f"综合得分: {log.overall_score:.1f}")
+                    if getattr(log, 'detected_keywords', None):
+                        details_list.append(f"敏感词: {log.detected_keywords}")
+                    if getattr(log, 'voice_confidence', 0) > 0:
+                        details_list.append(f"语音伪造率: {log.voice_confidence:.2f}")
+                    if getattr(log, 'video_confidence', 0) > 0:
+                        details_list.append(f"画面伪造率: {log.video_confidence:.2f}")
+                    
                     if details_list:
                         details_str = " | ".join(details_list)
+
                 call_summary += (
                     f"- 时间：{start_time_str}\n"
                     f"  号码：{call.target_name}\n"
@@ -170,33 +185,34 @@ class LLMService:
 1. 必须使用 Markdown 格式排版，包含标题、加粗、列表等元素，使其美观易读。
 2. 结构建议包含：
    -  核心评估结论（综合安全评级：如优秀、良好、极度危险）
-   -  近期风险数据回顾（拦截了几次，主要是什么类型的诈骗）
-   -  暴露的薄弱点分析（根据被骗的话术和人群特征分析）
-   -  专属防骗建议（必须结合该用户的【角色类型】给出定制化、可操作的建议）
-3. 语气要专业、关怀，像一个贴心的私人安全顾问。如果风险很高，语气要严厉警示。"""
+   -  近期风险数据回顾（拦截了多少次，触发了哪些敏感词）
+   -  暴露的薄弱点分析
+   -  专属防骗建议（结合该用户的【角色类型】给出定制化建议）
+3. 语气要专业、关怀。"""
+
+        # 【修复 3】：使用 family_id 安全判断监护人绑定状态
+        is_bound = '是' if getattr(user, 'family_id', None) else '否'
 
         user_content = f"""
 【用户画像】
 - 用户姓名：{user.name or user.username}
-- 角色类型：{user.role_type} (如老人、学生、青壮年等)
-- 监护人已绑定：{'是' if user.guardian_phone else '否'}
+- 角色类型：{user.role_type}
+- 监护人已绑定：{is_bound}
 
-【近期通话检测记录】(共 {len(recent_calls)} 条，其中高风险 {risk_count} 条)
+【近期通话检测记录】(共 {len(recent_calls_with_logs)} 条，其中高风险 {risk_count} 条)
 {call_summary}
 """
+        
         # 3. 调用大模型
         try:
+            # 【修复 4】：直接使用 SystemMessage 和 HumanMessage
+            # 彻底避开 ChatPromptTemplate 遇到敏感词 JSON 括号 {} 时引发的 KeyError 崩溃！
             messages = [
-                ("system", system_prompt),
-                ("human", user_content)
+                SystemMessage(content=system_prompt),
+                HumanMessage(content=user_content)
             ]
             
-            # 使用一个普通的会话链（不需要 JSON 解析器，直接输出文本）
-            from langchain.prompts import ChatPromptTemplate
-            prompt = ChatPromptTemplate.from_messages(messages)
-            chain = prompt | self.llm
-            
-            response = await chain.ainvoke({})
+            response = await self.llm.ainvoke(messages)
             return response.content
             
         except Exception as e:
