@@ -23,9 +23,9 @@ class FamilyApplication(Base):
     
     id = Column(Integer, primary_key=True, index=True, autoincrement=True)
     family_id = Column(Integer, ForeignKey("family_groups.id"), nullable=False) # 关联你的家庭组
-    user_id = Column(Integer, ForeignKey("users.user_id"), nullable=False)      # 注意：根据你的版本，用户表主键是 user_id
+    user_id = Column(Integer, ForeignKey("users.user_id"), nullable=False)     
     status = Column(SQLEnum(ApplicationStatus), default=ApplicationStatus.PENDING)
     created_at = Column(DateTime, server_default=func.now())
 
     def __repr__(self):
-        return f"<FamilyGroup(id={self.id}, name={self.group_name}, owner={self.owner_id})>"
+        return f"<FamilyApplication(id={self.id}, family_id={self.family_id}, user_id={self.user_id}, status={self.status})>"

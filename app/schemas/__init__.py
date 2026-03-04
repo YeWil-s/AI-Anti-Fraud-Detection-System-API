@@ -56,7 +56,8 @@ class CallRecordBase(BaseModel):
     """通话记录基础模型"""
     caller_number: Optional[str] = None
     start_time: datetime
-
+    target_name: Optional[str] = None
+    platform: Optional[str] = "phone"
 
 class CallRecordCreate(CallRecordBase):
     """通话记录创建模型"""
@@ -71,6 +72,8 @@ class CallRecordResponse(CallRecordBase):
     duration: int
     detected_result: str
     audio_url: Optional[str] = None
+    cover_image: Optional[str] = None
+    video_url: Optional[str] = None
     created_at: datetime
     model_config = ConfigDict(from_attributes=True)
 
