@@ -2,8 +2,13 @@
 FastAPI主应用入口
 """
 import os
-os.environ["ANONYMIZED_TELEMETRY"] = "False"
-
+import sys
+from unittest.mock import MagicMock
+os.environ["ANONYMIZED_TELEMETRY"] = "false"
+os.environ["CHROMA_TELEMETRY"] = "false"
+os.environ["POSTHOG_DISABLED"] = "1"
+sys.modules['chromadb.telemetry.posthog'] = MagicMock()
+sys.modules['posthog'] = MagicMock()
 import asyncio
 import json
 import uuid

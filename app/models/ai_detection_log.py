@@ -19,13 +19,10 @@ class AIDetectionLog(Base):
     text_confidence = Column(Float, default=0.0, comment="文本诈骗话术置信度(0-1)")
     
     overall_score = Column(Float, nullable=False, comment="综合风险评分(0-100)")
-    
-    # [新增] 证据详情字段
     detected_keywords = Column(Text, nullable=True, comment="检测到的敏感词(JSON)")
-    evidence_snapshot = Column(String(500), nullable=True, comment="违规画面截图URL") # 新增：用于展示证据图片
-    time_offset = Column(Integer, default=0, comment="异常发生的通话秒数") # 新增：比如第15秒检测到异常
-    algorithm_details = Column(Text, nullable=True, comment="技术细节(JSON,如FaceSwap/LipSync)") # 新增：存具体的算法输出
-    
+    evidence_snapshot = Column(String(500), nullable=True, comment="违规画面截图URL") 
+    time_offset = Column(Integer, default=0, comment="异常发生的通话秒数")
+    algorithm_details = Column(Text, nullable=True, comment="技术细节(JSON,如FaceSwap/LipSync)") 
     model_version = Column(String(50), nullable=True, comment="使用的模型版本")
     created_at = Column(DateTime(timezone=True), server_default=func.now(), comment="检测时间")
     

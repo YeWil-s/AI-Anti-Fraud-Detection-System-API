@@ -13,6 +13,9 @@ class UserBase(BaseModel):
     username: str = Field(..., min_length=3, max_length=50, description="用户名")
     name: Optional[str] = Field(None, min_length=2, max_length=50, description="用户姓名")
     role_type: Optional[str] = Field("青壮年", description="角色类型(如老人、儿童、学生、青壮年)")
+    gender: Optional[str] = Field(None, description="性别")
+    profession: Optional[str] = Field(None, description="职业")
+    marital_status: Optional[str] = Field(None, description="婚姻状况")
 
 class UserCreate(UserBase):
     """用户创建模型"""
@@ -33,6 +36,9 @@ class UserLogin(BaseModel):
 class UserUpdateProfile(BaseModel):
     """用户画像更新模型"""
     role_type: Optional[str] = Field(None, description="角色类型(如老人、儿童、学生、青壮年)")
+    gender: Optional[str] = Field(None, description="性别")
+    profession: Optional[str] = Field(None, description="职业")
+    marital_status: Optional[str] = Field(None, description="婚姻状况")
 
 
 class UserResponse(UserBase):

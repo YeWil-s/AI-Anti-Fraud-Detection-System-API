@@ -99,14 +99,16 @@ async def register(user_data: UserCreate, db: AsyncSession = Depends(get_db)):
         name=user_data.name,
         password_hash=get_password_hash(user_data.password),
         role_type=user_data.role_type,
+        gender=user_data.gender,
+        profession=user_data.profession,
+        marital_status=user_data.marital_status,
     )
     
     try:
         db.add(new_user)
         await db.commit()
         await db.refresh(new_user)
-        
-        # [新增] 关键审计日志
+
         logger.info(f"New user registered: {new_user.username} (ID: {new_user.user_id})")
         
         return ResponseModel(
@@ -115,9 +117,8 @@ async def register(user_data: UserCreate, db: AsyncSession = Depends(get_db)):
             data={"user_id": new_user.user_id}
         )
     except Exception as e:
-        # [新增] 记录数据库异常
+        # 记录数据库异常
         logger.error(f"Registration failed for {user_data.username}: {e}", exc_info=True)
-        # 不要向前端暴露具体数据库错误，返回通用提示
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="注册失败，请稍后重试"
@@ -133,7 +134,7 @@ async def login(login_data: UserLogin, db: AsyncSession = Depends(get_db)):
     user = result.scalar_one_or_none()
     
     if not user or not verify_password(login_data.password, user.password_hash):  # type: ignore[arg-type]
-        # [新增] 安全日志：记录登录失败尝试
+        #  安全日志：记录登录失败尝试
         logger.warning(f"Login failed for phone: {login_data.phone} (Invalid credentials)")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -147,8 +148,6 @@ async def login(login_data: UserLogin, db: AsyncSession = Depends(get_db)):
             detail="账号已被禁用"
         )
     
-    # [关键] 登录成功，绑定上下文 user_id
-    # 这样后续的处理（如果有）日志都会带上这个 ID
     bind_context(user_id=user.user_id)
     logger.info(f"User logged in successfully: {user.username} (ID: {user.user_id})")
     
@@ -241,6 +240,12 @@ async def update_user_profile(
     # 动态更新字段
     if profile_data.role_type is not None:
         user.role_type = profile_data.role_type
+    if profile_data.gender is not None:
+        user.gender = profile_data.gender
+    if profile_data.profession is not None:
+        user.profession = profile_data.profession
+    if profile_data.marital_status is not None:
+        user.marital_status = profile_data.marital_status
 
     try:
         await db.commit()

@@ -42,12 +42,17 @@ class LLMService:
             ("system", """你是一个国家级的多模态反诈智能体助手，具备强大的意图识别与复杂逻辑推理能力。
 你的任务是综合分析【近期对话上下文】、【当前最新输入】和【底层AI特征得分】，保护用户免受欺诈。
 
-【当前用户的角色画像】：{role_type}
-注意：请严格根据用户的角色画像动态调整你的风险容忍度、审查重点。以下是不同人群的易受骗场景：
-- 老人：对推销特效药、高息理财、冒充公检法恐吓、冒充亲友要求转账极度敏感。
-- 学生：对兼职刷单、注销校园贷、非官方低价票、游戏账号交易高度警惕。
-- 孩子：对免费领游戏皮肤、解除防沉迷、诱导索要父母验证码零容忍。
-- 青壮年：对内部高回报投资(杀猪盘)、虚假网贷、冒充老板过桥垫资保持防范。
+【当前用户的综合画像】：
+{user_profile}
+【当前通话场景】：
+{call_type}
+
+注意：请严格根据用户的综合画像动态调整你的风险容忍度、审查重点。以下是不同特征人群的易受骗场景：
+- 老年人：对推销特效药、高息理财、冒充公检法恐吓极度敏感。
+- 宝妈/全职：极易遇到“兼职刷单”、“买返利金”、“免费领母婴用品”诈骗。
+- 单身/离异：极易遇到“杀猪盘”（网恋诱导博彩/投资诈骗）。
+- 公司财务/出纳：极易遇到“冒充老板/公检法要求紧急对公转账”。
+- 学生/儿童：对免费领皮肤、解除防沉迷、注销校园贷、非官方低价票高度警惕。
 
 【知识库参考案例（RAG检索结果）】：
 {context}
@@ -71,14 +76,14 @@ class LLMService:
             ("human", "【当前最新输入(含语音转写)】：{user_input}")
         ])
 
-    async def analyze_text_risk(self, user_input: str, chat_history: str, role_type: str = "青壮年") -> dict:
-        """纯文本风控分析（带记忆池）"""
+    async def analyze_text_risk(self, user_input: str, chat_history: str, user_profile: str = "青壮年") -> dict:
+        """带记忆池文本风控分析"""
         try:
             context = await asyncio.to_thread(vector_db.get_context_for_llm, query=user_input, n_results=2)
             chain = self.prompt_template | self.llm | self.output_parser
             
             response = await chain.ainvoke({
-                "role_type": role_type,
+                "user_profile": user_profile,
                 "context": context,
                 "chat_history": chat_history,
                 "user_input": user_input,
@@ -97,19 +102,20 @@ class LLMService:
                 "analysis": "大模型调用异常，降级通过", "advice": "系统繁忙"
             }
 
-    async def analyze_multimodal_risk(self, user_input: str, chat_history: str, role_type: str = "青壮年", audio_conf: float = 0.0, video_conf: float = 0.0) -> dict:
-        """多模态融合风控分析（带记忆池）"""
+    async def analyze_multimodal_risk(self, user_input: str, chat_history: str, user_profile: str = "青壮年", call_type: str = "普通通话", audio_conf: float = 0.0, video_conf: str = "0.0") -> dict:
+        """多模态融合风控分析"""
         try:
             context = await asyncio.to_thread(vector_db.get_context_for_llm, query=user_input, n_results=2)
             chain = self.prompt_template | self.llm | self.output_parser
             
             response = await chain.ainvoke({
-                "role_type": role_type,
+                "user_profile": user_profile,
+                "call_type": call_type,
                 "context": context,
                 "chat_history": chat_history,
                 "user_input": user_input,
                 "audio_conf": f"{audio_conf:.4f}",
-                "video_conf": f"{video_conf:.4f}",
+                "video_conf": video_conf,  # 传入 N/A 或具体数值
                 "format_instructions": self.output_parser.get_format_instructions()
             })
             
@@ -205,8 +211,6 @@ class LLMService:
         
         # 3. 调用大模型
         try:
-            # 【修复 4】：直接使用 SystemMessage 和 HumanMessage
-            # 彻底避开 ChatPromptTemplate 遇到敏感词 JSON 括号 {} 时引发的 KeyError 崩溃！
             messages = [
                 SystemMessage(content=system_prompt),
                 HumanMessage(content=user_content)
