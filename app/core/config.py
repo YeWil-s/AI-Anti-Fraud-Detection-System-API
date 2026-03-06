@@ -44,7 +44,7 @@ class Settings(BaseSettings):
     VOICE_MODEL_PATH: str = "./models/voice_detection.onnx"
     VIDEO_MODEL_PATH: str = "./models/video_detection.onnx"
     TEXT_MODEL_PATH: str = "./models/text_fraud_model.onnx"
-    TEXT_VOCAB_PATH: str = "./models/vocab.txt"
+    TEXT_VOCAB_PATH: str = "./models"
     COLLECT_TRAINING_DATA: bool = True
 
     # 视频预处理标准

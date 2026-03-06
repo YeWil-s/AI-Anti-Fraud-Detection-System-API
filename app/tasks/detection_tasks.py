@@ -342,6 +342,22 @@ def detect_text_task(self, text: str, user_id: int, call_id: int) -> Dict:
                         )
                         return {"status": "success", "result": {"is_fraud": True, "source": "rule"}}
 
+                # ================== [新增] 第二道防线：本地 ONNX 模型快筛 ==================
+                try:
+                    text_result = await model_service.predict_text(text)
+                    text_conf = text_result.get("confidence", 0.5) 
+                    logger.info(f"本地 ONNX 文本检测置信度: {text_conf:.4f}")
+                    
+                    # 极速拦截：如果是极度安全的日常闲聊 (低于0.3)
+                    if text_conf < 0.3:
+                        logger.info("ONNX 判定为安全闲聊，跳过大模型处理")
+                        return {"status": "success", "result": {"is_fraud": False, "risk_level": "safe", "source": "onnx"}}
+                    
+                except Exception as e:
+                    logger.error(f"ONNX 文本快筛异常: {e}")
+                    text_conf = 0.5 # 如果崩了，给个中性分数，交由 LLM 兜底处理
+                # =========================================================================
+
                 # 2. 从数据库动态获取通话场景 (平台标识)
                 call_stmt = select(CallRecord).where(CallRecord.call_id == call_id)
                 call_result = await db.execute(call_stmt)
@@ -380,14 +396,15 @@ def detect_text_task(self, text: str, user_id: int, call_id: int) -> Dict:
                 memory_service.add_message(call_id, text)
                 chat_history = memory_service.get_context(call_id)
                 
-                # 6. 第二道防线：呼叫 LLM 大脑融合裁决
+                # 6. 第三道防线：呼叫 LLM 大脑融合裁决 (已修改传入 text_conf)
                 llm_result = await llm_service.analyze_multimodal_risk(
                     user_input=text, 
                     chat_history=chat_history,
                     user_profile=user_profile_str,
                     call_type=call_type_desc,
                     audio_conf=audio_conf,
-                    video_conf=video_conf_val
+                    video_conf=video_conf_val,
+                    text_conf=text_conf  # <--- [新增] 将ONNX漏斗过滤后的分数传递给司令部
                 )
                 
                 is_fraud = llm_result.get('is_fraud', False)
@@ -427,7 +444,6 @@ def detect_text_task(self, text: str, user_id: int, call_id: int) -> Dict:
     except Exception as e:
         logger.error(f"Task wrapper failed: {e}")
         return {"status": "error", "message": str(e), "call_id": call_id}
-
 
 @celery_app.task(name="get_task_status")
 def get_task_status(task_id: str) -> Dict:

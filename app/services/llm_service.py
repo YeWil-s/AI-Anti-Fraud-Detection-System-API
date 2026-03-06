@@ -61,6 +61,7 @@ class LLMService:
 {chat_history}
 
 【底层AI模型多模态特征分析结果】（极其重要！）：
+- 本地文本预检(Text-ONNX)置信度：{text_conf} （0~1.0，>0.85通常代表话术高度匹配已知诈骗模板）
 - 语音伪造(Voice Clone)置信度：{audio_conf} （0~1.0，>0.7通常代表极有可能是AI合成变声）
 - 视频伪造(Deepfake)置信度：{video_conf} （0~1.0，>0.75通常代表画面经过AI换脸或唇形篡改）
 
@@ -68,6 +69,7 @@ class LLMService:
 1. 上下文连贯性：骗子通常会将“我是领导”、“出事了”、“快打钱”分段发送。请务必将【当前最新输入】与【近期对话上下文】结合看，一旦发现连环套话术，立即提高风险等级。
 2. 交叉验证：如果文本内容涉及要钱/转账，且【语音/视频伪造置信度】处于高位，必须判定为 is_fraud=True，risk_level="fake"。
 3. 纠正误报：如果语音置信度较高，但结合上下文完全是正常业务（如快递员送件），请结合常识判定为 safe，纠正底层误报。
+4. 双重印证：如果【本地文本预检置信度】极高(>0.9)，即使音视频是真实的，也说明通话内容极具煽动性或欺诈性，请重点审视并倾向于判定为高风险。
 
 请综合推理，并严格按照 JSON 格式输出最终裁定结果。
 {format_instructions}
@@ -102,7 +104,9 @@ class LLMService:
                 "analysis": "大模型调用异常，降级通过", "advice": "系统繁忙"
             }
 
-    async def analyze_multimodal_risk(self, user_input: str, chat_history: str, user_profile: str = "青壮年", call_type: str = "普通通话", audio_conf: float = 0.0, video_conf: str = "0.0") -> dict:
+    async def analyze_multimodal_risk(self, user_input: str, chat_history: str, user_profile: str = "青壮年", 
+        call_type: str = "普通通话", audio_conf: float = 0.0, 
+        video_conf: str = "0.0", text_conf: float = 0.0) -> dict:
         """多模态融合风控分析"""
         try:
             context = await asyncio.to_thread(vector_db.get_context_for_llm, query=user_input, n_results=2)
@@ -114,12 +118,13 @@ class LLMService:
                 "context": context,
                 "chat_history": chat_history,
                 "user_input": user_input,
+                "text_conf": f"{text_conf:.4f}",
                 "audio_conf": f"{audio_conf:.4f}",
                 "video_conf": video_conf,  # 传入 N/A 或具体数值
                 "format_instructions": self.output_parser.get_format_instructions()
             })
             
-            logger.info(f"多模态决策完成: 诈骗={response['is_fraud']} | 等级={response['risk_level']} | A_conf={audio_conf:.2f} | V_conf={video_conf:.2f}")
+            logger.info(f"多模态决策完成: 诈骗={response['is_fraud']} | 等级={response['risk_level']} | T_conf={text_conf:.2f} | A_conf={audio_conf:.2f} | V_conf={video_conf}")
             return response
             
         except Exception as e:
