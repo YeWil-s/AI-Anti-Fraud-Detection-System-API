@@ -2,7 +2,7 @@
 Pydantic Schema 模型
 """
 from pydantic import BaseModel, EmailStr, Field, ConfigDict
-from typing import Optional
+from typing import Optional, Any
 from datetime import datetime
 
 
@@ -82,6 +82,8 @@ class CallRecordResponse(CallRecordBase):
     video_url: Optional[str] = None
     created_at: datetime
     model_config = ConfigDict(from_attributes=True)
+    analysis: Optional[str] = Field(None, description="大模型对通话内容的完整分析")
+    advice: Optional[str] = Field(None, description="大模型给出的专属防骗建议")
 
 
 # ========== AI检测日志相关 ==========
@@ -119,4 +121,4 @@ class ResponseModel(BaseModel):
     """通用响应模型"""
     code: int = 200
     message: str = "Success"
-    data: Optional[dict] = None
+    data: Optional[Any] = None

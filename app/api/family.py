@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, and_
+from sqlalchemy import select, and_, delete, update
 
 from app.db.database import get_db
 from app.core.security import get_current_user_id
@@ -22,7 +22,11 @@ async def create_family_group(
     user = result.scalar_one_or_none()
     if user and user.family_id:
         return ResponseModel(code=400, message="您已在一个家庭组中")
-
+    
+    admin_check = await db.execute(select(FamilyGroup).where(FamilyGroup.admin_id == current_user_id))
+    if admin_check.scalars().first():
+        return ResponseModel(code=400, message="您已经是某个家庭组的管理员，请勿重复创建")
+    
     # 2. 创建群组 
     new_family = FamilyGroup(group_name=name, admin_id=current_user_id) 
     db.add(new_family)
@@ -32,6 +36,8 @@ async def create_family_group(
     # 3. 将创建者自己绑定到这个新组
     if user:
         user.family_id = new_family.id
+        user.is_admin = True
+
         await db.commit()
 
     return ResponseModel(
@@ -141,3 +147,105 @@ async def review_application(
 
     await db.commit()
     return ResponseModel(code=200, message=f"操作成功，{msg}")
+
+@router.get("/members", response_model=ResponseModel)
+async def get_family_members(
+    current_user_id: int = Depends(get_current_user_id),
+    db: AsyncSession = Depends(get_db)
+):
+    """获取家庭组成员列表"""
+    # 1. 查找当前用户及确认其所在的家庭组
+    user_result = await db.execute(select(User).where(User.user_id == current_user_id))
+    current_user = user_result.scalar_one_or_none()
+    
+    if not current_user or not current_user.family_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, 
+            detail="您还未加入任何家庭组"
+        )
+        
+    # 2. 查询同 family_id 的所有成员
+    members_result = await db.execute(
+        select(User).where(User.family_id == current_user.family_id)
+    )
+    members = members_result.scalars().all()
+    
+    # 3. 组装返回数据，过滤掉敏感信息（如密码）
+    return ResponseModel(
+        code=200,
+        message="获取成员列表成功",
+        data=[
+            {
+                "user_id": member.user_id,
+                "username": member.username,
+                "name": member.name,
+                "phone": member.phone,
+                "role_type": member.role_type, # 如：老人、学生等
+                "is_admin": member.is_admin,   # 是否是家庭组长
+            }
+            for member in members
+        ]
+    )
+
+
+@router.post("/leave", response_model=ResponseModel)
+async def leave_family_group(
+    current_user_id: int = Depends(get_current_user_id),
+    db: AsyncSession = Depends(get_db)
+):
+    """退出家庭组 (组长退出即解散整个群组)"""
+    # 1. 查询当前用户
+    user_result = await db.execute(select(User).where(User.user_id == current_user_id))
+    current_user = user_result.scalar_one_or_none()
+    
+    if not current_user or not current_user.family_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, 
+            detail="您还未加入任何家庭组"
+        )
+        
+    target_family_id = current_user.family_id
+
+    # 2. 判断身份并执行对应退出逻辑
+    if current_user.is_admin:
+        # ==========================================
+        # 组长退出逻辑：解散家庭组，清理所有关联数据
+        # ==========================================
+        
+        # 第一步：删除该家庭组所有的申请记录 (防止外键约束冲突)
+        await db.execute(
+            delete(FamilyApplication).where(FamilyApplication.family_id == target_family_id)
+        )
+        
+        # 第二步：将所有属于该家庭组的成员的 family_id 置空，并撤销管理员身份
+        await db.execute(
+            update(User)
+            .where(User.family_id == target_family_id)
+            .values(family_id=None, is_admin=False)
+        )
+        
+        # 第三步：删除家庭组记录本身
+        await db.execute(
+            delete(FamilyGroup).where(FamilyGroup.id == target_family_id)
+        )
+        
+        # 由于当前用户的对象还在内存里，手动更新一下它的状态以保安全
+        current_user.family_id = None
+        current_user.is_admin = False
+        
+        msg = "您已成功解散并退出家庭组"
+        
+    else:
+        # ==========================================
+        # 普通成员退出逻辑：仅清除自己的绑定信息
+        # ==========================================
+        current_user.family_id = None
+        msg = "已成功退出家庭组"
+    
+    # 3. 统一提交事务
+    await db.commit()
+    
+    return ResponseModel(
+        code=200,
+        message=msg
+    )

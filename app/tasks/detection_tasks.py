@@ -131,7 +131,8 @@ def detect_audio_task(self, audio_base64: str, user_id: int, call_id: int) -> Di
     async def _process():
         async with AsyncSessionLocal() as db:
             try:
-                await ensure_call_record_exists(db, call_id, user_id)
+                # 1. 获取通话记录对象
+                record = await ensure_call_record_exists(db, call_id, user_id)
 
                 try:
                     audio_bytes = base64.b64decode(audio_base64)
@@ -141,12 +142,29 @@ def detect_audio_task(self, audio_base64: str, user_id: int, call_id: int) -> Di
                 if settings.COLLECT_TRAINING_DATA:
                     await save_raw_data(audio_bytes, user_id, call_id, "audio", "wav")
                 
+                # 模型预测
                 result = await model_service.predict_voice(audio_bytes)
                 is_fake = result.get('is_fake', False)
                 confidence = result.get('confidence', 0.0)
                 risk_level = result.get('risk_level', 'low')
+                
+                # 2. 正确计算 time_offset
+                # 提取 record 里的 start_time (如果 record 不存在则兜底用当前时间防止报错)
+                now = datetime.now()
+                call_start_time = record.start_time if record and record.start_time else datetime.now()
+                
+                
+                # 时区对齐
+                if call_start_time.tzinfo and not now.tzinfo:
+                    now = now.replace(tzinfo=call_start_time.tzinfo)
+                elif not call_start_time.tzinfo and now.tzinfo:
+                    call_start_time = call_start_time.replace(tzinfo=now.tzinfo)
+                
+                # 相减得到秒数偏移量
+                time_offset = int((now - call_start_time).total_seconds())
+                if time_offset < 0: time_offset = 0
 
-                # [修改 1] 将最新的音频分数写入 Redis "黑板"，供文本融合任务拉取
+                # 3. 将最新的音频分数写入 Redis "黑板"
                 r = redis.from_url(settings.REDIS_URL)
                 r.setex(f"call:{call_id}:latest_audio_conf", 3600, str(confidence))
 
@@ -154,26 +172,26 @@ def detect_audio_task(self, audio_base64: str, user_id: int, call_id: int) -> Di
                 if confidence > settings.VOICE_DETECTION_THRESHOLD:
                     evidence_url = await save_audit_evidence(audio_bytes, user_id, call_id, "audio", "wav")
                 
+                # 4. 记录到底层 AI 审计日志
                 ai_log = AIDetectionLog(
                     call_id=call_id,
                     voice_confidence=confidence,
                     overall_score=confidence * 100,
                     evidence_snapshot=evidence_url,
-                    time_offset=time_offset,
+                    time_offset=time_offset, # 正确存入 time_offset
                     model_version="v1.0"
                 )
                 db.add(ai_log)
                 await db.commit()
 
+                # 更新通话记录的留存证据URL
                 if evidence_url:
-                    call_stmt = select(CallRecord).where(CallRecord.call_id == call_id)
-                    call_result = await db.execute(call_stmt)
-                    record = call_result.scalar_one_or_none()
-                    
+                    # 刚才已经查询过 record 了，这里可以直接使用，不用再 select 一次
                     if record and not record.audio_url:
                         record.audio_url = evidence_url
                         await db.commit()
-                    
+                
+                # 触发消息告警系统
                 await notification_service.handle_detection_result(
                     db=db, user_id=user_id, call_id=call_id,
                     detection_type="语音", is_risk=is_fake, confidence=confidence,
@@ -181,10 +199,8 @@ def detect_audio_task(self, audio_base64: str, user_id: int, call_id: int) -> Di
                     details=f"检测结果: {'伪造' if is_fake else '真实'}"
                 )
 
-                if is_fake and confidence > 0.85:  # 设置一个高阈值
-                    call_stmt = select(CallRecord).where(CallRecord.call_id == call_id)
-                    call_result = await db.execute(call_stmt)
-                    record = call_result.scalar_one_or_none()
+                # 更新大盘风险状态
+                if is_fake and confidence > 0.85:
                     if record and record.detected_result != "fake":
                         record.detected_result = "fake"
                         await db.commit()
@@ -193,7 +209,7 @@ def detect_audio_task(self, audio_base64: str, user_id: int, call_id: int) -> Di
                 if is_fake and confidence > 0.95:
                     payload_control = {
                         "type": "control", "action": "upgrade_level", "target_level": 2,
-                        "config": {"video_fps": 30.0, "ui_message": "检测到高危AI合成语音，请立即挂断！"}
+                        "config": {"ui_message": "检测到高危AI合成语音，请立即挂断！"} # 音频任务里不需要传 video_fps
                     }
                     publish_control_command(user_id, payload_control)
 
@@ -207,8 +223,6 @@ def detect_audio_task(self, audio_base64: str, user_id: int, call_id: int) -> Di
     except Exception as e:
         logger.error(f"Task wrapper failed: {e}")
         return {"status": "error", "message": str(e)}
-
-
 @celery_app.task(name="detect_video", bind=True)
 def detect_video_task(self, frame_data: list, user_id: int, call_id: int) -> Dict:
     """视频检测任务 (底层雷达)"""
@@ -441,6 +455,8 @@ def detect_text_task(self, text: str, user_id: int, call_id: int) -> Dict:
                 
                 is_fraud = llm_result.get('is_fraud', False)
                 risk_level = llm_result.get('risk_level', 'safe')
+                full_analysis = llm_result.get('analysis', '')
+                full_advice = llm_result.get('advice', '')
 
                 # 7. 写入最终决策日志并通知前端
                 await notification_service.handle_detection_result(
@@ -448,23 +464,25 @@ def detect_text_task(self, text: str, user_id: int, call_id: int) -> Dict:
                     detection_type="多模态(Agent融合)", is_risk=is_fraud, 
                     confidence=llm_result.get('confidence', 0.0),
                     risk_level=risk_level,
-                    details=f"Agent裁定: {llm_result.get('analysis')[:60]}..."
+                    details=f"Agent裁定: {full_analysis}"
                 )
 
-                if is_fraud:
-                    # 重新查询当前的通话记录
-                    call_stmt = select(CallRecord).where(CallRecord.call_id == call_id)
-                    call_result = await db.execute(call_stmt)
-                    record = call_result.scalar_one_or_none()
+                call_stmt = select(CallRecord).where(CallRecord.call_id == call_id)
+                call_result = await db.execute(call_stmt)
+                record = call_result.scalar_one_or_none()
+                
+                if record:
+                    # 无论是否诈骗，只要大模型给了评价，我们就更新最新评价
+                    record.analysis = full_analysis
+                    record.advice = full_advice
                     
-                    if record:
-                        # 只要当前记录不是 fake，我们就允许它升级
-                        if record.detected_result != "fake":
-                            if risk_level in ['fake', 'high', 'critical']:
-                                record.detected_result = "fake"
-                            else:
-                                record.detected_result = "suspicious"
-                        await db.commit()
+                    if is_fraud and record.detected_result != "fake":
+                        if risk_level in ['fake', 'high', 'critical']:
+                            record.detected_result = "fake"
+                        else:
+                            record.detected_result = "suspicious"
+                            
+                    await db.commit()
 
                 # 8. LLM 下达 WebSocket 控制指令 (动态升降级)
                 if is_fraud and risk_level in ['suspicious', 'fake', 'high', 'critical']:

@@ -60,6 +60,8 @@ async def get_my_call_records(
                     "duration": r.duration,
                     "detected_result": r.detected_result.value if r.detected_result else None,
                     "audio_url": r.audio_url,
+                    "analysis": r.analysis, 
+                    "advice": r.advice,
                     "created_at": r.created_at.isoformat() if r.created_at else None
                 }
                 for r in records
@@ -143,6 +145,8 @@ async def get_call_record_detail(
                 "duration": record.duration,
                 "detected_result": record.detected_result.value,
                 "audio_url": record.audio_url,
+                "analysis": record.analysis,  
+                "advice": record.advice,
                 "created_at": record.created_at.isoformat()
             },
             # 详情页通常需要更详细的AI数据
@@ -212,6 +216,8 @@ async def get_family_call_records(
                     "start_time": r.start_time.isoformat() if r.start_time else None,
                     "duration": r.duration,
                     "detected_result": r.detected_result.value if r.detected_result else None,
+                    "analysis": r.analysis, 
+                    "advice": r.advice,
                     "created_at": r.created_at.isoformat() if r.created_at else None
                 }
                 for r in records

@@ -1,7 +1,7 @@
 """
 通话记录模型
 """
-from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, Enum as SQLEnum
+from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, Enum as SQLEnum, Text
 from sqlalchemy.sql import func
 from app.db.database import Base
 import enum
@@ -32,7 +32,9 @@ class CallRecord(Base):
     start_time = Column(DateTime(timezone=True), nullable=False, comment="通话开始时间")
     end_time = Column(DateTime(timezone=True), nullable=True, comment="通话结束时间")
     duration = Column(Integer, default=0, comment="通话时长(秒)")
-    
+    analysis = Column(Text, nullable=True, comment="大模型对通话内容的完整分析")
+    advice = Column(Text, nullable=True, comment="大模型针对用户画像给出的专属防骗建议")
+
     detected_result = Column(
         SQLEnum(DetectionResult),
         default=DetectionResult.SAFE,
