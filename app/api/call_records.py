@@ -9,6 +9,7 @@ from datetime import datetime
 from pydantic import BaseModel
 from app.db.database import get_db
 from app.core.security import get_current_user_id
+from app.models.message_log import MessageLog
 
 from app.models.call_record import CallRecord, DetectionResult, CallPlatform
 from app.models.ai_detection_log import AIDetectionLog
@@ -317,3 +318,91 @@ async def end_call_record(
         message="通话记录归档成功", 
         data={"duration": record.duration}
     )
+
+@router.get("/{call_id}/audit-logs", response_model=ResponseModel)
+async def get_call_audit_logs(
+    call_id: int,
+    current_user_id: int = Depends(get_current_user_id),
+    db: AsyncSession = Depends(get_db)
+):
+    """获取指定通话的详细审计日志（时间轴）"""
+    # 1. 查询通话记录及其归属
+    result = await db.execute(select(CallRecord).where(CallRecord.call_id == call_id))
+    record = result.scalar_one_or_none()
+    if not record:
+        raise HTTPException(status_code=404, detail="通话记录不存在")
+
+    # 2. 权限校验：本人或其家庭组管理员可看
+    user_result = await db.execute(select(User).where(User.user_id == current_user_id))
+    current_user = user_result.scalar_one_or_none()
+
+    if record.user_id != current_user_id:
+        owner_result = await db.execute(select(User).where(User.user_id == record.user_id))
+        owner = owner_result.scalar_one_or_none()
+        if not owner or owner.family_id != current_user.family_id or not current_user.is_admin:
+            raise HTTPException(status_code=403, detail="无权查看该记录的审计日志")
+
+    # 3. 获取底层 AI 检测日志
+    ai_logs_result = await db.execute(
+        select(AIDetectionLog).where(AIDetectionLog.call_id == call_id).order_by(AIDetectionLog.time_offset.asc())
+    )
+    ai_logs = ai_logs_result.scalars().all()
+
+    # 4. 获取告警消息日志
+    msg_logs_result = await db.execute(
+        select(MessageLog).where(MessageLog.call_id == call_id).order_by(MessageLog.created_at.asc())
+    )
+    msg_logs = msg_logs_result.scalars().all()
+
+    return ResponseModel(
+        code=200,
+        message="获取审计日志成功",
+        data={
+            "ai_events": [{
+                "time_offset": log.time_offset,
+                "overall_score": log.overall_score,
+                "voice_conf": log.voice_confidence,
+                "video_conf": log.video_confidence,
+                "text_conf": log.text_confidence,
+                "evidence_url": log.evidence_snapshot
+            } for log in ai_logs],
+            "alert_events": [{
+                "created_at": log.created_at.isoformat() if log.created_at else None,
+                "msg_type": log.msg_type,
+                "risk_level": log.risk_level,
+                "title": log.title,
+                "content": log.content
+            } for log in msg_logs]
+        }
+    )
+
+@router.post("/{call_id}/report-to-admin", response_model=ResponseModel)
+async def report_call_to_admin(
+    call_id: int,
+    current_user_id: int = Depends(get_current_user_id),
+    db: AsyncSession = Depends(get_db)
+):
+    """家庭组长审查后，提交给系统管理员喂给智能体学习"""
+    # 1. 权限校验
+    result = await db.execute(select(CallRecord).where(CallRecord.call_id == call_id))
+    record = result.scalar_one_or_none()
+    if not record:
+        raise HTTPException(status_code=404, detail="通话记录不存在")
+
+    user_result = await db.execute(select(User).where(User.user_id == current_user_id))
+    current_user = user_result.scalar_one_or_none()
+
+    # 必须是管理员，且这条记录是自己家人的
+    if not current_user.is_admin:
+        raise HTTPException(status_code=403, detail="仅家庭组管理员可提交审查")
+
+    owner_result = await db.execute(select(User).where(User.user_id == record.user_id))
+    owner = owner_result.scalar_one_or_none()
+    if not owner or owner.family_id != current_user.family_id:
+        raise HTTPException(status_code=403, detail="只能提交家庭组成员的记录")
+
+    # 2. 将检测结果标记为 FAKE (欺诈)，以便 admin.py 中的 get_fraud_cases 接口能捕获到
+    record.detected_result = DetectionResult.FAKE
+    await db.commit()
+
+    return ResponseModel(code=200, message="已成功提交至系统防诈特征库待审核队列")

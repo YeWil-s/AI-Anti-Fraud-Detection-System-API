@@ -11,7 +11,7 @@ class AIDetectionLog(Base):
     __tablename__ = "ai_detection_logs"
     
     log_id = Column(Integer, primary_key=True, index=True, autoincrement=True)
-    call_id = Column(Integer, ForeignKey("call_records.call_id"), nullable=False, index=True, comment="对应通话ID")
+    call_id = Column(Integer, ForeignKey("call_records.call_id", ondelete="CASCADE"), nullable=False, index=True, comment="对应通话ID")
     
     # 三模态评分
     voice_confidence = Column(Float, default=0.0, comment="声音伪造置信度(0-1)")

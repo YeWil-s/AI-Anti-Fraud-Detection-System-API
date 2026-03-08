@@ -104,7 +104,7 @@ async def get_applications(
             "apply_time": app.created_at.strftime("%Y-%m-%d %H:%M:%S") if app.created_at else None
         })
         
-    return ResponseModel(code=200, message="获取成功", data=data)
+    return ResponseModel(code=200, message="获取成功", data={"items": data})
 
 @router.put("/applications/{app_id}", response_model=ResponseModel)
 async def review_application(

@@ -159,11 +159,21 @@ def detect_audio_task(self, audio_base64: str, user_id: int, call_id: int) -> Di
                     voice_confidence=confidence,
                     overall_score=confidence * 100,
                     evidence_snapshot=evidence_url,
+                    time_offset=time_offset,
                     model_version="v1.0"
                 )
                 db.add(ai_log)
                 await db.commit()
 
+                if evidence_url:
+                    call_stmt = select(CallRecord).where(CallRecord.call_id == call_id)
+                    call_result = await db.execute(call_stmt)
+                    record = call_result.scalar_one_or_none()
+                    
+                    if record and not record.audio_url:
+                        record.audio_url = evidence_url
+                        await db.commit()
+                    
                 await notification_service.handle_detection_result(
                     db=db, user_id=user_id, call_id=call_id,
                     detection_type="语音", is_risk=is_fake, confidence=confidence,
@@ -171,7 +181,15 @@ def detect_audio_task(self, audio_base64: str, user_id: int, call_id: int) -> Di
                     details=f"检测结果: {'伪造' if is_fake else '真实'}"
                 )
 
-                # [修改 2] 极高风险(>0.95)才越权直接发起强制拦截指令
+                if is_fake and confidence > 0.85:  # 设置一个高阈值
+                    call_stmt = select(CallRecord).where(CallRecord.call_id == call_id)
+                    call_result = await db.execute(call_stmt)
+                    record = call_result.scalar_one_or_none()
+                    if record and record.detected_result != "fake":
+                        record.detected_result = "fake"
+                        await db.commit()
+
+                # 极高风险才越权直接发起强制拦截指令
                 if is_fake and confidence > 0.95:
                     payload_control = {
                         "type": "control", "action": "upgrade_level", "target_level": 2,
@@ -250,7 +268,16 @@ def detect_video_task(self, frame_data: list, user_id: int, call_id: int) -> Dic
                     await db.commit()
                     r.set(tech_log_key, now_ts, ex=3600)
 
-                # 通知边缘触发处理 (略去详细日志，保持原有结构)
+                if evidence_url:
+                        call_stmt = select(CallRecord).where(CallRecord.call_id == call_id)
+                        call_result = await db.execute(call_stmt)
+                        record = call_result.scalar_one_or_none()
+                        
+                        if record and not record.cover_image:
+                            record.cover_image = evidence_url
+                            await db.commit()
+                        
+                # 通知边缘触发处理
                 alarm_start_key = f"detect:alarm_start:{call_id}"
                 last_alert_key = f"detect:last_alert:{call_id}"
                 prev_state = debounce_data.get("prev_state", "SAFE")
@@ -282,7 +309,7 @@ def detect_video_task(self, frame_data: list, user_id: int, call_id: int) -> Dic
                         risk_level=risk_level, details=msg_content
                     )
 
-                # [修改 2] 极高风险(>0.95)才直接发起拦截，避免频繁打扰
+                # 极高风险(>0.95)才直接发起拦截，避免频繁打扰
                 if curr_state == "ALARM" and raw_conf > 0.95:
                      payload_control = {
                         "type": "control", "action": "upgrade_level", "target_level": 2,
@@ -326,11 +353,13 @@ def detect_text_task(self, text: str, user_id: int, call_id: int) -> Dict:
                 except Exception as e:
                     logger.error(f"Risk rule matching failed: {e}")
 
+                force_llm = False
+
                 if rule_hit:
                     logger.warning(f"触发规则拦截: {rule_hit['keyword']}")
                     risk_level_code = rule_hit.get('risk_level', 1)
                     if risk_level_code >= 4:
-                        # 命中绝对诈骗死穴，直接拉满防御等级阻断
+                        # 命中诈骗，拉满防御等级
                         publish_control_command(user_id, {
                             "type": "control", "action": "upgrade_level", "target_level": 2,
                             "config": {"ui_message": f"触发高危防骗规则: {rule_hit['keyword']}", "block_call": True}
@@ -340,7 +369,7 @@ def detect_text_task(self, text: str, user_id: int, call_id: int) -> Dict:
                             detection_type="多模态(强规则)", is_risk=True, confidence=1.0,
                             risk_level="critical", details=f"命中强规则: {rule_hit['keyword']}"
                         )
-                        return {"status": "success", "result": {"is_fraud": True, "source": "rule"}}
+                        force_llm = True
 
                 # ================== [新增] 第二道防线：本地 ONNX 模型快筛 ==================
                 try:
@@ -348,14 +377,17 @@ def detect_text_task(self, text: str, user_id: int, call_id: int) -> Dict:
                     text_conf = text_result.get("confidence", 0.5) 
                     logger.info(f"本地 ONNX 文本检测置信度: {text_conf:.4f}")
                     
-                    # 极速拦截：如果是极度安全的日常闲聊 (低于0.3)
-                    if text_conf < 0.3:
+                    if force_llm:
+                        logger.info("已命中高危风险词，跳过 ONNX 安全拦截，强制交由大模型裁决")
+                        text_conf = max(text_conf, 0.95) 
+                    elif text_conf < 0.3:
+                        # 极速拦截：如果是极度安全的日常闲聊 (低于0.3)
                         logger.info("ONNX 判定为安全闲聊，跳过大模型处理")
                         return {"status": "success", "result": {"is_fraud": False, "risk_level": "safe", "source": "onnx"}}
-                    
+
                 except Exception as e:
                     logger.error(f"ONNX 文本快筛异常: {e}")
-                    text_conf = 0.5 # 如果崩了，给个中性分数，交由 LLM 兜底处理
+                    text_conf = 0.95 if force_llm else 0.5 # 如果崩了，给个中性分数，交由 LLM 兜底处理
                 # =========================================================================
 
                 # 2. 从数据库动态获取通话场景 (平台标识)
@@ -404,7 +436,7 @@ def detect_text_task(self, text: str, user_id: int, call_id: int) -> Dict:
                     call_type=call_type_desc,
                     audio_conf=audio_conf,
                     video_conf=video_conf_val,
-                    text_conf=text_conf  # <--- [新增] 将ONNX漏斗过滤后的分数传递给司令部
+                    text_conf=text_conf  
                 )
                 
                 is_fraud = llm_result.get('is_fraud', False)
@@ -418,6 +450,21 @@ def detect_text_task(self, text: str, user_id: int, call_id: int) -> Dict:
                     risk_level=risk_level,
                     details=f"Agent裁定: {llm_result.get('analysis')[:60]}..."
                 )
+
+                if is_fraud:
+                    # 重新查询当前的通话记录
+                    call_stmt = select(CallRecord).where(CallRecord.call_id == call_id)
+                    call_result = await db.execute(call_stmt)
+                    record = call_result.scalar_one_or_none()
+                    
+                    if record:
+                        # 只要当前记录不是 fake，我们就允许它升级
+                        if record.detected_result != "fake":
+                            if risk_level in ['fake', 'high', 'critical']:
+                                record.detected_result = "fake"
+                            else:
+                                record.detected_result = "suspicious"
+                        await db.commit()
 
                 # 8. LLM 下达 WebSocket 控制指令 (动态升降级)
                 if is_fraud and risk_level in ['suspicious', 'fake', 'high', 'critical']:

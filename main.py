@@ -7,6 +7,7 @@ from unittest.mock import MagicMock
 os.environ["ANONYMIZED_TELEMETRY"] = "false"
 os.environ["CHROMA_TELEMETRY"] = "false"
 os.environ["POSTHOG_DISABLED"] = "1"
+os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 sys.modules['chromadb.telemetry.posthog'] = MagicMock()
 sys.modules['posthog'] = MagicMock()
 import asyncio
