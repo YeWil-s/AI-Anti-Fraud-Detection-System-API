@@ -425,7 +425,8 @@ async def get_call_audit_logs(
                 "voice_conf": log.voice_confidence,
                 "video_conf": log.video_confidence,
                 "text_conf": log.text_confidence,
-                "evidence_url": log.evidence_snapshot
+                "evidence_url": log.evidence_snapshot,
+                "text_content": log.detected_keywords,
             } for log in ai_logs],
             "alert_events": [{
                 "created_at": log.created_at.isoformat() if log.created_at else None,
