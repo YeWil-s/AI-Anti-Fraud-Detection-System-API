@@ -1,56 +1,71 @@
-# test_pipeline.py
-import time
-import redis
-from app.tasks.detection_tasks import detect_text_task
-from app.core.config import settings
+import requests
+import json
 
-def run_simulation():
-    user_id = 3
-    call_id = 9999  # 模拟一通真实的电话通话
+# 请根据你实际运行的服务地址修改
+BASE_URL = "http://localhost:8000" 
+
+def test_generate_report():
+    print("1. 正在尝试登录...")
+    login_url = f"{BASE_URL}/api/users/login"
+    login_payload = {
+        "phone": "13800138000",
+        "password": "123456"
+    }
     
-    # 连接 Redis，用于模拟底层音视频向"黑板"写入数据
-    r = redis.from_url(settings.REDIS_URL)
-
-    print("=== 🎬 开始模拟【三级漏斗多模态风控】测试 ===")
-
-    # 初始化/清空当前通话的黑板数据
-    r.delete(f"call:{call_id}:latest_audio_conf")
-    r.delete(f"call:{call_id}:latest_video_conf")
-    r.setex(f"call:{call_id}:latest_audio_conf", 3600, "0.05") # 初始非常安全
-    r.setex(f"call:{call_id}:latest_video_conf", 3600, "0.02")
-
-    # ---------------------------------------------------------
-    # 测试 1：正常的寒暄（期望：被本地 ONNX 极速拦截，根本不呼叫大模型）
-    # ---------------------------------------------------------
-    print("\n[时间 00:01] 说话：喂，小王啊，晚上打算吃什么？")
-    res1 = detect_text_task.delay(text="喂，小王啊，晚上打算吃什么？", user_id=user_id, call_id=call_id)
-    time.sleep(3) 
-    print(f"-> 任务ID: {res1.id} ")
-    print("   👉 预期 Celery 日志: [ONNX 判定为安全闲聊，跳过大模型处理]")
-
-    # ---------------------------------------------------------
-    # 测试 2：开始暴露意图（期望：ONNX 觉得可疑(>0.3)，提交给 LLM 研判）
-    # ---------------------------------------------------------
-    print("\n[时间 00:15] 说话：我是你领导，现在在外面办点急事。")
-    res2 = detect_text_task.delay(text="我是你领导，现在在外面办点急事。", user_id=user_id, call_id=call_id)
-    time.sleep(5)
-    print(f"-> 任务ID: {res2.id} ")
-    print("   👉 预期 Celery 日志: LLM 会结合上下文，可能判定为 suspicious(中危)")
+    try:
+        # 登录请求不需要太长超时
+        login_response = requests.post(login_url, json=login_payload, timeout=10)
+        
+        if login_response.status_code != 200:
+            print(f"❌ 登录失败: {login_response.text}")
+            return
+            
+        login_data = login_response.json()
+        token = login_data.get("access_token")
+        # 从返回的用户信息中获取 user_id
+        user_id = login_data.get("user", {}).get("user_id")
+        
+        if not user_id:
+            print("❌ 获取 user_id 失败")
+            return
+            
+        print(f"✅ 登录成功！获取到 user_id: {user_id}")
+        
+    except Exception as e:
+        print(f"❌ 登录请求发生异常: {e}")
+        return
 
     # ---------------------------------------------------------
-    # 测试 3：连环套收网，并伴随高仿音视频（期望：LLM 结合黑板数据做出终极制裁）
-    # ---------------------------------------------------------
-    print("\n[时间 00:30] 说话：恭喜你中奖了！")
-    print("   🚨 (底层系统模拟：音频和视频雷达突然报警，写入 Redis 黑板)")
-    r.setex(f"call:{call_id}:latest_audio_conf", 3600, "0.85") # 极高的语音伪造率
-    r.setex(f"call:{call_id}:latest_video_conf", 3600, "0.92") # 极高的换脸概率
     
-    # 只发文本任务，它会自动去 Redis 拉取上面的高危分数
-    res3 = detect_text_task.delay(text="恭喜你中奖了！", user_id=user_id, call_id=call_id)
+    print("\n2. 开始生成个人安全监测报告 (调用大模型中，请耐心等待...)")
+    report_url = f"{BASE_URL}/api/users/{user_id}/security-report"
     
-    time.sleep(5)
-    print(f"-> 任务ID: {res3.id}")
-    print("   👉 预期 Celery 日志: LLM 拿到 ONNX 高分 + 历史聊天 + 音视频高危分数，直接触发 upgrade_level 和强阻断！")
+    headers = {
+        "Authorization": f"Bearer {token}"
+    }
+    
+    try:
+        # 【关键】因为大模型生成 Markdown 需要较长时间，这里必须设置较长的超时时间 (例如 120 秒)
+        report_response = requests.get(report_url, headers=headers, timeout=120)
+        
+        if report_response.status_code == 200:
+            report_data = report_response.json()
+            print("\n✅ 报告生成成功！")
+            print("="*50)
+            print(f"用户: {report_data.get('username')}")
+            print(f"生成时间: {report_data.get('report_generated_at')}")
+            print("="*50)
+            print("【报告内容 Markdown】:\n")
+            print(report_data.get('report_content'))
+            print("="*50)
+        else:
+            print(f"❌ 生成报告失败，状态码: {report_response.status_code}")
+            print(f"错误详情: {report_response.text}")
+            
+    except requests.exceptions.Timeout:
+        print("❌ 请求超时！大模型未能在 120 秒内返回结果，建议检查大模型 API 响应速度。")
+    except Exception as e:
+        print(f"❌ 生成报告请求发生异常: {e}")
 
 if __name__ == "__main__":
-    run_simulation()
+    test_generate_report()

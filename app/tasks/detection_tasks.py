@@ -14,7 +14,7 @@ from datetime import datetime
 from asgiref.sync import async_to_sync
 
 from sqlalchemy import select
-from app.models.call_record import CallRecord
+from app.models.call_record import CallRecord, DetectionResult
 
 from app.services.memory_service import memory_service
 from app.services.llm_service import llm_service
@@ -33,6 +33,22 @@ from app.core.logger import get_logger, bind_context
 
 # 初始化模块级 logger
 logger = get_logger(__name__)
+
+def publish_realtime_score(user_id: int, detection_type: str, is_risk: bool, confidence: float):
+    """专门向前端 WebSocket 实时推送分数"""
+    try:
+        payload = {
+            "type": "detection_result",
+            "detection_type": detection_type,
+            "is_risk": is_risk,
+            "confidence": confidence,
+            "message": "安全" if not is_risk else "检测到风险"
+        }
+        message_data = {"user_id": user_id, "payload": payload}
+        # 通过 Redis pub/sub 发送给 websocket_manager
+        notification_service.redis.publish("fraud_alerts", json.dumps(message_data))
+    except Exception as e:
+        logger.error(f"Failed to publish real-time score: {e}")
 
 async def save_raw_data(data: bytes, user_id: int, call_id: int, data_type: str, ext: str):
     """保存原始数据到 MinIO"""
@@ -146,12 +162,13 @@ def detect_audio_task(self, audio_base64: str, user_id: int, call_id: int) -> Di
                 result = await model_service.predict_voice(audio_bytes)
                 is_fake = result.get('is_fake', False)
                 confidence = result.get('confidence', 0.0)
+                publish_realtime_score(user_id, "语音", is_fake, confidence)
                 risk_level = result.get('risk_level', 'low')
                 
                 # 2. 正确计算 time_offset
                 # 提取 record 里的 start_time (如果 record 不存在则兜底用当前时间防止报错)
                 now = datetime.now()
-                call_start_time = record.start_time if record and record.start_time else datetime.now()
+                call_start_time = record.start_time if hasattr(record, 'start_time') and record.start_time else (record if isinstance(record, datetime) else datetime.now())
                 
                 
                 # 时区对齐
@@ -192,24 +209,36 @@ def detect_audio_task(self, audio_base64: str, user_id: int, call_id: int) -> Di
                         await db.commit()
                 
                 # 触发消息告警系统
+                audio_alert_level = "safe"
+                if is_fake:
+                    if confidence >= 0.95:
+                        audio_alert_level = "critical"  # 极度确信是AI伪造，致命风险
+                    elif confidence >= 0.85:
+                        audio_alert_level = "high"      # 高度确信，高风险
+                    elif confidence >= 0.75:
+                        audio_alert_level = "medium"    # 有一定嫌疑，中风险
+                    else:
+                        audio_alert_level = "low"       # 嫌疑较小，低风险提示
+
+                # 2. 触发消息告警系统
                 await notification_service.handle_detection_result(
                     db=db, user_id=user_id, call_id=call_id,
                     detection_type="语音", is_risk=is_fake, confidence=confidence,
-                    risk_level=risk_level if is_fake else "safe",
-                    details=f"检测结果: {'伪造' if is_fake else '真实'}"
+                    risk_level=audio_alert_level,  # <--- 使用动态计算的规范等级
+                    details=f"检测结果: {'AI合成语音' if is_fake else '真实'} (置信度: {confidence:.2f})"
                 )
-
+                
                 # 更新大盘风险状态
                 if is_fake and confidence > 0.85:
-                    if record and record.detected_result != "fake":
-                        record.detected_result = "fake"
+                    if record and record.detected_result not in [DetectionResult.FAKE, DetectionResult.SUSPICIOUS]:
+                        record.detected_result = DetectionResult.SUSPICIOUS
                         await db.commit()
 
                 # 极高风险才越权直接发起强制拦截指令
                 if is_fake and confidence > 0.95:
                     payload_control = {
                         "type": "control", "action": "upgrade_level", "target_level": 2,
-                        "config": {"ui_message": "检测到高危AI合成语音，请立即挂断！"} # 音频任务里不需要传 video_fps
+                        "config": {"ui_message": "检测到可疑语音特征，已提高警惕！"} 
                     }
                     publish_control_command(user_id, payload_control)
 
@@ -231,7 +260,10 @@ def detect_video_task(self, frame_data: list, user_id: int, call_id: int) -> Dic
     async def _process():
         async with AsyncSessionLocal() as db:
             try:
-                call_start_time = await ensure_call_record_exists(db, call_id, user_id)
+                record = await ensure_call_record_exists(db, call_id, user_id)
+                # 安全提取时间：如果是CallRecord对象取start_time，否则取其本身或当前时间
+                call_start_time = record.start_time if hasattr(record, 'start_time') and record.start_time else (record if isinstance(record, datetime) else datetime.now())
+                
                 now = datetime.now()
                 if call_start_time.tzinfo and not now.tzinfo:
                     now = now.replace(tzinfo=call_start_time.tzinfo)
@@ -249,6 +281,7 @@ def detect_video_task(self, frame_data: list, user_id: int, call_id: int) -> Dic
                 raw_result = await model_service.predict_video(video_tensor)
                 raw_is_fake = raw_result.get('is_deepfake', False)
                 raw_conf = raw_result.get('confidence', 0.0)
+                publish_realtime_score(user_id, "视频", raw_is_fake, raw_conf)
 
                 evidence_url = ""
                 if raw_conf > settings.VIDEO_DETECTION_THRESHOLD:
@@ -324,10 +357,19 @@ def detect_video_task(self, frame_data: list, user_id: int, call_id: int) -> Dic
                     )
 
                 # 极高风险(>0.95)才直接发起拦截，避免频繁打扰
+                if curr_state == "ALARM" and raw_conf > 0.80:
+                     call_stmt = select(CallRecord).where(CallRecord.call_id == call_id)
+                     call_result = await db.execute(call_stmt)
+                     record = call_result.scalar_one_or_none()
+
+                     if record and record.detected_result not in [DetectionResult.FAKE, DetectionResult.SUSPICIOUS]:
+                         record.detected_result = DetectionResult.SUSPICIOUS
+                         await db.commit()
+
                 if curr_state == "ALARM" and raw_conf > 0.95:
                      payload_control = {
                         "type": "control", "action": "upgrade_level", "target_level": 2,
-                        "config": {"video_fps": 30.0, "ui_message": "检测到极高危AI换脸，请警惕！"}
+                        "config": {"video_fps": 15.0, "ui_message": "画面出现可疑篡改痕迹，已提高防御等级！"}
                     }
                      publish_control_command(user_id, payload_control)
 
@@ -373,7 +415,7 @@ def detect_text_task(self, text: str, user_id: int, call_id: int) -> Dict:
                     logger.warning(f"触发规则拦截: {rule_hit['keyword']}")
                     risk_level_code = rule_hit.get('risk_level', 1)
                     if risk_level_code >= 4:
-                        # 命中诈骗，拉满防御等级
+                        # 命中诈骗，拉高防御等级
                         publish_control_command(user_id, {
                             "type": "control", "action": "upgrade_level", "target_level": 2,
                             "config": {"ui_message": f"触发高危防骗规则: {rule_hit['keyword']}", "block_call": True}
@@ -385,7 +427,6 @@ def detect_text_task(self, text: str, user_id: int, call_id: int) -> Dict:
                         )
                         force_llm = True
 
-                # ================== [新增] 第二道防线：本地 ONNX 模型快筛 ==================
                 try:
                     text_result = await model_service.predict_text(text)
                     text_conf = text_result.get("confidence", 0.5) 
@@ -404,7 +445,7 @@ def detect_text_task(self, text: str, user_id: int, call_id: int) -> Dict:
                     text_conf = 0.95 if force_llm else 0.5 # 如果崩了，给个中性分数，交由 LLM 兜底处理
                 # =========================================================================
 
-                # 2. 从数据库动态获取通话场景 (平台标识)
+                # 2. 从数据库动态获取通话场景
                 call_stmt = select(CallRecord).where(CallRecord.call_id == call_id)
                 call_result = await db.execute(call_stmt)
                 call_record = call_result.scalar_one_or_none()
@@ -454,7 +495,36 @@ def detect_text_task(self, text: str, user_id: int, call_id: int) -> Dict:
                 )
                 
                 is_fraud = llm_result.get('is_fraud', False)
+                publish_realtime_score(user_id, "文本", is_fraud, llm_result.get('confidence', 0.0))
                 risk_level = llm_result.get('risk_level', 'safe')
+                full_analysis = llm_result.get('analysis', '')
+                full_advice = llm_result.get('advice', '')
+                raw_llm_risk = llm_result.get('risk_level', 'safe').lower()
+
+                # A. 映射到 MessageLog (告警级别: safe, low, medium, high, critical)
+                alert_level = 'safe'
+                if is_fraud:
+                    if raw_llm_risk in ['critical', 'fake']:
+                        alert_level = 'critical'
+                    elif raw_llm_risk in ['high']:
+                        alert_level = 'high'
+                    elif raw_llm_risk in ['suspicious', 'medium']:
+                        alert_level = 'medium'
+                    else:
+                        alert_level = 'low'
+                
+                record_verdict = DetectionResult.SAFE
+                if is_fraud:
+                    if raw_llm_risk in ['critical', 'fake', 'high']:
+                        record_verdict = DetectionResult.FAKE
+                    else:
+                        record_verdict = DetectionResult.SUSPICIOUS
+                
+                target_level = 1
+                if is_fraud:
+                    target_level = 3 if record_verdict == DetectionResult.FAKE else 2
+
+                publish_realtime_score(user_id, "文本", is_fraud, llm_result.get('confidence', 0.0))
                 full_analysis = llm_result.get('analysis', '')
                 full_advice = llm_result.get('advice', '')
 
@@ -463,37 +533,36 @@ def detect_text_task(self, text: str, user_id: int, call_id: int) -> Dict:
                     db=db, user_id=user_id, call_id=call_id,
                     detection_type="多模态(Agent融合)", is_risk=is_fraud, 
                     confidence=llm_result.get('confidence', 0.0),
-                    risk_level=risk_level,
+                    risk_level=alert_level,
                     details=f"Agent裁定: {full_analysis}"
                 )
 
                 call_stmt = select(CallRecord).where(CallRecord.call_id == call_id)
                 call_result = await db.execute(call_stmt)
                 record = call_result.scalar_one_or_none()
-                
+
                 if record:
                     # 无论是否诈骗，只要大模型给了评价，我们就更新最新评价
                     record.analysis = full_analysis
                     record.advice = full_advice
                     
-                    if is_fraud and record.detected_result != "fake":
-                        if risk_level in ['fake', 'high', 'critical']:
-                            record.detected_result = "fake"
-                        else:
-                            record.detected_result = "suspicious"
-                            
+                    current_verdict = record.detected_result
+                    if record_verdict == DetectionResult.FAKE and current_verdict != DetectionResult.FAKE:
+                        record.detected_result = DetectionResult.FAKE
+                    elif record_verdict == DetectionResult.SUSPICIOUS and current_verdict == DetectionResult.SAFE:
+                        record.detected_result = DetectionResult.SUSPICIOUS
+                        
                     await db.commit()
 
                 # 8. LLM 下达 WebSocket 控制指令 (动态升降级)
-                if is_fraud and risk_level in ['suspicious', 'fake', 'high', 'critical']:
-                    target_level = 2 if risk_level in ['fake', 'critical'] else 1
+                if target_level > 1:
                     payload_control = {
                         "type": "control", "action": "upgrade_level", "target_level": target_level,
                         "config": {
-                            "video_fps": 15.0 if target_level == 1 else 30.0,
-                            "ui_message": f"智能防诈守卫: {llm_result.get('advice')}",
-                            "warning_mode": "modal",
-                            "block_call": (target_level == 2)
+                            "video_fps": 15.0 if target_level == 2 else 30.0,
+                            "ui_message": f"智能防诈守卫: {full_advice}",
+                            "warning_mode": "modal" if target_level == 2 else "fullscreen",
+                            "block_call": (target_level == 3)
                         }
                     }
                     publish_control_command(user_id, payload_control)
