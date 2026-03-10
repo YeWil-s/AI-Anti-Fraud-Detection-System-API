@@ -55,7 +55,7 @@ async def ensure_call_record_exists(db, call_id: int, user_id: int) -> datetime:
         record = result.scalar_one_or_none()
         
         if record:
-            return record.start_time or datetime.now()
+            return record
         
         logger.info(f"CallRecord {call_id} not found, auto-creating...")
         now = datetime.now()
@@ -68,7 +68,7 @@ async def ensure_call_record_exists(db, call_id: int, user_id: int) -> datetime:
         )
         db.add(new_record)
         await db.commit()
-        return now
+        return new_record
     except Exception as e:
         logger.error(f"Failed to ensure call record: {e}")
         return datetime.now()
