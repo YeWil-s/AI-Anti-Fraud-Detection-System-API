@@ -21,6 +21,7 @@ class MessageLog(Base):
     
     title = Column(String(100), nullable=False, comment="消息标题")
     content = Column(Text, nullable=False, comment="消息内容")
+    evidence_url = Column(String(500), nullable=True, comment="留存的证据链接(MinIO)")
     is_read = Column(Boolean, default=False, comment="是否已读")
     
     created_at = Column(DateTime(timezone=True), server_default=func.now(), comment="创建时间")

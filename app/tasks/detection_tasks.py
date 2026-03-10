@@ -224,10 +224,10 @@ def detect_audio_task(self, audio_base64: str, user_id: int, call_id: int) -> Di
                 await notification_service.handle_detection_result(
                     db=db, user_id=user_id, call_id=call_id,
                     detection_type="语音", is_risk=is_fake, confidence=confidence,
-                    risk_level=audio_alert_level,  # <--- 使用动态计算的规范等级
+                    risk_level=audio_alert_level,  
                     details=f"检测结果: {'AI合成语音' if is_fake else '真实'} (置信度: {confidence:.2f})"
                 )
-                
+
                 # 更新大盘风险状态
                 if is_fake and confidence > 0.85:
                     if record and record.detected_result not in [DetectionResult.FAKE, DetectionResult.SUSPICIOUS]:
@@ -401,6 +401,18 @@ def detect_text_task(self, text: str, user_id: int, call_id: int) -> Dict:
                 # 0. 过滤无意义短句 (小脑优化：少于2个字直接丢弃，省时省钱)
                 if len(text.strip()) < 2:
                     return {"status": "skipped", "reason": "text too short"}
+                call_stmt = select(CallRecord).where(CallRecord.call_id == call_id)
+                call_result = await db.execute(call_stmt)
+                call_record = call_result.scalar_one_or_none()
+                
+                now = datetime.now()
+                call_start_time = call_record.start_time if hasattr(call_record, 'start_time') and call_record.start_time else now
+                if call_start_time.tzinfo and not now.tzinfo:
+                    now = now.replace(tzinfo=call_start_time.tzinfo)
+                elif not call_start_time.tzinfo and now.tzinfo:
+                    call_start_time = call_start_time.replace(tzinfo=now.tzinfo)
+                time_offset = int((now - call_start_time).total_seconds())
+                if time_offset < 0: time_offset = 0
 
                 # 1. 第一道防线：小脑规则引擎 (毫秒级响应极速拦截)
                 rule_hit = None
@@ -438,6 +450,17 @@ def detect_text_task(self, text: str, user_id: int, call_id: int) -> Dict:
                     elif text_conf < 0.3:
                         # 极速拦截：如果是极度安全的日常闲聊 (低于0.3)
                         logger.info("ONNX 判定为安全闲聊，跳过大模型处理")
+                        ai_log = AIDetectionLog(
+                            call_id=call_id,
+                            text_confidence=text_conf,      # 极低风险分数
+                            overall_score=text_conf * 100,
+                            detected_keywords=text,         # 存入原文
+                            time_offset=time_offset,
+                            model_version="onnx-fast"       # 标记来源为轻量模型
+                        )
+                        db.add(ai_log)
+                        await db.commit()
+                        publish_realtime_score(user_id, "文本", False, text_conf)
                         return {"status": "success", "result": {"is_fraud": False, "risk_level": "safe", "source": "onnx"}}
 
                 except Exception as e:
@@ -446,10 +469,6 @@ def detect_text_task(self, text: str, user_id: int, call_id: int) -> Dict:
                 # =========================================================================
 
                 # 2. 从数据库动态获取通话场景
-                call_stmt = select(CallRecord).where(CallRecord.call_id == call_id)
-                call_result = await db.execute(call_stmt)
-                call_record = call_result.scalar_one_or_none()
-                
                 platform_raw = getattr(call_record, 'platform', 'PHONE')
                 platform_str = platform_raw.name if hasattr(platform_raw, 'name') else str(platform_raw)
                 platform_str_lower = platform_str.lower()
@@ -495,6 +514,18 @@ def detect_text_task(self, text: str, user_id: int, call_id: int) -> Dict:
                 )
                 
                 is_fraud = llm_result.get('is_fraud', False)
+
+                ai_log = AIDetectionLog(
+                    call_id=call_id,
+                    text_confidence=final_text_conf,
+                    overall_score=final_text_conf * 100,
+                    detected_keywords=text,        # 存入原文
+                    time_offset=time_offset,
+                    model_version="llm-fusion"     # 标记来源为大模型
+                )
+                db.add(ai_log)
+                await db.commit()
+
                 publish_realtime_score(user_id, "文本", is_fraud, llm_result.get('confidence', 0.0))
                 risk_level = llm_result.get('risk_level', 'safe')
                 full_analysis = llm_result.get('analysis', '')

@@ -1,7 +1,7 @@
 """
 通话记录管理API路由 - 数据隔离
 """
-from fastapi import APIRouter, Depends, HTTPException, status, Query
+from fastapi import APIRouter, Depends, HTTPException, status, Query,BackgroundTasks
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, and_, func
 from typing import Optional
@@ -15,6 +15,9 @@ from app.models.call_record import CallRecord, DetectionResult, CallPlatform
 from app.models.ai_detection_log import AIDetectionLog
 from app.models.user import User
 from app.schemas import ResponseModel
+
+from app.services.memory_service import memory_service
+from app.services.llm_service import llm_service
 
 router = APIRouter(prefix="/api/call-records", tags=["通话记录"])
 
@@ -269,6 +272,42 @@ async def delete_call_record(
         data={"call_id": call_id}
     )
 
+async def generate_call_summary_background(call_id: int, chat_history: list):
+    """在后台执行的大模型全量总结任务"""
+    if not chat_history or len(chat_history) == 0:
+        memory_service.clear_context(call_id)
+        return
+    
+    try:
+        # 1. 呼叫大模型进行全盘总结 (需要在 llm_service 中实现此方法)
+        summary_result = await llm_service.generate_final_summary(chat_history)
+        
+        # 2. 开启独立的数据库会话进行更新
+        async with AsyncSessionLocal() as db:
+            result = await db.execute(select(CallRecord).where(CallRecord.call_id == call_id))
+            record = result.scalar_one_or_none()
+            
+            if record:
+                # 覆盖实时的 analysis 和 advice，填入全局总结版
+                record.analysis = summary_result.get("analysis", record.analysis)
+                record.advice = summary_result.get("advice", record.advice)
+                
+                # 如果大模型根据全局判断发现了深层套路，还可以做最后一次风险定性修正
+                final_risk = summary_result.get("risk_level", "safe")
+                current_verdict = record.detected_result
+                
+                if final_risk in ['fake', 'high', 'critical']:
+                    record.detected_result = DetectionResult.FAKE
+                elif final_risk in ['suspicious', 'medium'] and current_verdict == DetectionResult.SAFE:
+                    record.detected_result = DetectionResult.SUSPICIOUS
+                    
+                await db.commit()
+    except Exception as e:
+        print(f"后台生成通话全局总结失败: {e}")
+    finally:
+        # 3. 无论成功失败，必须清理内存中的对话上下文，防止内存泄漏
+        memory_service.clear_context(call_id)
+
 # 定义接收前端请求的数据结构
 class CallRecordEndRequest(BaseModel):
     audio_url: Optional[str] = None
@@ -279,11 +318,12 @@ class CallRecordEndRequest(BaseModel):
 async def end_call_record(
     call_id: int,
     payload: CallRecordEndRequest,
+    background_tasks: BackgroundTasks,
     current_user_id: int = Depends(get_current_user_id),
     db: AsyncSession = Depends(get_db)
 ):
     """
-    结束通话监测，更新最终音视频文件URL并计算总时长
+    结束通话监测，更新最终音视频文件URL，并按需触发AI全局总结
     """
     # 1. 验证所有权，确保只能操作自己的记录
     result = await db.execute(
@@ -305,7 +345,6 @@ async def end_call_record(
     # 2. 更新结束时间和通话时长
     record.end_time = datetime.now()
     if record.start_time:
-        # 计算时长(秒)
         record.duration = int((record.end_time - record.start_time).total_seconds())
         
     # 3. 更新完整的音视频文件和封面 URL
@@ -318,13 +357,29 @@ async def end_call_record(
         
     await db.commit()
     
-    # 4. 返回符合项目中统一 ResponseModel 格式的结果
+    # ==========================================
+    # [核心修改] 判断是否需要触发后台总结
+    # ==========================================
+    # 检查数据库中是否已经有大模型写好的评价和建议 (非空判断)
+    has_llm_evaluation = bool(record.analysis and record.advice)
+    
+    chat_history = memory_service.get_context(call_id)
+    
+    if chat_history and not has_llm_evaluation:
+        # 只有在“有对话记录” 且 “大模型从未评价过” 的情况下，才触发最终总结
+        background_tasks.add_task(generate_call_summary_background, call_id, chat_history)
+        msg = "通话记录归档成功，正在后台生成AI全局总结"
+    else:
+        # 如果没有说话，或者实时检测过程中大模型已经写过评价了，直接清空 Redis 记忆并跳过总结
+        memory_service.clear_context(call_id)
+        msg = "通话记录归档成功"
+    
+    # 4. 立即返回，不阻塞前端
     return ResponseModel(
         code=200, 
-        message="通话记录归档成功", 
+        message=msg, 
         data={"duration": record.duration}
     )
-
 @router.get("/{call_id}/audit-logs", response_model=ResponseModel)
 async def get_call_audit_logs(
     call_id: int,
