@@ -2,6 +2,9 @@
 app/api/admin.py
 管理员专用接口：异步版本
 """
+import os
+import json
+from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, delete
@@ -173,16 +176,18 @@ async def get_fraud_cases(skip: int = 0, limit: int = 50, db: AsyncSession = Dep
     # 格式化返回数据，提取有用的信息
     response_data = []
     for case in cases:
+        # 适配真实的 CallRecord 字段
+        contact_info = case.caller_number or case.target_name or "未知号码"
+        
         response_data.append({
             "call_id": case.call_id,
             "user_id": case.user_id,
-            "target_number": case.target_number,
+            "target_number": contact_info, # 为了前端兼容，这里 key 不变，value 用组合字段
             "start_time": case.start_time.isoformat() if case.start_time else None,
             "duration": case.duration,
             "risk_level": "高危",  # 简单映射
             "fraud_type": "未分类拦截", # 真实环境可根据 AI 日志提取，这里暂用默认
-            # 如果你有保存最终的话术，可以展示在这里。这里假设你保存了检测详情
-            "details": case.detection_details or f"检测到来自 {case.target_number} 的风险通话" 
+            "details": f"检测到与 {contact_info} 的风险通话" 
         })
     return response_data
 
@@ -200,12 +205,15 @@ async def learn_fraud_case(call_id: int, db: AsyncSession = Depends(get_db)):
     if case.detected_result != DetectionResult.FAKE:
          raise HTTPException(status_code=400, detail="该通话并非诈骗，无需学习")
 
+    # 适配真实的 CallRecord 字段
+    contact_info = case.caller_number or case.target_name or "未知号码"
+
     # 1. 组装学习数据格式 (必须符合我们在 maintenance_tasks.py 中约定的格式)
     learn_data = [{
         "modality": "audio", # 假设电话拦截默认是音频转写
-        "fraud_type": f"管理员标记案例_{case.target_number}",
+        "fraud_type": f"管理员标记案例_{contact_info}",
         "risk_level": "高危",
-        "content": case.detection_details or f"系统拦截了与 {case.target_number} 的高危通话，判定为疑似欺诈。",
+        "content": f"系统拦截了与 {contact_info} 的高危通话，判定为疑似欺诈。",
         "source": f"管理员人工核实 (CallID:{call_id})"
     }]
 

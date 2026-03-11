@@ -1,7 +1,7 @@
 """
 数据模型模块
 """
-from .family_group import FamilyGroup
+from .family_group import FamilyGroup, FamilyApplication
 from .user import User
 from .call_record import CallRecord, DetectionResult
 from .ai_detection_log import AIDetectionLog
@@ -18,4 +18,5 @@ __all__ = [
     "NumberBlacklist",
     "MessageLog",
     "FamilyGroup",
+    "FamilyApplication",
 ]

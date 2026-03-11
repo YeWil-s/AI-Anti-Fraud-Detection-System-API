@@ -1,6 +1,7 @@
 """
 用户管理API路由
 """
+from datetime import datetime
 from app.models.call_record import CallRecord
 from app.services.llm_service import llm_service
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -10,6 +11,7 @@ from typing import List
 from pydantic import BaseModel
 from app.db.database import get_db
 from app.models.user import User
+from app.models.ai_detection_log import AIDetectionLog
 from app.schemas import (
     UserCreate,
     UserLogin,
@@ -40,7 +42,7 @@ async def send_verification_code(request: PhoneRequest):
         )
     
     # 发送验证码
-    success = send_sms_code(phone)
+    success = await send_sms_code(phone)
     if not success:
         # 日志已在 send_sms_code 内部记录，这里只需抛出异常
         raise HTTPException(
@@ -97,15 +99,16 @@ async def register(user_data: UserCreate, db: AsyncSession = Depends(get_db)):
         name=user_data.name,
         password_hash=get_password_hash(user_data.password),
         role_type=user_data.role_type,
-        guardian_phone=user_data.guardian_phone
+        gender=user_data.gender,
+        profession=user_data.profession,
+        marital_status=user_data.marital_status,
     )
     
     try:
         db.add(new_user)
         await db.commit()
         await db.refresh(new_user)
-        
-        # [新增] 关键审计日志
+
         logger.info(f"New user registered: {new_user.username} (ID: {new_user.user_id})")
         
         return ResponseModel(
@@ -114,9 +117,8 @@ async def register(user_data: UserCreate, db: AsyncSession = Depends(get_db)):
             data={"user_id": new_user.user_id}
         )
     except Exception as e:
-        # [新增] 记录数据库异常
+        # 记录数据库异常
         logger.error(f"Registration failed for {user_data.username}: {e}", exc_info=True)
-        # 不要向前端暴露具体数据库错误，返回通用提示
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="注册失败，请稍后重试"
@@ -132,7 +134,7 @@ async def login(login_data: UserLogin, db: AsyncSession = Depends(get_db)):
     user = result.scalar_one_or_none()
     
     if not user or not verify_password(login_data.password, user.password_hash):  # type: ignore[arg-type]
-        # [新增] 安全日志：记录登录失败尝试
+        #  安全日志：记录登录失败尝试
         logger.warning(f"Login failed for phone: {login_data.phone} (Invalid credentials)")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -146,8 +148,6 @@ async def login(login_data: UserLogin, db: AsyncSession = Depends(get_db)):
             detail="账号已被禁用"
         )
     
-    # [关键] 登录成功，绑定上下文 user_id
-    # 这样后续的处理（如果有）日志都会带上这个 ID
     bind_context(user_id=user.user_id)
     logger.info(f"User logged in successfully: {user.username} (ID: {user.user_id})")
     
@@ -181,47 +181,6 @@ async def get_current_user_info(
         )
     
     return UserResponse.model_validate(user)
-
-
-@router.put("/family/{family_id}", response_model=ResponseModel)
-async def bind_family(
-    family_id: int,
-    current_user_id: int = Depends(get_current_user_id),
-    db: AsyncSession = Depends(get_db)
-):
-    """绑定家庭组"""
-    bind_context(user_id=current_user_id)
-    
-    # 查询用户
-    result = await db.execute(select(User).where(User.user_id == current_user_id))
-    user = result.scalar_one_or_none()
-    
-    if not user:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="用户不存在"
-        )
-    
-    # 更新家庭组ID
-    old_family_id = user.family_id
-    user.family_id = family_id  # type: ignore[assignment]
-    
-    try:
-        await db.commit()
-        await db.refresh(user)
-        logger.info(f"User {current_user_id} family changed: {old_family_id} -> {family_id}")
-    except Exception as e:
-        logger.error(f"Failed to bind family for user {current_user_id}: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail="绑定失败")
-    
-    return ResponseModel(
-        code=200,
-        message="绑定成功",
-        data={
-            "user_id": user.user_id,
-            "family_id": user.family_id
-        }
-    )
 
 
 @router.delete("/family", response_model=ResponseModel)
@@ -265,7 +224,7 @@ async def update_user_profile(
     current_user_id: int = Depends(get_current_user_id),
     db: AsyncSession = Depends(get_db)
 ):
-    """[大赛新增] 更新用户画像与监护人信息"""
+    """更新用户画像与监护人信息"""
     bind_context(user_id=current_user_id)
     
     # 查询当前用户
@@ -281,13 +240,17 @@ async def update_user_profile(
     # 动态更新字段
     if profile_data.role_type is not None:
         user.role_type = profile_data.role_type
-    if profile_data.guardian_phone is not None:
-        user.guardian_phone = profile_data.guardian_phone
-        
+    if profile_data.gender is not None:
+        user.gender = profile_data.gender
+    if profile_data.profession is not None:
+        user.profession = profile_data.profession
+    if profile_data.marital_status is not None:
+        user.marital_status = profile_data.marital_status
+
     try:
         await db.commit()
         await db.refresh(user)
-        logger.info(f"User {current_user_id} profile updated: role={user.role_type}, guardian={user.guardian_phone}")
+        logger.info(f"User {current_user_id} profile updated: role={user.role_type}")
     except Exception as e:
         logger.error(f"Failed to update profile for user {current_user_id}: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="更新画像失败")
@@ -298,7 +261,6 @@ async def update_user_profile(
         data={
             "user_id": user.user_id,
             "role_type": user.role_type,
-            "guardian_phone": user.guardian_phone
         }
     )
 
@@ -317,15 +279,16 @@ async def get_user_security_report(user_id: int, db: AsyncSession = Depends(get_
 
     # 2. 查询该用户近期通话记录 (最多取最近 10 条进行分析，避免超出大模型上下文限制)
     calls_result = await db.execute(
-        select(CallRecord)
+        select(CallRecord, AIDetectionLog)
+        .outerjoin(AIDetectionLog, CallRecord.call_id == AIDetectionLog.call_id)
         .where(CallRecord.user_id == user_id)
         .order_by(CallRecord.start_time.desc())
         .limit(10)
     )
-    recent_calls = calls_result.scalars().all()
+    recent_calls_with_logs = calls_result.all()
 
     # 3. 调用 LLM 生成报告
-    report_markdown = await llm_service.generate_security_report(user, recent_calls)
+    report_markdown = await llm_service.generate_security_report(user, recent_calls_with_logs)
 
     # 4. 返回 JSON 数据
     return {
@@ -334,3 +297,46 @@ async def get_user_security_report(user_id: int, db: AsyncSession = Depends(get_
         "report_generated_at": datetime.now().isoformat(),
         "report_content": report_markdown
     }
+
+@router.get("/guardian", summary="获取当前用户的监护人信息")
+async def get_user_guardian(
+    current_user_id: int = Depends(get_current_user_id),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    通过查询家庭组，动态获取监护人的手机号和信息
+    """
+    # 1. 查询当前用户的 family_id
+    result = await db.execute(select(User).where(User.user_id == current_user_id))
+    user = result.scalar_one_or_none()
+    
+    if not user or not user.family_id:
+        return ResponseModel(code=200, message="未绑定家庭组", data={"guardian": None})
+        
+    # 2. 在同一家庭组中，查找 is_admin=True 的用户（即监护人）
+    guardian_result = await db.execute(
+        select(User).where(
+            User.family_id == user.family_id,
+            User.is_admin == True,
+            User.user_id != current_user_id  # 排除自己
+        )
+    )
+    guardians = guardian_result.scalars().all()
+    
+    if not guardians:
+         return ResponseModel(code=200, message="家庭组内未设置监护人", data={"guardian": None})
+         
+    # 3. 返回监护人信息 (如果有多个监护人，这里返回列表)
+    guardian_data = [
+        {
+            "user_id": g.user_id, 
+            "name": g.name or g.username, 
+            "phone": g.phone
+        } for g in guardians
+    ]
+    
+    return ResponseModel(
+        code=200, 
+        message="获取监护人成功", 
+        data={"guardians": guardian_data}
+    )

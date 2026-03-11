@@ -1,51 +1,71 @@
-# test_pipeline.py
-import time
-import base64
-from app.tasks.detection_tasks import detect_text_task, multi_modal_fusion_task
+import requests
+import json
 
-def run_simulation():
-    user_id = 3
-    call_id = 9999  # 模拟一通真实的电话通话
+# 请根据你实际运行的服务地址修改
+BASE_URL = "http://localhost:8000" 
 
-    print("=== 🎬 开始模拟诈骗通话 ===")
-
-    # ---------------------------------------------------------
-    # 测试 1：正常的寒暄（测试记忆池写入）
-    # ---------------------------------------------------------
-    print("\n[时间 00:01] 骗子发话：喂，小王啊，最近工作怎么样？")
-    res1 = detect_text_task.delay(text="喂，小王啊，最近工作怎么样？", user_id=user_id, call_id=call_id)
-    # 等待几秒钟让 Celery 处理完
-    time.sleep(3) 
-    print(f"-> 任务ID: {res1.id} (请去终端2查看大模型判定结果，应该是 safe)")
-
-    # ---------------------------------------------------------
-    # 测试 2：开始暴露意图（测试大模型结合上一句的上下文理解）
-    # ---------------------------------------------------------
-    print("\n[时间 00:15] 骗子发话：我是你领导，现在在外面办点急事。")
-    res2 = detect_text_task.delay(text="我是你领导，现在在外面办点急事。", user_id=user_id, call_id=call_id)
-    time.sleep(3)
-    print(f"-> 任务ID: {res2.id} (请去终端2查看，可能会判定为 suspicious)")
-
-    # ---------------------------------------------------------
-    # 测试 3：连环套收网，并伴随高仿音视频（测试多模态融合引擎！）
-    # ---------------------------------------------------------
-    print("\n[时间 00:30] 骗子发话：赶紧给我转两万块钱应急！")
-    print("           (底层 AI 探针报警：发现音频克隆特征 0.85，视频唇形不自然 0.92)")
+def test_generate_report():
+    print("1. 正在尝试登录...")
+    login_url = f"{BASE_URL}/api/users/login"
+    login_payload = {
+        "phone": "13800138000",
+        "password": "123456"
+    }
     
-    # 触发最高级别的多模态融合任务
-    res3 = multi_modal_fusion_task.delay(
-        text="赶紧给我转两万块钱应急！", 
-        audio_conf=0.85, 
-        video_conf=0.92, 
-        user_id=user_id, 
-        call_id=call_id
-    )
-    time.sleep(5)
-    print(f"-> 任务ID: {res3.id}")
-    print("\n=== 🎯 请观察 Celery 终端（终端2）的日志 ===")
-    print("你应该能看到大模型：")
-    print("1. 成功读取了前面的聊天记录（喂、我是你领导、转钱）")
-    print("2. 结合极高的音视频置信度，给出了 critical/fake 的终极拦截指令！")
+    try:
+        # 登录请求不需要太长超时
+        login_response = requests.post(login_url, json=login_payload, timeout=10)
+        
+        if login_response.status_code != 200:
+            print(f"❌ 登录失败: {login_response.text}")
+            return
+            
+        login_data = login_response.json()
+        token = login_data.get("access_token")
+        # 从返回的用户信息中获取 user_id
+        user_id = login_data.get("user", {}).get("user_id")
+        
+        if not user_id:
+            print("❌ 获取 user_id 失败")
+            return
+            
+        print(f"✅ 登录成功！获取到 user_id: {user_id}")
+        
+    except Exception as e:
+        print(f"❌ 登录请求发生异常: {e}")
+        return
+
+    # ---------------------------------------------------------
+    
+    print("\n2. 开始生成个人安全监测报告 (调用大模型中，请耐心等待...)")
+    report_url = f"{BASE_URL}/api/users/{user_id}/security-report"
+    
+    headers = {
+        "Authorization": f"Bearer {token}"
+    }
+    
+    try:
+        # 【关键】因为大模型生成 Markdown 需要较长时间，这里必须设置较长的超时时间 (例如 120 秒)
+        report_response = requests.get(report_url, headers=headers, timeout=120)
+        
+        if report_response.status_code == 200:
+            report_data = report_response.json()
+            print("\n✅ 报告生成成功！")
+            print("="*50)
+            print(f"用户: {report_data.get('username')}")
+            print(f"生成时间: {report_data.get('report_generated_at')}")
+            print("="*50)
+            print("【报告内容 Markdown】:\n")
+            print(report_data.get('report_content'))
+            print("="*50)
+        else:
+            print(f"❌ 生成报告失败，状态码: {report_response.status_code}")
+            print(f"错误详情: {report_response.text}")
+            
+    except requests.exceptions.Timeout:
+        print("❌ 请求超时！大模型未能在 120 秒内返回结果，建议检查大模型 API 响应速度。")
+    except Exception as e:
+        print(f"❌ 生成报告请求发生异常: {e}")
 
 if __name__ == "__main__":
-    run_simulation()
+    test_generate_report()

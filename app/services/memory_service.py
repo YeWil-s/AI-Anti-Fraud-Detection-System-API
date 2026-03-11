@@ -49,5 +49,13 @@ class MemoryService:
             logger.error(f"Failed to fetch memory context: {e}")
             return "暂无历史上下文。"
 
+    def clear_context(self, call_id: int):
+        """清理该通话的上下文缓存，释放Redis内存"""
+        key = f"chat_history:{call_id}"
+        try:
+            self.redis_client.delete(key)
+        except Exception as e:
+            logger.error(f"Failed to clear memory context: {e}")
+
 # 全局单例
 memory_service = MemoryService()

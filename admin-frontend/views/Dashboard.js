@@ -45,7 +45,7 @@ export default {
             <el-row :gutter="20">
                 <el-col :span="16">
                     <div class="page-card" style="height: 400px;">
-                        <div class="page-title">系统防御趋势 (模拟展示)</div>
+                        <div class="page-title">系统防御</div>
                         <div id="chartLine" style="width:100%; height:320px; margin-top:20px;"></div>
                     </div>
                 </el-col>

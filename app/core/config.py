@@ -44,7 +44,7 @@ class Settings(BaseSettings):
     VOICE_MODEL_PATH: str = "./models/voice_detection.onnx"
     VIDEO_MODEL_PATH: str = "./models/video_detection.onnx"
     TEXT_MODEL_PATH: str = "./models/text_fraud_model.onnx"
-    TEXT_VOCAB_PATH: str = "./models/vocab.txt"
+    TEXT_VOCAB_PATH: str = "./models"
     COLLECT_TRAINING_DATA: bool = True
 
     # 视频预处理标准
@@ -53,9 +53,9 @@ class Settings(BaseSettings):
     VIDEO_NORM_STD: list = [0.229, 0.224, 0.225]
 
     # AI 检测阈值配置
-    VOICE_DETECTION_THRESHOLD: float = 0.70   
+    VOICE_DETECTION_THRESHOLD: float = 0.85  
     VIDEO_DETECTION_THRESHOLD: float = 0.75   
-    TEXT_DETECTION_THRESHOLD: float = 0.75   
+    TEXT_DETECTION_THRESHOLD: float = 0.80   
     
     # WebSocket配置
     WS_HEARTBEAT_INTERVAL: int = 30
