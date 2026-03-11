@@ -7,10 +7,10 @@ from sqlalchemy import select, and_, func
 from typing import Optional
 from datetime import datetime  
 from pydantic import BaseModel
-from app.db.database import get_db
+from app.db.database import get_db, AsyncSessionLocal
 from app.core.security import get_current_user_id
 from app.models.message_log import MessageLog
-
+from app.tasks.celery_app import celery_app
 from app.models.call_record import CallRecord, DetectionResult, CallPlatform
 from app.models.ai_detection_log import AIDetectionLog
 from app.models.user import User
@@ -272,46 +272,6 @@ async def delete_call_record(
         data={"call_id": call_id}
     )
 
-async def generate_call_summary_background(call_id: int, chat_history: list):
-    """在后台执行的大模型全量总结任务"""
-    if not chat_history or len(chat_history) == 0:
-        memory_service.clear_context(call_id)
-        return
-    
-    try:
-        # 1. 呼叫大模型进行全盘总结
-        summary_result = await llm_service.generate_final_summary(chat_history)
-        
-        # 2. 开启独立的数据库会话进行更新
-        async with AsyncSessionLocal() as db:
-            result = await db.execute(select(CallRecord).where(CallRecord.call_id == call_id))
-            record = result.scalar_one_or_none()
-            
-            if record:
-                # 覆盖实时的 analysis 和 advice，填入全局总结版
-                record.analysis = summary_result.get("analysis", record.analysis)
-                record.advice = summary_result.get("advice", record.advice)
-                
-                # 如果大模型根据全局判断发现了深层套路，还可以做最后一次风险定性修正
-                final_risk = summary_result.get("risk_level", "safe")
-                current_verdict = record.detected_result
-                
-                # 映射大模型结果到数据库枚举
-                record_verdict = DetectionResult.SAFE
-                if final_risk in ['fake', 'high', 'critical']:
-                    record_verdict = DetectionResult.FAKE
-                elif final_risk in ['suspicious', 'medium']:
-                    record_verdict = DetectionResult.SUSPICIOUS
-
-                record.detected_result = record_verdict
-                    
-                await db.commit()
-    except Exception as e:
-        print(f"后台生成通话全局总结失败: {e}")
-    finally:
-        # 3. 无论成功失败，必须清理内存中的对话上下文，防止内存泄漏
-        memory_service.clear_context(call_id)
-
 # 定义接收前端请求的数据结构
 class CallRecordEndRequest(BaseModel):
     audio_url: Optional[str] = None
@@ -322,14 +282,13 @@ class CallRecordEndRequest(BaseModel):
 async def end_call_record(
     call_id: int,
     payload: CallRecordEndRequest,
-    background_tasks: BackgroundTasks,
     current_user_id: int = Depends(get_current_user_id),
     db: AsyncSession = Depends(get_db)
 ):
     """
-    结束通话监测，更新最终音视频文件URL，并按需触发AI全局总结
+    结束通话监测，更新最终音视频文件URL，并下发AI全局总结任务给Celery
     """
-    # 1. 验证所有权，确保只能操作自己的记录
+    # 1. 验证所有权
     result = await db.execute(
         select(CallRecord).where(
             and_(
@@ -362,26 +321,16 @@ async def end_call_record(
     await db.commit()
     
     # ==========================================
-    # [核心修改] 判断是否需要触发后台总结
+    # [核心修改] 不再由 FastAPI 查内存，直接交给 Celery 决策
     # ==========================================
-    # 检查数据库中是否已经有大模型写好的评价和建议 (非空判断)
-    has_llm_evaluation = bool(record.analysis and record.advice)
+    celery_app.send_task("generate_post_call_summary", args=[call_id, current_user_id])
     
-    chat_history = memory_service.get_context(call_id)
-    
-    if chat_history and chat_history != "暂无历史上下文。":  # 去掉拦截，只要有对话就进行全局复盘
-        background_tasks.add_task(generate_call_summary_background, call_id, chat_history)
-        msg = "通话记录归档成功，正在后台生成AI全局总结"
-    else:
-        memory_service.clear_context(call_id)
-        msg = "通话记录归档成功"
-    
-    # 4. 立即返回，不阻塞前端
     return ResponseModel(
         code=200, 
-        message=msg, 
+        message="通话记录归档成功，已交由异步引擎生成AI全局总结", 
         data={"duration": record.duration}
     )
+
 @router.get("/{call_id}/audit-logs", response_model=ResponseModel)
 async def get_call_audit_logs(
     call_id: int,

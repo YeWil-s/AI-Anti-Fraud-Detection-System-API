@@ -53,7 +53,7 @@ class Settings(BaseSettings):
     VIDEO_NORM_STD: list = [0.229, 0.224, 0.225]
 
     # AI 检测阈值配置
-    VOICE_DETECTION_THRESHOLD: float = 0.85  
+    VOICE_DETECTION_THRESHOLD: float = 0.90
     VIDEO_DETECTION_THRESHOLD: float = 0.75   
     TEXT_DETECTION_THRESHOLD: float = 0.80   
     

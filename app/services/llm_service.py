@@ -228,37 +228,56 @@ class LLMService:
             logger.error(f"Failed to generate security report: {e}")
             return "## 报告生成失败\n系统当前繁忙，无法生成安全报告，请稍后再试。"
     
-    async def generate_final_summary(self, chat_history: list) -> dict:
+    async def generate_final_summary(self, chat_history: list | str) -> dict:
         """
         通话结束时，根据全局对话历史生成最终总结
         """
-        # 将历史记录列表拼接成字符串
-        history_text = "\n".join([f"{msg['role']}: {msg['content']}" for msg in chat_history])
-        
-        prompt = f"""你是一个专业的反诈风控专家。一通电话或聊天刚刚结束，以下是完整的对话记录：
-        
-{history_text}
-
-请根据整个对话的上下文，进行一次全局视角的复盘分析，并以 JSON 格式返回结果。
-必须包含以下字段：
-1. "risk_level": 从全局看，最终定性是什么？(选项: safe, suspicious, fake, high, critical)
-2. "analysis": 通话总结分析（描述对方的整体意图、使用了什么套路，或者是否属于正常沟通）
-3. "advice": 给用户的最终防范建议（如果安全，提示继续保持警惕；如果有风险，给出止损建议）
-"""
-        try:
-            # 这里的调用方式请参考你 llm_service 中现有的请求代码（如调用智谱、通义千问等）
-            # response = await self.client.chat.completions.create(...)
-            # result = self._parse_json(response)
+        # 1. 安全处理历史记录格式（兼容字符串和列表字典）
+        if isinstance(chat_history, list):
+            try:
+                history_text = "\n".join([f"{msg.get('role', 'User')}: {msg.get('content', '')}" for msg in chat_history])
+            except Exception:
+                history_text = str(chat_history)
+        else:
+            history_text = str(chat_history)
             
-            # 假设你已经有了解析 JSON 的方法
-            result = await self._call_llm_and_parse_json(prompt) 
+        # 2. 构建符合 LangChain 规范的 Prompt
+        system_prompt = """你是一个专业的反诈风控专家。一通电话或聊天刚刚结束，以下是完整的对话记录。
+请根据整个对话的上下文，进行一次全局视角的复盘分析。
+
+必须且只能返回合法的 JSON 对象，不要包含 Markdown 标记（如 ```json），字段要求如下：
+{
+    "risk_level": "风险等级评估 (选项: safe, suspicious, fake, high, critical)",
+    "analysis": "通话总结分析 (描述对方的整体意图、使用了什么套路，或者是否属于正常沟通)",
+    "advice": "给用户的最终防范建议 (如果安全提示保持警惕；如果有风险给出止损建议)"
+}"""
+
+        messages = [
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=f"以下是完整的对话记录：\n{history_text}")
+        ]
+
+        try:
+            # 3. 直接调用 LLM 并尝试解析返回结果
+            response = await self.llm.ainvoke(messages)
+            
+            # 清理可能携带的 Markdown 格式符
+            content = response.content.strip()
+            if content.startswith("```json"):
+                content = content[7:]
+            if content.startswith("```"):
+                content = content[3:]
+            if content.endswith("```"):
+                content = content[:-3]
+                
+            result = json.loads(content.strip())
             return result
+            
         except Exception as e:
-            print(f"全局总结LLM调用失败: {e}")
+            logger.error(f"全局总结LLM调用失败: {e}", exc_info=True)
             return {
                 "risk_level": "safe",
                 "analysis": "大模型全局复盘分析生成失败，请参考实时检测记录。",
                 "advice": "系统暂无额外建议。"
             }
-
 llm_service = LLMService()

@@ -412,7 +412,9 @@ def detect_text_task(self, text: str, user_id: int, call_id: int) -> Dict:
                 # 0. 过滤无意义短句 (小脑优化：少于2个字直接丢弃，省时省钱)
                 if len(text.strip()) < 2:
                     return {"status": "skipped", "reason": "text too short"}
-                
+                    
+                memory_service.add_message(call_id, text)
+
                 now = datetime.now()
                 call_start_time = record.start_time if record and hasattr(record, 'start_time') and record.start_time else now
                 if call_start_time.tzinfo and not now.tzinfo:
@@ -507,7 +509,7 @@ def detect_text_task(self, text: str, user_id: int, call_id: int) -> Dict:
                     call_type_desc = f"纯语音通话场景（当前渠道：{platform_str}。请完全忽略视频特征，重点分析文本与语音）"
 
                 # 5. 维护短期记忆池
-                memory_service.add_message(call_id, text)
+                
                 chat_history = memory_service.get_context(call_id)
                 
                 # 6. 第三道防线：呼叫 LLM 大脑融合裁决
@@ -631,3 +633,53 @@ async def save_audit_evidence(data: bytes, user_id: int, call_id: int, data_type
     except Exception as e:
         logger.error(f"审计证据保存失败: {e}")
         return ""
+
+@celery_app.task(name="generate_post_call_summary")
+def generate_post_call_summary_task(call_id: int, user_id: int):
+    """通话结束后，由 Celery 去读取自身内存中的对话并呼叫 LLM"""
+    
+    async def _process():
+        # 1. 在 Celery 进程内读取 chat_history (此时它是有数据的)
+        chat_history = memory_service.get_context(call_id)
+        
+        # 过滤空对话：如果真的没有说话，为了省钱直接清空并跳过
+        if not chat_history or chat_history == "暂无历史上下文。" or len(chat_history) == 0:
+            memory_service.clear_context(call_id)
+            return {"status": "skipped", "reason": "No conversation history"}
+            
+        try:
+            # 2. 呼叫大模型进行全盘总结
+            summary_result = await llm_service.generate_final_summary(chat_history)
+            
+            # 3. 开启数据库会话进行更新
+            async with AsyncSessionLocal() as db:
+                result = await db.execute(select(CallRecord).where(CallRecord.call_id == call_id))
+                record = result.scalar_one_or_none()
+                
+                if record:
+                    record.analysis = summary_result.get("analysis", record.analysis)
+                    record.advice = summary_result.get("advice", record.advice)
+                    
+                    final_risk = summary_result.get("risk_level", "safe").lower()
+                    
+                    record_verdict = DetectionResult.SAFE
+                    if final_risk in ['fake', 'high', 'critical']:
+                        record_verdict = DetectionResult.FAKE
+                    elif final_risk in ['suspicious', 'medium']:
+                        record_verdict = DetectionResult.SUSPICIOUS
+
+                    record.detected_result = record_verdict
+                    await db.commit()
+                    
+            return {"status": "success"}
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+        finally:
+            # 4. 无论成功失败，处理完毕后清空该通话的内存，防止内存泄漏
+            memory_service.clear_context(call_id)
+
+    # 运行异步逻辑
+    try:
+        return async_to_sync(_process)()
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
