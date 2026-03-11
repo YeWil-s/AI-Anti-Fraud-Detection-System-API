@@ -62,9 +62,9 @@ async def save_raw_data(data: bytes, user_id: int, call_id: int, data_type: str,
     except Exception as e:
         logger.warning(f"Failed to collect training data: {e}")
 
-async def ensure_call_record_exists(db, call_id: int, user_id: int) -> datetime:
+async def ensure_call_record_exists(db, call_id: int, user_id: int) -> Optional[CallRecord]:
     """
-    确保 CallRecord 存在，并返回通话开始时间(start_time)用于计算偏移量
+    确保 CallRecord 存在，并返回通话记录对象
     """
     try:
         result = await db.execute(select(CallRecord).where(CallRecord.call_id == call_id))
@@ -87,7 +87,8 @@ async def ensure_call_record_exists(db, call_id: int, user_id: int) -> datetime:
         return new_record
     except Exception as e:
         logger.error(f"Failed to ensure call record: {e}")
-        return datetime.now()
+        # 【修复】原代码这里返回了 datetime.now() 导致后续获取 record.audio_url 时崩溃，现统一返回 None
+        return None
 
 
 # [核心辅助函数] 发布控制指令
@@ -166,10 +167,9 @@ def detect_audio_task(self, audio_base64: str, user_id: int, call_id: int) -> Di
                 risk_level = result.get('risk_level', 'low')
                 
                 # 2. 正确计算 time_offset
-                # 提取 record 里的 start_time (如果 record 不存在则兜底用当前时间防止报错)
                 now = datetime.now()
-                call_start_time = record.start_time if hasattr(record, 'start_time') and record.start_time else (record if isinstance(record, datetime) else datetime.now())
-                
+                # 【修复】兜底容错：如果 record 为 None 或者没有 start_time，使用当前时间
+                call_start_time = record.start_time if record and hasattr(record, 'start_time') and record.start_time else now
                 
                 # 时区对齐
                 if call_start_time.tzinfo and not now.tzinfo:
@@ -182,6 +182,7 @@ def detect_audio_task(self, audio_base64: str, user_id: int, call_id: int) -> Di
                 if time_offset < 0: time_offset = 0
 
                 # 3. 将最新的音频分数写入 Redis "黑板"
+                # （注：在 async 函数内使用同步 redis.from_url 建议未来优化为 redis.asyncio）
                 r = redis.from_url(settings.REDIS_URL)
                 r.setex(f"call:{call_id}:latest_audio_conf", 3600, str(confidence))
 
@@ -195,7 +196,7 @@ def detect_audio_task(self, audio_base64: str, user_id: int, call_id: int) -> Di
                     voice_confidence=confidence,
                     overall_score=confidence * 100,
                     evidence_snapshot=evidence_url,
-                    time_offset=time_offset, # 正确存入 time_offset
+                    time_offset=time_offset,
                     model_version="v1.0"
                 )
                 db.add(ai_log)
@@ -203,7 +204,6 @@ def detect_audio_task(self, audio_base64: str, user_id: int, call_id: int) -> Di
 
                 # 更新通话记录的留存证据URL
                 if evidence_url:
-                    # 刚才已经查询过 record 了，这里可以直接使用，不用再 select 一次
                     if record and not record.audio_url:
                         record.audio_url = evidence_url
                         await db.commit()
@@ -235,10 +235,18 @@ def detect_audio_task(self, audio_base64: str, user_id: int, call_id: int) -> Di
                         await db.commit()
 
                 # 极高风险才越权直接发起强制拦截指令
-                if is_fake and confidence > 0.95:
+                if is_fake and confidence >= 0.85:  # 设定一个合理的起步阈值
+                    target_lvl = 3 if confidence >= 0.95 else 2
+                    ui_msg = "检测到极高风险AI合成语音，强烈建议挂断！" if target_lvl == 3 else "检测到可疑语音特征，已提高警惕！"
+                    warning_md = "fullscreen" if target_lvl == 3 else "modal"
                     payload_control = {
-                        "type": "control", "action": "upgrade_level", "target_level": 2,
-                        "config": {"ui_message": "检测到可疑语音特征，已提高警惕！"} 
+                        "type": "control", 
+                        "action": "upgrade_level", 
+                        "target_level": target_lvl,
+                        "config": {
+                            "ui_message": ui_msg,
+                            "warning_mode": warning_md
+                        } 
                     }
                     publish_control_command(user_id, payload_control)
 
@@ -252,6 +260,8 @@ def detect_audio_task(self, audio_base64: str, user_id: int, call_id: int) -> Di
     except Exception as e:
         logger.error(f"Task wrapper failed: {e}")
         return {"status": "error", "message": str(e)}
+
+
 @celery_app.task(name="detect_video", bind=True)
 def detect_video_task(self, frame_data: list, user_id: int, call_id: int) -> Dict:
     """视频检测任务 (底层雷达)"""
@@ -261,10 +271,10 @@ def detect_video_task(self, frame_data: list, user_id: int, call_id: int) -> Dic
         async with AsyncSessionLocal() as db:
             try:
                 record = await ensure_call_record_exists(db, call_id, user_id)
-                # 安全提取时间：如果是CallRecord对象取start_time，否则取其本身或当前时间
-                call_start_time = record.start_time if hasattr(record, 'start_time') and record.start_time else (record if isinstance(record, datetime) else datetime.now())
-                
                 now = datetime.now()
+                # 【修复】安全提取时间
+                call_start_time = record.start_time if record and hasattr(record, 'start_time') and record.start_time else now
+                
                 if call_start_time.tzinfo and not now.tzinfo:
                     now = now.replace(tzinfo=call_start_time.tzinfo)
                 elif not call_start_time.tzinfo and now.tzinfo:
@@ -294,7 +304,6 @@ def detect_video_task(self, frame_data: list, user_id: int, call_id: int) -> Dic
                 debounce_data = apply_video_debounce(user_id, call_id, raw_is_fake)
                 curr_state = debounce_data.get("state", "SAFE")
 
-                # [修改 1] 将最新的视频分数和状态写入 Redis "黑板"
                 r = redis.from_url(settings.REDIS_URL)
                 r.setex(f"call:{call_id}:latest_video_conf", 3600, str(raw_conf))
                 r.setex(f"call:{call_id}:latest_video_state", 3600, curr_state)
@@ -315,14 +324,11 @@ def detect_video_task(self, frame_data: list, user_id: int, call_id: int) -> Dic
                     await db.commit()
                     r.set(tech_log_key, now_ts, ex=3600)
 
+                # 【修复】缩进错误与重复查询
                 if evidence_url:
-                        call_stmt = select(CallRecord).where(CallRecord.call_id == call_id)
-                        call_result = await db.execute(call_stmt)
-                        record = call_result.scalar_one_or_none()
-                        
-                        if record and not record.cover_image:
-                            record.cover_image = evidence_url
-                            await db.commit()
+                    if record and not record.cover_image:
+                        record.cover_image = evidence_url
+                        await db.commit()
                         
                 # 通知边缘触发处理
                 alarm_start_key = f"detect:alarm_start:{call_id}"
@@ -356,23 +362,29 @@ def detect_video_task(self, frame_data: list, user_id: int, call_id: int) -> Dic
                         risk_level=risk_level, details=msg_content
                     )
 
-                # 极高风险(>0.95)才直接发起拦截，避免频繁打扰
+                # 【修复】缩进错误与重复查询
                 if curr_state == "ALARM" and raw_conf > 0.80:
-                     call_stmt = select(CallRecord).where(CallRecord.call_id == call_id)
-                     call_result = await db.execute(call_stmt)
-                     record = call_result.scalar_one_or_none()
+                    if record and record.detected_result not in [DetectionResult.FAKE, DetectionResult.SUSPICIOUS]:
+                        record.detected_result = DetectionResult.SUSPICIOUS
+                        await db.commit()
 
-                     if record and record.detected_result not in [DetectionResult.FAKE, DetectionResult.SUSPICIOUS]:
-                         record.detected_result = DetectionResult.SUSPICIOUS
-                         await db.commit()
-
-                if curr_state == "ALARM" and raw_conf > 0.95:
-                     payload_control = {
-                        "type": "control", "action": "upgrade_level", "target_level": 2,
-                        "config": {"video_fps": 15.0, "ui_message": "画面出现可疑篡改痕迹，已提高防御等级！"}
+                if curr_state == "ALARM" and raw_conf >= 0.75:
+                    target_lvl = 3 if raw_conf >= 0.90 else 2
+                    ui_msg = "画面出现严重篡改痕迹，极高风险！" if target_lvl == 3 else "画面出现可疑篡改痕迹，已提高防御等级！"
+                    warning_md = "fullscreen" if target_lvl == 3 else "modal"
+                    fps_val = 30.0 if target_lvl == 3 else 15.0
+                    payload_control = {
+                        "type": "control", 
+                        "action": "upgrade_level", 
+                        "target_level": target_lvl,
+                        "config": {
+                            "video_fps": fps_val, 
+                            "ui_message": ui_msg,
+                            "warning_mode": warning_md
+                        } 
                     }
-                     publish_control_command(user_id, payload_control)
-
+                    publish_control_command(user_id, payload_control)
+                    
                 return {"status": "success", "result": raw_result, "debounce": debounce_data}
             except Exception as e:
                 logger.error(f"Video task failed: {e}", exc_info=True)
@@ -384,9 +396,7 @@ def detect_video_task(self, frame_data: list, user_id: int, call_id: int) -> Dic
         return {"status": "error", "message": str(e)}
 
 
-# =================================================================
-# 核心重构：多模态融合司令部 (文本驱动 + 黑板拉取)
-# =================================================================
+# 多模态融合
 @celery_app.task(name="detect_text", bind=True)
 def detect_text_task(self, text: str, user_id: int, call_id: int) -> Dict:
     """文本触发器 & 大模型多模态融合决策司令部"""
@@ -396,17 +406,15 @@ def detect_text_task(self, text: str, user_id: int, call_id: int) -> Dict:
     async def _process():
         async with AsyncSessionLocal() as db:
             try:
-                await ensure_call_record_exists(db, call_id, user_id)
+                # 【修复】直接使用这里获取到的 record，不重复执行 select 语句
+                record = await ensure_call_record_exists(db, call_id, user_id)
                 
                 # 0. 过滤无意义短句 (小脑优化：少于2个字直接丢弃，省时省钱)
                 if len(text.strip()) < 2:
                     return {"status": "skipped", "reason": "text too short"}
-                call_stmt = select(CallRecord).where(CallRecord.call_id == call_id)
-                call_result = await db.execute(call_stmt)
-                call_record = call_result.scalar_one_or_none()
                 
                 now = datetime.now()
-                call_start_time = call_record.start_time if hasattr(call_record, 'start_time') and call_record.start_time else now
+                call_start_time = record.start_time if record and hasattr(record, 'start_time') and record.start_time else now
                 if call_start_time.tzinfo and not now.tzinfo:
                     now = now.replace(tzinfo=call_start_time.tzinfo)
                 elif not call_start_time.tzinfo and now.tzinfo:
@@ -469,7 +477,7 @@ def detect_text_task(self, text: str, user_id: int, call_id: int) -> Dict:
                 # =========================================================================
 
                 # 2. 从数据库动态获取通话场景
-                platform_raw = getattr(call_record, 'platform', 'PHONE')
+                platform_raw = getattr(record, 'platform', 'PHONE') if record else 'PHONE'
                 platform_str = platform_raw.name if hasattr(platform_raw, 'name') else str(platform_raw)
                 platform_str_lower = platform_str.lower()
                 is_video_call = "video" in platform_str_lower or "视频" in platform_str_lower
@@ -502,7 +510,7 @@ def detect_text_task(self, text: str, user_id: int, call_id: int) -> Dict:
                 memory_service.add_message(call_id, text)
                 chat_history = memory_service.get_context(call_id)
                 
-                # 6. 第三道防线：呼叫 LLM 大脑融合裁决 (已修改传入 text_conf)
+                # 6. 第三道防线：呼叫 LLM 大脑融合裁决
                 llm_result = await llm_service.analyze_multimodal_risk(
                     user_input=text, 
                     chat_history=chat_history,
@@ -514,11 +522,12 @@ def detect_text_task(self, text: str, user_id: int, call_id: int) -> Dict:
                 )
                 
                 is_fraud = llm_result.get('is_fraud', False)
+                llm_conf = float(llm_result.get('confidence', text_conf))
 
                 ai_log = AIDetectionLog(
                     call_id=call_id,
-                    text_confidence=final_text_conf,
-                    overall_score=final_text_conf * 100,
+                    text_confidence=llm_conf,    
+                    overall_score=llm_conf * 100,
                     detected_keywords=text,        # 存入原文
                     time_offset=time_offset,
                     model_version="llm-fusion"     # 标记来源为大模型
@@ -526,11 +535,9 @@ def detect_text_task(self, text: str, user_id: int, call_id: int) -> Dict:
                 db.add(ai_log)
                 await db.commit()
 
-                publish_realtime_score(user_id, "文本", is_fraud, llm_result.get('confidence', 0.0))
+                # 【修复】删除了此处重复冗余的 publish_realtime_score 调用
                 risk_level = llm_result.get('risk_level', 'safe')
-                full_analysis = llm_result.get('analysis', '')
-                full_advice = llm_result.get('advice', '')
-                raw_llm_risk = llm_result.get('risk_level', 'safe').lower()
+                raw_llm_risk = risk_level.lower()
 
                 # A. 映射到 MessageLog (告警级别: safe, low, medium, high, critical)
                 alert_level = 'safe'
@@ -567,10 +574,6 @@ def detect_text_task(self, text: str, user_id: int, call_id: int) -> Dict:
                     risk_level=alert_level,
                     details=f"Agent裁定: {full_analysis}"
                 )
-
-                call_stmt = select(CallRecord).where(CallRecord.call_id == call_id)
-                call_result = await db.execute(call_stmt)
-                record = call_result.scalar_one_or_none()
 
                 if record:
                     # 无论是否诈骗，只要大模型给了评价，我们就更新最新评价

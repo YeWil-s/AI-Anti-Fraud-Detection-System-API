@@ -38,7 +38,7 @@ export default {
                                 type="primary" 
                                 size="default" 
                                 @click="handleLearn(scope.row)">
-                                🪄 让AI学习此案例
+                                  学习此案例
                             </el-button>
                         </template>
                     </el-table-column>

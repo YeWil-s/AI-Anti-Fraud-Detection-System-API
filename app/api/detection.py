@@ -175,6 +175,9 @@ async def websocket_endpoint(
                     await db.commit()
         await _fallback_end_call()
 
+        from app.tasks.detection_tasks import generate_post_call_summary_task
+        generate_post_call_summary_task.delay(call_id, user_id)
+
     except Exception as e:
         logger.error(f"WebSocket error: {e}", exc_info=True)
         await connection_manager.disconnect(user_id)

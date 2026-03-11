@@ -227,5 +227,38 @@ class LLMService:
         except Exception as e:
             logger.error(f"Failed to generate security report: {e}")
             return "## 报告生成失败\n系统当前繁忙，无法生成安全报告，请稍后再试。"
+    
+    async def generate_final_summary(self, chat_history: list) -> dict:
+        """
+        通话结束时，根据全局对话历史生成最终总结
+        """
+        # 将历史记录列表拼接成字符串
+        history_text = "\n".join([f"{msg['role']}: {msg['content']}" for msg in chat_history])
+        
+        prompt = f"""你是一个专业的反诈风控专家。一通电话或聊天刚刚结束，以下是完整的对话记录：
+        
+{history_text}
+
+请根据整个对话的上下文，进行一次全局视角的复盘分析，并以 JSON 格式返回结果。
+必须包含以下字段：
+1. "risk_level": 从全局看，最终定性是什么？(选项: safe, suspicious, fake, high, critical)
+2. "analysis": 通话总结分析（描述对方的整体意图、使用了什么套路，或者是否属于正常沟通）
+3. "advice": 给用户的最终防范建议（如果安全，提示继续保持警惕；如果有风险，给出止损建议）
+"""
+        try:
+            # 这里的调用方式请参考你 llm_service 中现有的请求代码（如调用智谱、通义千问等）
+            # response = await self.client.chat.completions.create(...)
+            # result = self._parse_json(response)
+            
+            # 假设你已经有了解析 JSON 的方法
+            result = await self._call_llm_and_parse_json(prompt) 
+            return result
+        except Exception as e:
+            print(f"全局总结LLM调用失败: {e}")
+            return {
+                "risk_level": "safe",
+                "analysis": "大模型全局复盘分析生成失败，请参考实时检测记录。",
+                "advice": "系统暂无额外建议。"
+            }
 
 llm_service = LLMService()

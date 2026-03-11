@@ -279,7 +279,7 @@ async def generate_call_summary_background(call_id: int, chat_history: list):
         return
     
     try:
-        # 1. 呼叫大模型进行全盘总结 (需要在 llm_service 中实现此方法)
+        # 1. 呼叫大模型进行全盘总结
         summary_result = await llm_service.generate_final_summary(chat_history)
         
         # 2. 开启独立的数据库会话进行更新
@@ -296,10 +296,14 @@ async def generate_call_summary_background(call_id: int, chat_history: list):
                 final_risk = summary_result.get("risk_level", "safe")
                 current_verdict = record.detected_result
                 
+                # 映射大模型结果到数据库枚举
+                record_verdict = DetectionResult.SAFE
                 if final_risk in ['fake', 'high', 'critical']:
-                    record.detected_result = DetectionResult.FAKE
-                elif final_risk in ['suspicious', 'medium'] and current_verdict == DetectionResult.SAFE:
-                    record.detected_result = DetectionResult.SUSPICIOUS
+                    record_verdict = DetectionResult.FAKE
+                elif final_risk in ['suspicious', 'medium']:
+                    record_verdict = DetectionResult.SUSPICIOUS
+
+                record.detected_result = record_verdict
                     
                 await db.commit()
     except Exception as e:
@@ -365,12 +369,10 @@ async def end_call_record(
     
     chat_history = memory_service.get_context(call_id)
     
-    if chat_history and not has_llm_evaluation:
-        # 只有在“有对话记录” 且 “大模型从未评价过” 的情况下，才触发最终总结
+    if chat_history and chat_history != "暂无历史上下文。":  # 去掉拦截，只要有对话就进行全局复盘
         background_tasks.add_task(generate_call_summary_background, call_id, chat_history)
         msg = "通话记录归档成功，正在后台生成AI全局总结"
     else:
-        # 如果没有说话，或者实时检测过程中大模型已经写过评价了，直接清空 Redis 记忆并跳过总结
         memory_service.clear_context(call_id)
         msg = "通话记录归档成功"
     
