@@ -163,7 +163,7 @@ def detect_audio_task(self, audio_base64: str, user_id: int, call_id: int) -> Di
                 result = await model_service.predict_voice(audio_bytes)
                 is_fake = result.get('is_fake', False)
                 confidence = result.get('confidence', 0.0)
-                publish_realtime_score(user_id, "语音", is_fake, confidence)
+                #publish_realtime_score(user_id, "语音", is_fake, confidence)
                 risk_level = result.get('risk_level', 'low')
                 
                 # 2. 正确计算 time_offset
@@ -229,13 +229,13 @@ def detect_audio_task(self, audio_base64: str, user_id: int, call_id: int) -> Di
                 )
 
                 # 更新大盘风险状态
-                if is_fake and confidence > 0.85:
+                if is_fake and confidence > 0.90:
                     if record and record.detected_result not in [DetectionResult.FAKE, DetectionResult.SUSPICIOUS]:
                         record.detected_result = DetectionResult.SUSPICIOUS
                         await db.commit()
 
                 # 极高风险才越权直接发起强制拦截指令
-                if is_fake and confidence >= 0.85:  # 设定一个合理的起步阈值
+                if is_fake and confidence >= 0.90:
                     target_lvl = 3 if confidence >= 0.95 else 2
                     ui_msg = "检测到极高风险AI合成语音，强烈建议挂断！" if target_lvl == 3 else "检测到可疑语音特征，已提高警惕！"
                     warning_md = "fullscreen" if target_lvl == 3 else "modal"
@@ -264,7 +264,7 @@ def detect_audio_task(self, audio_base64: str, user_id: int, call_id: int) -> Di
 
 @celery_app.task(name="detect_video", bind=True)
 def detect_video_task(self, frame_data: list, user_id: int, call_id: int) -> Dict:
-    """视频检测任务 (底层雷达)"""
+    """视频检测任务"""
     bind_context(user_id=user_id, call_id=call_id)
 
     async def _process():
@@ -272,7 +272,6 @@ def detect_video_task(self, frame_data: list, user_id: int, call_id: int) -> Dic
             try:
                 record = await ensure_call_record_exists(db, call_id, user_id)
                 now = datetime.now()
-                # 【修复】安全提取时间
                 call_start_time = record.start_time if record and hasattr(record, 'start_time') and record.start_time else now
                 
                 if call_start_time.tzinfo and not now.tzinfo:
@@ -291,7 +290,7 @@ def detect_video_task(self, frame_data: list, user_id: int, call_id: int) -> Dic
                 raw_result = await model_service.predict_video(video_tensor)
                 raw_is_fake = raw_result.get('is_deepfake', False)
                 raw_conf = raw_result.get('confidence', 0.0)
-                publish_realtime_score(user_id, "视频", raw_is_fake, raw_conf)
+                #publish_realtime_score(user_id, "视频", raw_is_fake, raw_conf)
 
                 evidence_url = ""
                 if raw_conf > settings.VIDEO_DETECTION_THRESHOLD:
@@ -324,7 +323,6 @@ def detect_video_task(self, frame_data: list, user_id: int, call_id: int) -> Dic
                     await db.commit()
                     r.set(tech_log_key, now_ts, ex=3600)
 
-                # 【修复】缩进错误与重复查询
                 if evidence_url:
                     if record and not record.cover_image:
                         record.cover_image = evidence_url
@@ -362,7 +360,6 @@ def detect_video_task(self, frame_data: list, user_id: int, call_id: int) -> Dic
                         risk_level=risk_level, details=msg_content
                     )
 
-                # 【修复】缩进错误与重复查询
                 if curr_state == "ALARM" and raw_conf > 0.80:
                     if record and record.detected_result not in [DetectionResult.FAKE, DetectionResult.SUSPICIOUS]:
                         record.detected_result = DetectionResult.SUSPICIOUS
@@ -409,11 +406,11 @@ def detect_text_task(self, text: str, user_id: int, call_id: int) -> Dict:
                 # 【修复】直接使用这里获取到的 record，不重复执行 select 语句
                 record = await ensure_call_record_exists(db, call_id, user_id)
                 
-                # 0. 过滤无意义短句 (小脑优化：少于2个字直接丢弃，省时省钱)
+                # 0. 过滤无意义短句 
                 if len(text.strip()) < 2:
                     return {"status": "skipped", "reason": "text too short"}
                     
-                memory_service.add_message(call_id, text)
+                await memory_service.add_message(call_id, text)
 
                 now = datetime.now()
                 call_start_time = record.start_time if record and hasattr(record, 'start_time') and record.start_time else now
@@ -424,7 +421,7 @@ def detect_text_task(self, text: str, user_id: int, call_id: int) -> Dict:
                 time_offset = int((now - call_start_time).total_seconds())
                 if time_offset < 0: time_offset = 0
 
-                # 1. 第一道防线：小脑规则引擎 (毫秒级响应极速拦截)
+                # 1. 第一道防线
                 rule_hit = None
                 try:
                     rule_hit = await security_service.match_risk_rules(text)
@@ -470,13 +467,12 @@ def detect_text_task(self, text: str, user_id: int, call_id: int) -> Dict:
                         )
                         db.add(ai_log)
                         await db.commit()
-                        publish_realtime_score(user_id, "文本", False, text_conf)
+                        #publish_realtime_score(user_id, "文本", False, text_conf)
                         return {"status": "success", "result": {"is_fraud": False, "risk_level": "safe", "source": "onnx"}}
 
                 except Exception as e:
                     logger.error(f"ONNX 文本快筛异常: {e}")
-                    text_conf = 0.95 if force_llm else 0.5 # 如果崩了，给个中性分数，交由 LLM 兜底处理
-                # =========================================================================
+                    text_conf = 0.95 if force_llm else 0.5 # 如果崩了，给个中性分数
 
                 # 2. 从数据库动态获取通话场景
                 platform_raw = getattr(record, 'platform', 'PHONE') if record else 'PHONE'
@@ -510,7 +506,7 @@ def detect_text_task(self, text: str, user_id: int, call_id: int) -> Dict:
 
                 # 5. 维护短期记忆池
                 
-                chat_history = memory_service.get_context(call_id)
+                chat_history = await memory_service.get_context(call_id)
                 
                 # 6. 第三道防线：呼叫 LLM 大脑融合裁决
                 llm_result = await llm_service.analyze_multimodal_risk(
@@ -564,7 +560,7 @@ def detect_text_task(self, text: str, user_id: int, call_id: int) -> Dict:
                 if is_fraud:
                     target_level = 3 if record_verdict == DetectionResult.FAKE else 2
 
-                publish_realtime_score(user_id, "文本", is_fraud, llm_result.get('confidence', 0.0))
+                #publish_realtime_score(user_id, "文本", is_fraud, llm_result.get('confidence', 0.0))
                 full_analysis = llm_result.get('analysis', '')
                 full_advice = llm_result.get('advice', '')
 
@@ -640,11 +636,11 @@ def generate_post_call_summary_task(call_id: int, user_id: int):
     
     async def _process():
         # 1. 在 Celery 进程内读取 chat_history (此时它是有数据的)
-        chat_history = memory_service.get_context(call_id)
+        chat_history = await memory_service.get_context(call_id)
         
         # 过滤空对话：如果真的没有说话，为了省钱直接清空并跳过
         if not chat_history or chat_history == "暂无历史上下文。" or len(chat_history) == 0:
-            memory_service.clear_context(call_id)
+            await memory_service.clear_context(call_id)
             return {"status": "skipped", "reason": "No conversation history"}
             
         try:

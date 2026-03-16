@@ -100,8 +100,7 @@ class ModelService:
                         settings.TEXT_MODEL_PATH, 
                         providers=['CPUExecutionProvider']
                     )
-                    
-                    # [新增调试代码] 让 Celery 亲口告诉我们它看到的入口是什么
+
                     input_names = [i.name for i in self.text_session.get_inputs()]
                     logger.info(f"[DEBUG] Actual Input Names in Memory: {input_names}")
                     
@@ -180,7 +179,7 @@ class ModelService:
             # === Fusion: 决策融合 ===
             if has_dl and has_ml:
                 # 深度流权重 ，统计流 
-                final_score = 0.5 * score_dl + 0.5 * score_ml
+                final_score = 0.7 * score_dl + 0.3 * score_ml
                 method = "dual_stream_fusion"
             elif has_dl:
                 final_score = score_dl
@@ -225,7 +224,6 @@ class ModelService:
             logits = outputs[0]
             
             # ================= [Debug 日志] =================
-            # 看看原始输出到底是多少。如果是 [-120, 50]，那 Softmax 肯定就是 0.0
             logger.info(f"🧠 [Model Output] Raw Logits: {logits}")
             # ====================================================
 
@@ -235,9 +233,8 @@ class ModelService:
             
             fake_prob = float(probs[0][0]) 
             
-            logger.info(f"📊 [Result] Fake Prob: {fake_prob:.6f}") # 看看精确值
-
-            # ... (后续代码不变)
+            logger.info(f"📊 [Result] Fake Prob: {fake_prob:.6f}") 
+            
             threshold = settings.VIDEO_DETECTION_THRESHOLD
             is_deepfake = fake_prob > threshold
             risk_level = self._calculate_risk_level(fake_prob, threshold)

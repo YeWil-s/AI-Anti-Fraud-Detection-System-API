@@ -41,11 +41,11 @@ class NotificationService:
         if is_risk:
             msg_type = "alert"
             title = f"检测到{detection_type}异常风险"
-            content = f"系统检测到疑似伪造内容 (置信度: {confidence:.2f})。{details}"
+            content = f"当前通话环境存在伪造风险，未通过{detection_type}安全检测。{details}"
         else:
             msg_type = "info"
             title = f"{detection_type}检测通过"
-            content = f"当前通话环境安全 (置信度: {confidence:.2f})。"
+            content = f"当前通话环境安全，未检测到异常{detection_type}特征。"
 
         # 2. [存库] 记录至 MessageLog (受控于任务层的边缘触发逻辑，不会产生冗余写入)
         new_log = MessageLog(
