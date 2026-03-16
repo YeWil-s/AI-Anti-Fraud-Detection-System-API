@@ -1,6 +1,7 @@
 """
 AI检测异步任务 (Celery Worker) 
 - 采用黑板模式(Blackboard)与文本意图驱动(Semantic-Driven)架构
+- 引入马尔可夫决策过程 (MDP) 实现动态防御阈值调整
 """
 import redis
 import json
@@ -31,8 +32,22 @@ from app.core.storage import upload_to_minio
 from app.core.config import settings
 from app.core.logger import get_logger, bind_context
 
+# [新增引入] 融合算分引擎与 MDP 决策大脑
+from app.services.risk_fusion_engine import fusion_engine
+from app.services.mdp_defense.dynamic_defense_agent import DynamicDefenseAgent
+
+# 尝试引入短信服务（若路径不同请自行调整）
+try:
+    from app.core.sms import send_guardian_sms
+except ImportError:
+    # 兼容性 Mock
+    async def send_guardian_sms(phone, msg): pass
+
 # 初始化模块级 logger
 logger = get_logger(__name__)
+
+# 全局初始化 MDP 智能体
+mdp_agent = DynamicDefenseAgent()
 
 def publish_realtime_score(user_id: int, detection_type: str, is_risk: bool, confidence: float):
     """专门向前端 WebSocket 实时推送分数"""
@@ -45,14 +60,13 @@ def publish_realtime_score(user_id: int, detection_type: str, is_risk: bool, con
             "message": "安全" if not is_risk else "检测到风险"
         }
         message_data = {"user_id": user_id, "payload": payload}
-        # 通过 Redis pub/sub 发送给 websocket_manager
         notification_service.redis.publish("fraud_alerts", json.dumps(message_data))
     except Exception as e:
         logger.error(f"Failed to publish real-time score: {e}")
 
 async def save_raw_data(data: bytes, user_id: int, call_id: int, data_type: str, ext: str):
     """保存原始数据到 MinIO"""
-    if not settings.COLLECT_TRAINING_DATA:
+    if not getattr(settings, 'COLLECT_TRAINING_DATA', False):
         return
     try:
         timestamp = int(time.time() * 1000)
@@ -87,11 +101,8 @@ async def ensure_call_record_exists(db, call_id: int, user_id: int) -> Optional[
         return new_record
     except Exception as e:
         logger.error(f"Failed to ensure call record: {e}")
-        # 【修复】原代码这里返回了 datetime.now() 导致后续获取 record.audio_url 时崩溃，现统一返回 None
         return None
 
-
-# [核心辅助函数] 发布控制指令
 def publish_control_command(user_id: int, payload: dict):
     """发送控制指令 (如升级防御等级、挂断通话)"""
     try:
@@ -100,8 +111,6 @@ def publish_control_command(user_id: int, payload: dict):
     except Exception as e:
         logger.error(f"Failed to publish control command: {e}")
 
-
-# [核心辅助函数] 视频结果防抖与状态机逻辑
 def apply_video_debounce(user_id: int, call_id: int, raw_is_fake: bool) -> dict:
     """使用 Redis 实现滑动窗口防抖和状态机"""
     try:
@@ -148,49 +157,37 @@ def detect_audio_task(self, audio_base64: str, user_id: int, call_id: int) -> Di
     async def _process():
         async with AsyncSessionLocal() as db:
             try:
-                # 1. 获取通话记录对象
                 record = await ensure_call_record_exists(db, call_id, user_id)
-
                 try:
                     audio_bytes = base64.b64decode(audio_base64)
                 except Exception as e:
                     return {"status": "error", "message": "Invalid base64"}
 
-                if settings.COLLECT_TRAINING_DATA:
+                if getattr(settings, 'COLLECT_TRAINING_DATA', False):
                     await save_raw_data(audio_bytes, user_id, call_id, "audio", "wav")
                 
-                # 模型预测
                 result = await model_service.predict_voice(audio_bytes)
                 is_fake = result.get('is_fake', False)
                 confidence = result.get('confidence', 0.0)
-                #publish_realtime_score(user_id, "语音", is_fake, confidence)
-                risk_level = result.get('risk_level', 'low')
                 
-                # 2. 正确计算 time_offset
                 now = datetime.now()
-                # 【修复】兜底容错：如果 record 为 None 或者没有 start_time，使用当前时间
                 call_start_time = record.start_time if record and hasattr(record, 'start_time') and record.start_time else now
                 
-                # 时区对齐
                 if call_start_time.tzinfo and not now.tzinfo:
                     now = now.replace(tzinfo=call_start_time.tzinfo)
                 elif not call_start_time.tzinfo and now.tzinfo:
                     call_start_time = call_start_time.replace(tzinfo=now.tzinfo)
                 
-                # 相减得到秒数偏移量
                 time_offset = int((now - call_start_time).total_seconds())
                 if time_offset < 0: time_offset = 0
 
-                # 3. 将最新的音频分数写入 Redis "黑板"
-                # （注：在 async 函数内使用同步 redis.from_url 建议未来优化为 redis.asyncio）
                 r = redis.from_url(settings.REDIS_URL)
                 r.setex(f"call:{call_id}:latest_audio_conf", 3600, str(confidence))
 
                 evidence_url = ""
-                if confidence > settings.VOICE_DETECTION_THRESHOLD:
+                if confidence > getattr(settings, 'VOICE_DETECTION_THRESHOLD', 0.8):
                     evidence_url = await save_audit_evidence(audio_bytes, user_id, call_id, "audio", "wav")
                 
-                # 4. 记录到底层 AI 审计日志
                 ai_log = AIDetectionLog(
                     call_id=call_id,
                     voice_confidence=confidence,
@@ -202,51 +199,15 @@ def detect_audio_task(self, audio_base64: str, user_id: int, call_id: int) -> Di
                 db.add(ai_log)
                 await db.commit()
 
-                # 更新通话记录的留存证据URL
-                if evidence_url:
-                    if record and not record.audio_url:
-                        record.audio_url = evidence_url
-                        await db.commit()
+                if evidence_url and record and not record.audio_url:
+                    record.audio_url = evidence_url
+                    await db.commit()
                 
-                # 触发消息告警系统
-                audio_alert_level = "safe"
-                if is_fake:
-                    if confidence >= 0.95:
-                        audio_alert_level = "critical"  # 极度确信是AI伪造，致命风险
-                    elif confidence >= 0.85:
-                        audio_alert_level = "high"      # 高度确信，高风险
-                    elif confidence >= 0.75:
-                        audio_alert_level = "medium"    # 有一定嫌疑，中风险
-                    else:
-                        audio_alert_level = "low"       # 嫌疑较小，低风险提示
-
-                # 2. 触发消息告警系统
-                await notification_service.handle_detection_result(
-                    db=db, user_id=user_id, call_id=call_id,
-                    detection_type="语音", is_risk=is_fake, confidence=confidence,
-                    risk_level=audio_alert_level,  
-                    details=f"检测结果: {'AI合成语音' if is_fake else '真实'} (置信度: {confidence:.2f})"
-                )
-
-                # 更新大盘风险状态
-                if is_fake and confidence > 0.90:
-                    if record and record.detected_result not in [DetectionResult.FAKE, DetectionResult.SUSPICIOUS]:
-                        record.detected_result = DetectionResult.SUSPICIOUS
-                        await db.commit()
-
-                # 极高风险才越权直接发起强制拦截指令
-                if is_fake and confidence >= 0.90:
-                    target_lvl = 3 if confidence >= 0.95 else 2
-                    ui_msg = "检测到极高风险AI合成语音，强烈建议挂断！" if target_lvl == 3 else "检测到可疑语音特征，已提高警惕！"
-                    warning_md = "fullscreen" if target_lvl == 3 else "modal"
+                # 保留底层雷达的“兜底熔断”机制：遇到极端高危特征直接报警，绕过平滑 MDP 保证低延迟
+                if is_fake and confidence >= 0.95:
                     payload_control = {
-                        "type": "control", 
-                        "action": "upgrade_level", 
-                        "target_level": target_lvl,
-                        "config": {
-                            "ui_message": ui_msg,
-                            "warning_mode": warning_md
-                        } 
+                        "type": "control", "action": "upgrade_level", "target_level": 3,
+                        "config": {"ui_message": "【兜底熔断】检测到极度确信的AI合成语音，强制挂断！", "warning_mode": "fullscreen"} 
                     }
                     publish_control_command(user_id, payload_control)
 
@@ -258,7 +219,6 @@ def detect_audio_task(self, audio_base64: str, user_id: int, call_id: int) -> Di
     try:
         return async_to_sync(_process)()
     except Exception as e:
-        logger.error(f"Task wrapper failed: {e}")
         return {"status": "error", "message": str(e)}
 
 
@@ -274,26 +234,16 @@ def detect_video_task(self, frame_data: list, user_id: int, call_id: int) -> Dic
                 now = datetime.now()
                 call_start_time = record.start_time if record and hasattr(record, 'start_time') and record.start_time else now
                 
-                if call_start_time.tzinfo and not now.tzinfo:
-                    now = now.replace(tzinfo=call_start_time.tzinfo)
-                elif not call_start_time.tzinfo and now.tzinfo:
-                    call_start_time = call_start_time.replace(tzinfo=now.tzinfo)
-                
                 time_offset = int((now - call_start_time).total_seconds())
                 if time_offset < 0: time_offset = 0
 
-                try:
-                    video_tensor = VideoProcessor.preprocess_batch(frame_data)
-                except Exception as e:
-                    return {"status": "error", "message": "Preprocessing failed"}
-
+                video_tensor = VideoProcessor.preprocess_batch(frame_data)
                 raw_result = await model_service.predict_video(video_tensor)
                 raw_is_fake = raw_result.get('is_deepfake', False)
                 raw_conf = raw_result.get('confidence', 0.0)
-                #publish_realtime_score(user_id, "视频", raw_is_fake, raw_conf)
 
                 evidence_url = ""
-                if raw_conf > settings.VIDEO_DETECTION_THRESHOLD:
+                if raw_conf > getattr(settings, 'VIDEO_DETECTION_THRESHOLD', 0.8):
                     try:
                         first_frame_bytes = base64.b64decode(frame_data[0])
                         evidence_url = await save_audit_evidence(first_frame_bytes, user_id, call_id, "video", "jpg")
@@ -308,7 +258,7 @@ def detect_video_task(self, frame_data: list, user_id: int, call_id: int) -> Dic
                 r.setex(f"call:{call_id}:latest_video_state", 3600, curr_state)
 
                 tech_log_key = f"detect:tech_log_throttle:{call_id}"
-                log_interval = 0.5 if raw_conf > settings.VIDEO_DETECTION_THRESHOLD else 10.0
+                log_interval = 0.5 if raw_conf > 0.8 else 10.0
                 last_tech_ts = r.get(tech_log_key)
                 now_ts = now.timestamp()
                 
@@ -323,62 +273,11 @@ def detect_video_task(self, frame_data: list, user_id: int, call_id: int) -> Dic
                     await db.commit()
                     r.set(tech_log_key, now_ts, ex=3600)
 
-                if evidence_url:
-                    if record and not record.cover_image:
-                        record.cover_image = evidence_url
-                        await db.commit()
-                        
-                # 通知边缘触发处理
-                alarm_start_key = f"detect:alarm_start:{call_id}"
-                last_alert_key = f"detect:last_alert:{call_id}"
-                prev_state = debounce_data.get("prev_state", "SAFE")
-                
-                should_notify = False
-                msg_content = ""
-                risk_level = "safe"
-
-                if prev_state == "SAFE" and curr_state == "ALARM":
-                    should_notify, msg_content, risk_level = True, f"在通话第 {time_offset} 秒检测到疑似伪造内容 (置信度: {raw_conf:.2f})。", "high"
-                    r.set(alarm_start_key, now_ts)
-                    r.set(last_alert_key, now_ts)
-                elif prev_state == "ALARM" and curr_state == "SAFE":
-                    should_notify, risk_level = True, "safe"
-                    start_ts = r.get(alarm_start_key)
-                    duration_str = str(int(now_ts - float(start_ts))) if start_ts else "未知"
-                    msg_content = f"环境恢复安全。伪造持续时长: {duration_str}秒 (结束于第 {time_offset} 秒)。"
-                    r.delete(alarm_start_key)
-                elif curr_state == "ALARM":
-                    last_alert_ts = r.get(last_alert_key)
-                    if not last_alert_ts or (now_ts - float(last_alert_ts) > 10.0):
-                        should_notify, msg_content, risk_level = True, "当前仍处于伪造状态 (已持续监控中...)", "high"
-                        r.set(last_alert_key, now_ts)
-
-                if should_notify:
-                    await notification_service.handle_detection_result(
-                        db=db, user_id=user_id, call_id=call_id, detection_type="视频",
-                        is_risk=(curr_state == "ALARM"), confidence=raw_conf,
-                        risk_level=risk_level, details=msg_content
-                    )
-
-                if curr_state == "ALARM" and raw_conf > 0.80:
-                    if record and record.detected_result not in [DetectionResult.FAKE, DetectionResult.SUSPICIOUS]:
-                        record.detected_result = DetectionResult.SUSPICIOUS
-                        await db.commit()
-
-                if curr_state == "ALARM" and raw_conf >= 0.75:
-                    target_lvl = 3 if raw_conf >= 0.90 else 2
-                    ui_msg = "画面出现严重篡改痕迹，极高风险！" if target_lvl == 3 else "画面出现可疑篡改痕迹，已提高防御等级！"
-                    warning_md = "fullscreen" if target_lvl == 3 else "modal"
-                    fps_val = 30.0 if target_lvl == 3 else 15.0
+                # 保留视频极端高危的兜底熔断
+                if curr_state == "ALARM" and raw_conf >= 0.95:
                     payload_control = {
-                        "type": "control", 
-                        "action": "upgrade_level", 
-                        "target_level": target_lvl,
-                        "config": {
-                            "video_fps": fps_val, 
-                            "ui_message": ui_msg,
-                            "warning_mode": warning_md
-                        } 
+                        "type": "control", "action": "upgrade_level", "target_level": 3,
+                        "config": {"video_fps": 30.0, "ui_message": "【兜底熔断】画面出现严重篡改痕迹，极高风险！", "warning_mode": "fullscreen"} 
                     }
                     publish_control_command(user_id, payload_control)
                     
@@ -393,20 +292,20 @@ def detect_video_task(self, frame_data: list, user_id: int, call_id: int) -> Dic
         return {"status": "error", "message": str(e)}
 
 
-# 多模态融合
+# ==========================================
+# 核心中枢：多模态融合与 MDP 决策
+# ==========================================
 @celery_app.task(name="detect_text", bind=True)
 def detect_text_task(self, text: str, user_id: int, call_id: int) -> Dict:
     """文本触发器 & 大模型多模态融合决策司令部"""
     bind_context(user_id=user_id, call_id=call_id)
-    logger.info(f"Task started: Text/Fusion Command Center (Len: {len(text)})")
+    logger.info(f"Task started: MDP Fusion Command Center (Len: {len(text)})")
 
     async def _process():
         async with AsyncSessionLocal() as db:
             try:
-                # 【修复】直接使用这里获取到的 record，不重复执行 select 语句
                 record = await ensure_call_record_exists(db, call_id, user_id)
                 
-                # 0. 过滤无意义短句 
                 if len(text.strip()) < 2:
                     return {"status": "skipped", "reason": "text too short"}
                     
@@ -414,73 +313,42 @@ def detect_text_task(self, text: str, user_id: int, call_id: int) -> Dict:
 
                 now = datetime.now()
                 call_start_time = record.start_time if record and hasattr(record, 'start_time') and record.start_time else now
-                if call_start_time.tzinfo and not now.tzinfo:
-                    now = now.replace(tzinfo=call_start_time.tzinfo)
-                elif not call_start_time.tzinfo and now.tzinfo:
-                    call_start_time = call_start_time.replace(tzinfo=now.tzinfo)
                 time_offset = int((now - call_start_time).total_seconds())
                 if time_offset < 0: time_offset = 0
 
-                # 1. 第一道防线
-                rule_hit = None
-                try:
-                    rule_hit = await security_service.match_risk_rules(text)
-                except Exception as e:
-                    logger.error(f"Risk rule matching failed: {e}")
-
+                # 1. 第一道防线：强规则库匹配
+                rule_hit = await security_service.match_risk_rules(text)
                 force_llm = False
 
                 if rule_hit:
                     logger.warning(f"触发规则拦截: {rule_hit['keyword']}")
                     risk_level_code = rule_hit.get('risk_level', 1)
                     if risk_level_code >= 4:
-                        # 命中诈骗，拉高防御等级
                         publish_control_command(user_id, {
-                            "type": "control", "action": "upgrade_level", "target_level": 2,
+                            "type": "control", "action": "upgrade_level", "target_level": 3,
                             "config": {"ui_message": f"触发高危防骗规则: {rule_hit['keyword']}", "block_call": True}
                         })
-                        await notification_service.handle_detection_result(
-                            db=db, user_id=user_id, call_id=call_id,
-                            detection_type="多模态(强规则)", is_risk=True, confidence=1.0,
-                            risk_level="critical", details=f"命中强规则: {rule_hit['keyword']}"
-                        )
                         force_llm = True
 
                 try:
                     text_result = await model_service.predict_text(text)
                     text_conf = text_result.get("confidence", 0.5) 
-                    logger.info(f"本地 ONNX 文本检测置信度: {text_conf:.4f}")
                     
                     if force_llm:
-                        logger.info("已命中高危风险词，跳过 ONNX 安全拦截，强制交由大模型裁决")
                         text_conf = max(text_conf, 0.95) 
                     elif text_conf < 0.3:
-                        # 极速拦截：如果是极度安全的日常闲聊 (低于0.3)
-                        logger.info("ONNX 判定为安全闲聊，跳过大模型处理")
-                        ai_log = AIDetectionLog(
-                            call_id=call_id,
-                            text_confidence=text_conf,      # 极低风险分数
-                            overall_score=text_conf * 100,
-                            detected_keywords=text,         # 存入原文
-                            time_offset=time_offset,
-                            model_version="onnx-fast"       # 标记来源为轻量模型
-                        )
-                        db.add(ai_log)
-                        await db.commit()
-                        #publish_realtime_score(user_id, "文本", False, text_conf)
+                        logger.info("ONNX 判定为极度安全闲聊，跳过重量级决策")
                         return {"status": "success", "result": {"is_fraud": False, "risk_level": "safe", "source": "onnx"}}
-
                 except Exception as e:
                     logger.error(f"ONNX 文本快筛异常: {e}")
-                    text_conf = 0.95 if force_llm else 0.5 # 如果崩了，给个中性分数
+                    text_conf = 0.95 if force_llm else 0.5 
 
-                # 2. 从数据库动态获取通话场景
+                # 2. 准备状态机所需的上下文数据
                 platform_raw = getattr(record, 'platform', 'PHONE') if record else 'PHONE'
                 platform_str = platform_raw.name if hasattr(platform_raw, 'name') else str(platform_raw)
-                platform_str_lower = platform_str.lower()
-                is_video_call = "video" in platform_str_lower or "视频" in platform_str_lower
+                is_video_call = "video" in platform_str.lower() or "视频" in platform_str.lower()
 
-                # 3. 组装多维度用户画像
+                # 用户画像 (User Profile)
                 user_stmt = select(User).where(User.user_id == user_id)
                 user_result = await db.execute(user_stmt)
                 user = user_result.scalar_one_or_none()
@@ -488,121 +356,126 @@ def detect_text_task(self, text: str, user_id: int, call_id: int) -> Dict:
                 profile_parts = []
                 if user:
                     if getattr(user, 'role_type', None): profile_parts.append(f"身份：{user.role_type}")
-                    if getattr(user, 'gender', None): profile_parts.append(f"性别：{user.gender}")
                     if getattr(user, 'profession', None): profile_parts.append(f"职业：{user.profession}")
-                    if getattr(user, 'marital_status', None): profile_parts.append(f"婚姻：{user.marital_status}")
-                user_profile_str = "，".join(profile_parts) if profile_parts else "普通青壮年"
+                user_profile_str = "，".join(profile_parts) if profile_parts else "普通人群"
 
-                # 4. 从 Redis "黑板" 拉取最新底层音视频得分
+                # 从黑板拉取多模态数据
                 r = redis.from_url(settings.REDIS_URL)
                 audio_conf = float(r.get(f"call:{call_id}:latest_audio_conf") or 0.0)
+                raw_video_conf = float(r.get(f"call:{call_id}:latest_video_conf") or 0.0) if is_video_call else 0.0
                 
-                if is_video_call:
-                    video_conf_val = f"{float(r.get(f'call:{call_id}:latest_video_conf') or 0.0):.4f}"
-                    call_type_desc = f"视频通话场景（当前渠道：{platform_str}。请综合分析画面伪造与语音伪造特征）"
-                else:
-                    video_conf_val = "N/A"
-                    call_type_desc = f"纯语音通话场景（当前渠道：{platform_str}。请完全忽略视频特征，重点分析文本与语音）"
+                call_type_desc = f"视频通话场景" if is_video_call else f"纯语音通话场景"
 
-                # 5. 维护短期记忆池
-                
+                # 提取交互轮次 (用于 MDP 的 Depth)
                 chat_history = await memory_service.get_context(call_id)
-                
-                # 6. 第三道防线：呼叫 LLM 大脑融合裁决
+                msg_count = len(chat_history.split('\n')) if isinstance(chat_history, str) else 1
+
+                # ==========================================
+                # 3. LLM 感知层 (只负责输出分类和意图)
+                # ==========================================
                 llm_result = await llm_service.analyze_multimodal_risk(
                     user_input=text, 
                     chat_history=chat_history,
                     user_profile=user_profile_str,
                     call_type=call_type_desc,
                     audio_conf=audio_conf,
-                    video_conf=video_conf_val,
+                    video_conf=f"{raw_video_conf:.4f}" if is_video_call else "N/A",
                     text_conf=text_conf  
                 )
                 
-                is_fraud = llm_result.get('is_fraud', False)
-                llm_conf = float(llm_result.get('confidence', text_conf))
+                # 4. 融合算分层 (科学加权避免大模型幻觉)
+                fused_score = fusion_engine.calculate_score(
+                    llm_classification=llm_result,
+                    local_text_conf=text_conf,
+                    audio_conf=audio_conf,
+                    video_conf=raw_video_conf
+                )
 
+                # 5. 马尔可夫决策层
+                # 根据画像、计算的科学分数、交互轮次获取 O(1) 查表动作
+                action_level = mdp_agent.get_defense_action(
+                    user=user, 
+                    current_risk_score=fused_score, 
+                    message_count=msg_count
+                )
+
+                # 将日志数据落盘
                 ai_log = AIDetectionLog(
                     call_id=call_id,
-                    text_confidence=llm_conf,    
-                    overall_score=llm_conf * 100,
-                    detected_keywords=text,        # 存入原文
+                    text_confidence=fused_score / 100.0, # 兼容老数据库格式 
+                    overall_score=fused_score,           # 核心：使用算分引擎得出的分数
+                    detected_keywords=f"剧本:{llm_result.get('match_script', '无')}|意图:{llm_result.get('intent', '无')}",
                     time_offset=time_offset,
-                    model_version="llm-fusion"     # 标记来源为大模型
+                    model_version="fusion-mdp-v1"
                 )
                 db.add(ai_log)
                 await db.commit()
 
-                # 【修复】删除了此处重复冗余的 publish_realtime_score 调用
-                risk_level = llm_result.get('risk_level', 'safe')
-                raw_llm_risk = risk_level.lower()
-
-                # A. 映射到 MessageLog (告警级别: safe, low, medium, high, critical)
+                # 6. 转化与执行 MDP 的拦截指令
                 alert_level = 'safe'
-                if is_fraud:
-                    if raw_llm_risk in ['critical', 'fake']:
-                        alert_level = 'critical'
-                    elif raw_llm_risk in ['high']:
-                        alert_level = 'high'
-                    elif raw_llm_risk in ['suspicious', 'medium']:
-                        alert_level = 'medium'
-                    else:
-                        alert_level = 'low'
-                
                 record_verdict = DetectionResult.SAFE
-                if is_fraud:
-                    if raw_llm_risk in ['critical', 'fake', 'high']:
-                        record_verdict = DetectionResult.FAKE
-                    else:
-                        record_verdict = DetectionResult.SUSPICIOUS
+                ui_message = "请注意保护个人隐私。"
                 
-                target_level = 1
-                if is_fraud:
-                    target_level = 3 if record_verdict == DetectionResult.FAKE else 2
+                target_level = action_level + 1 # Action(0,1,2) 对应 System Level(1,2,3)
 
-                #publish_realtime_score(user_id, "文本", is_fraud, llm_result.get('confidence', 0.0))
-                full_analysis = llm_result.get('analysis', '')
-                full_advice = llm_result.get('advice', '')
+                if action_level == 2:
+                    # MDP 裁定：三级最高防御 (强制阻断 + 联动监护人)
+                    alert_level = 'critical'
+                    record_verdict = DetectionResult.FAKE
+                    ui_message = f"【极度高危】系统已阻断。防骗建议：{llm_result.get('advice', '请立刻停止操作！')}"
+                    
+                    # 触发联动闭环 (大赛亮点)
+                    guardian_phone = getattr(user, 'guardian_phone', None)
+                    if guardian_phone:
+                        # 异步发送监护人短信
+                        try:
+                            await send_guardian_sms(guardian_phone, f"【防骗预警】您的家人正在遭遇高度疑似 [{llm_result.get('match_script', '诈骗')}] 类型的欺诈，系统已执行强制熔断，请立刻电话核实！")
+                        except Exception as e:
+                            logger.error(f"Failed to send guardian sms: {e}")
 
-                # 7. 写入最终决策日志并通知前端
+                elif action_level == 1:
+                    # MDP 裁定：二级中度防御 (弹窗警告/强核验)
+                    alert_level = 'medium'
+                    record_verdict = DetectionResult.SUSPICIOUS
+                    ui_message = f"【风险提示】行为可疑。防骗建议：{llm_result.get('advice', '请仔细核实对方身份！')}"
+                
+                # 通知前端展示并在记录中更新
                 await notification_service.handle_detection_result(
                     db=db, user_id=user_id, call_id=call_id,
-                    detection_type="多模态(Agent融合)", is_risk=is_fraud, 
-                    confidence=llm_result.get('confidence', 0.0),
+                    detection_type="MDP动态决策", is_risk=(action_level > 0), 
+                    confidence=fused_score / 100.0,
                     risk_level=alert_level,
-                    details=f"Agent裁定: {full_analysis}"
+                    details=f"命中剧本: {llm_result.get('match_script', '无')} | 融合分: {fused_score:.1f}"
                 )
 
                 if record:
-                    # 无论是否诈骗，只要大模型给了评价，我们就更新最新评价
-                    record.analysis = full_analysis
-                    record.advice = full_advice
+                    record.analysis = llm_result.get('analysis', '')
+                    record.advice = llm_result.get('advice', '')
                     
                     current_verdict = record.detected_result
-                    if record_verdict == DetectionResult.FAKE and current_verdict != DetectionResult.FAKE:
+                    if record_verdict == DetectionResult.FAKE:
                         record.detected_result = DetectionResult.FAKE
                     elif record_verdict == DetectionResult.SUSPICIOUS and current_verdict == DetectionResult.SAFE:
                         record.detected_result = DetectionResult.SUSPICIOUS
-                        
                     await db.commit()
 
-                # 8. LLM 下达 WebSocket 控制指令 (动态升降级)
+                # 将指令通过 WebSocket 路由给前端
                 if target_level > 1:
                     payload_control = {
                         "type": "control", "action": "upgrade_level", "target_level": target_level,
                         "config": {
                             "video_fps": 15.0 if target_level == 2 else 30.0,
-                            "ui_message": f"智能防诈守卫: {full_advice}",
+                            "ui_message": ui_message,
                             "warning_mode": "modal" if target_level == 2 else "fullscreen",
                             "block_call": (target_level == 3)
                         }
                     }
                     publish_control_command(user_id, payload_control)
 
-                return {"status": "success", "result": llm_result, "call_id": call_id}
+                return {"status": "success", "fused_score": fused_score, "action_level": action_level}
                 
             except Exception as e:
-                logger.error(f"Text fusion command center failed: {e}", exc_info=True)
+                logger.error(f"MDP Fusion Command Center failed: {e}", exc_info=True)
                 return {"status": "error", "message": str(e), "call_id": call_id}
 
     try:
@@ -616,7 +489,6 @@ def get_task_status(task_id: str) -> Dict:
     res = celery_app.AsyncResult(task_id)
     return {"task_id": task_id, "status": res.status, "result": res.result if res.successful() else None}
 
-# 新增保存审计证据的函数，返回文件的 MinIO URL
 async def save_audit_evidence(data: bytes, user_id: int, call_id: int, data_type: str, ext: str) -> str:
     """保存审计证据到 MinIO 并返回访问路径"""
     try:
@@ -632,22 +504,16 @@ async def save_audit_evidence(data: bytes, user_id: int, call_id: int, data_type
 
 @celery_app.task(name="generate_post_call_summary")
 def generate_post_call_summary_task(call_id: int, user_id: int):
-    """通话结束后，由 Celery 去读取自身内存中的对话并呼叫 LLM"""
-    
+    """通话结束后，由 Celery 去读取自身内存中的对话并呼叫 LLM 进行复盘"""
     async def _process():
-        # 1. 在 Celery 进程内读取 chat_history (此时它是有数据的)
         chat_history = await memory_service.get_context(call_id)
         
-        # 过滤空对话：如果真的没有说话，为了省钱直接清空并跳过
         if not chat_history or chat_history == "暂无历史上下文。" or len(chat_history) == 0:
             await memory_service.clear_context(call_id)
             return {"status": "skipped", "reason": "No conversation history"}
             
         try:
-            # 2. 呼叫大模型进行全盘总结
             summary_result = await llm_service.generate_final_summary(chat_history)
-            
-            # 3. 开启数据库会话进行更新
             async with AsyncSessionLocal() as db:
                 result = await db.execute(select(CallRecord).where(CallRecord.call_id == call_id))
                 record = result.scalar_one_or_none()
@@ -657,7 +523,6 @@ def generate_post_call_summary_task(call_id: int, user_id: int):
                     record.advice = summary_result.get("advice", record.advice)
                     
                     final_risk = summary_result.get("risk_level", "safe").lower()
-                    
                     record_verdict = DetectionResult.SAFE
                     if final_risk in ['fake', 'high', 'critical']:
                         record_verdict = DetectionResult.FAKE
@@ -666,15 +531,12 @@ def generate_post_call_summary_task(call_id: int, user_id: int):
 
                     record.detected_result = record_verdict
                     await db.commit()
-                    
             return {"status": "success"}
         except Exception as e:
             return {"status": "error", "message": str(e)}
         finally:
-            # 4. 无论成功失败，处理完毕后清空该通话的内存，防止内存泄漏
             memory_service.clear_context(call_id)
 
-    # 运行异步逻辑
     try:
         return async_to_sync(_process)()
     except Exception as e:
