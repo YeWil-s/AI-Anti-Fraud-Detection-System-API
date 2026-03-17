@@ -2,7 +2,7 @@
 Pydantic Schema 模型
 """
 from pydantic import BaseModel, EmailStr, Field, ConfigDict
-from typing import Optional, Any
+from typing import List, Optional, Any
 from datetime import datetime
 
 
@@ -122,3 +122,25 @@ class ResponseModel(BaseModel):
     code: int = 200
     message: str = "Success"
     data: Optional[Any] = None
+
+# ========== 案例数据库 ==========
+# 1. 案例匹配的请求体   
+class CaseMatchRequest(BaseModel):
+    transcript: str
+    top_k: int = 1
+
+# 2. 学习记录提交的请求体
+class LearningRecordRequest(BaseModel):
+    item_id: int
+    is_completed: bool = False
+
+# 3. 推荐资料的响应体 (根据你数据库实际字段调整)
+class KnowledgeItemResponse(BaseModel):
+    id: int
+    title: str
+    content_type: str  
+    url: Optional[str] = None
+    fraud_type: Optional[str] = None
+    
+    class Config:
+        from_attributes = True  

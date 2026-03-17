@@ -1,6 +1,6 @@
 """
 向量数据库服务 (RAG 检索基础)
-用于存储和检索反诈骗典型案例
+用于存储和检索反诈骗典型案例与法律法规
 """
 import os
 from chromadb.config import Settings
@@ -26,57 +26,75 @@ class VectorDBService:
             model_name="paraphrase-multilingual-MiniLM-L12-v2"
         )
         
-        # 获取或创建集合 (Collection，类似于关系型数据库中的表)
-        self.collection = self.client.get_or_create_collection(
+        # 1. 典型案例库 (原有)
+        self.cases_collection = self.client.get_or_create_collection(
             name="anti_fraud_cases",
             embedding_function=self.embedding_fn,
             metadata={"hnsw:space": "cosine"} # 使用余弦相似度进行检索
         )
-        logger.info("ChromaDB Vector DB initialized successfully.")
-
-    def add_cases(self, documents: list[str], metadatas: list[dict], ids: list[str]):
-        """
-        向知识库中添加新的反诈案例
-        :param documents: 案例正文列表
-        :param metadatas: 元数据列表（如案件类型、危险等级）
-        :param ids: 唯一标识符列表
-        """
-        self.collection.upsert(
-            documents=documents,
-            metadatas=metadatas,
-            ids=ids
+        
+        # 2. 法律法规库 (新增)
+        self.laws_collection = self.client.get_or_create_collection(
+            name="anti_fraud_laws",
+            embedding_function=self.embedding_fn,
+            metadata={"hnsw:space": "cosine"} 
         )
+        
+        logger.info("ChromaDB Vector DB initialized successfully with cases and laws collections.")
+
+    # ================= 原有兼容方法 =================
+    def add_cases(self, documents: list[str], metadatas: list[dict], ids: list[str]):
+        """向知识库中添加新的反诈案例 (兼容老代码)"""
+        self.cases_collection.upsert(documents=documents, metadatas=metadatas, ids=ids)
         logger.info(f"Successfully upserted {len(ids)} cases into Vector DB.")
 
     def search_similar_cases(self, query: str, n_results: int = 3) -> dict:
-        """
-        根据用户输入，检索最相似的历史案例
-        :param query: 用户的聊天内容或风险文本
-        :param n_results: 返回的最相似案例数量
-        """
-        results = self.collection.query(
-            query_texts=[query],
-            n_results=n_results
-        )
-        return results
+        """根据用户输入，检索最相似的历史案例 (兼容老代码返回原生格式)"""
+        return self.cases_collection.query(query_texts=[query], n_results=n_results)
     
+    # ================= 新增通用方法 =================
+    def add_data(self, collection_name: str, documents: list[str], metadatas: list[dict], ids: list[str]):
+        """通用数据入库方法"""
+        collection = self.cases_collection if collection_name == "anti_fraud_cases" else self.laws_collection
+        collection.upsert(documents=documents, metadatas=metadatas, ids=ids)
+        logger.info(f"Successfully upserted {len(ids)} items into {collection_name}.")
+
+    def search_similar(self, collection_name: str, text: str, top_k: int = 2) -> list:
+        """
+        通用检索方法 (供 EducationService 使用)
+        返回格式化好的字典列表
+        """
+        collection = self.cases_collection if collection_name == "anti_fraud_cases" else self.laws_collection
+        results = collection.query(
+            query_texts=[text],
+            n_results=top_k
+        )
+        
+        formatted_results = []
+        if results and results.get('documents') and results['documents'][0]:
+            for i in range(len(results['documents'][0])):
+                distance = results['distances'][0][i] if 'distances' in results and results['distances'] else None
+                formatted_results.append({
+                    "id": results['ids'][0][i],
+                    "content": results['documents'][0][i],
+                    "metadata": results['metadatas'][0][i],
+                    "distance": distance
+                })
+        return formatted_results
+
     def get_context_for_llm(self, query: str, n_results: int = 3) -> str:
-        """
-        [补充增强] 将检索到的相似案例组装成一段易于大模型阅读的纯文本上下文
-        """
+        """将检索到的相似案例组装成一段易于大模型阅读的纯文本上下文"""
         results = self.search_similar_cases(query, n_results=n_results)
         
         if not results['documents'] or not results['documents'][0]:
             return "未在知识库中检索到相似案例。"
             
         context_parts = []
-        # 遍历检索到的结果
         for i in range(len(results['documents'][0])):
             doc = results['documents'][0][i]
             meta = results['metadatas'][0][i]
             distance = results['distances'][0][i]
             
-            # 距离越小越相似，设定一个合理的阈值过滤掉不相关的结果(余弦距离 < 0.6 表示相关性较高)
             if distance > 0.6:
                 continue
                 

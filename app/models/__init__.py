@@ -8,6 +8,7 @@ from .ai_detection_log import AIDetectionLog
 from .risk_rule import RiskRule
 from .blacklist import NumberBlacklist
 from .message_log import MessageLog
+from app.models.education import KnowledgeItem, UserLearningRecord
 
 __all__ = [
     "User",
@@ -19,4 +20,6 @@ __all__ = [
     "MessageLog",
     "FamilyGroup",
     "FamilyApplication",
+    "KnowledgeItem",
+    "UserLearningRecord",
 ]

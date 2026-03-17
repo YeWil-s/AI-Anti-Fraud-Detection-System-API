@@ -21,7 +21,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
 
 from app.db.database import engine
-from app.api import users_router, detection_router, tasks_router, call_records_router,family
+from app.api import users_router, detection_router, tasks_router, call_records_router, family
+from app.api.education import router as education_router
 from app.api.admin import router as admin_router
 from app.core.config import settings
 from app.core.logger import setup_logging, logger, request_id_ctx
@@ -150,6 +151,7 @@ app.include_router(tasks_router)
 app.include_router(call_records_router)
 app.include_router(family.router)
 app.include_router(admin_router, prefix="/api/admin", tags=["Admin Management"])
+app.include_router(education_router)
 
 @app.get("/")
 async def root():
