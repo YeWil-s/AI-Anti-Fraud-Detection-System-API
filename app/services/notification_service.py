@@ -12,6 +12,7 @@ from app.models.message_log import MessageLog
 from app.models.user import User
 from app.core.config import settings
 from app.core.logger import get_logger
+from app.services.email_service import email_service
 
 logger = get_logger(__name__)
 
@@ -87,6 +88,10 @@ class NotificationService:
         if is_risk and risk_level in ["critical", "high", "medium"]:
             await self._notify_family_in_app(db, user_id, ws_payload)
             
+        # 5. [邮件通知] 高风险时发送邮件给监护人
+        if is_risk and risk_level in ["critical", "high"]:
+            await self._notify_guardian_by_email(db, user_id, risk_level, details)
+            
     async def _notify_family_in_app(self, db: AsyncSession, current_user_id: int, original_payload: dict):
         """
         核心任务：通过 WebSocket 向家庭组监护人发送预警
@@ -125,6 +130,55 @@ class NotificationService:
         for guardian in guardians:
             self._publish_to_redis(guardian.user_id, guardian_payload)
             logger.info(f"Sent family alert for User {current_user_id} to Guardian {guardian.user_id}")
+
+    async def _notify_guardian_by_email(
+        self, 
+        db: AsyncSession, 
+        current_user_id: int, 
+        risk_level: str,
+        details: str = ""
+    ):
+        """
+        通过邮件向监护人发送预警
+        """
+        try:
+            # 1. 查询受害者信息
+            result = await db.execute(select(User).where(User.user_id == current_user_id))
+            victim = result.scalar_one_or_none()
+            
+            if not victim or not victim.family_id:
+                return
+
+            # 2. 查询家庭组管理员（is_admin=True 且同一家庭组）
+            guardian_result = await db.execute(
+                select(User).where(
+                    User.family_id == victim.family_id,
+                    User.is_admin == True,
+                    User.user_id != current_user_id,
+                    User.email.isnot(None)  # 必须有邮箱
+                )
+            )
+            guardians = guardian_result.scalars().all()
+            
+            if not guardians:
+                logger.info(f"User {current_user_id} 的家庭组没有配置邮箱的管理员")
+                return
+            
+            # 3. 向每个管理员发送邮件
+            victim_name = victim.name or victim.username
+            
+            for guardian in guardians:
+                if guardian.email:
+                    await email_service.send_guardian_alert(
+                        to_email=guardian.email,
+                        victim_name=victim_name,
+                        risk_level=risk_level,
+                        details=details
+                    )
+                    logger.info(f"Sent email alert for User {current_user_id} to Guardian {guardian.user_id}")
+                    
+        except Exception as e:
+            logger.error(f"Failed to send guardian email: {e}")
 
     def _publish_to_redis(self, user_id: int, payload: dict):
         """

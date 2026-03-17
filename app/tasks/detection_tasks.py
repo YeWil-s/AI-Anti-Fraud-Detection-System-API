@@ -36,12 +36,23 @@ from app.core.config import settings
 from app.core.logger import get_logger, bind_context
 from app.services.risk_fusion_engine import fusion_engine
 from app.services.mdp_defense.dynamic_defense_agent import DynamicDefenseAgent
+from app.core.redis import get_redis
 
 # 初始化模块级 logger
 logger = get_logger(__name__)
 
 # 全局初始化 MDP 智能体
 mdp_agent = DynamicDefenseAgent()
+
+# Redis 连接池（模块级复用）
+_redis_pool = None
+
+def get_redis_pool():
+    """获取 Redis 连接池"""
+    global _redis_pool
+    if _redis_pool is None:
+        _redis_pool = redis.from_url(settings.REDIS_URL, decode_responses=True)
+    return _redis_pool
 
 def publish_realtime_score(user_id: int, detection_type: str, is_risk: bool, confidence: float):
     """专门向前端 WebSocket 实时推送分数"""
@@ -108,7 +119,7 @@ def publish_control_command(user_id: int, payload: dict):
 def apply_video_debounce(user_id: int, call_id: int, raw_is_fake: bool) -> dict:
     """使用 Redis 实现滑动窗口防抖和状态机"""
     try:
-        r = redis.from_url(settings.REDIS_URL)
+        r = get_redis_pool()
         window_key = f"detect:window:{call_id}"
         state_key = f"detect:state:{call_id}"
         
@@ -175,7 +186,7 @@ def detect_audio_task(self, audio_base64: str, user_id: int, call_id: int) -> Di
                 time_offset = int((now - call_start_time).total_seconds())
                 if time_offset < 0: time_offset = 0
 
-                r = redis.from_url(settings.REDIS_URL)
+                r = get_redis_pool()
                 r.setex(f"call:{call_id}:latest_audio_conf", 3600, str(confidence))
 
                 evidence_url = ""
@@ -197,14 +208,23 @@ def detect_audio_task(self, audio_base64: str, user_id: int, call_id: int) -> Di
                     record.audio_url = evidence_url
                     await db.commit()
                 
-                # 保留底层雷达的“兜底熔断”机制：遇到极端高危特征直接报警，绕过平滑 MDP 保证低延迟
+                # 保留底层雷达的"兜底熔断"机制：遇到极端高危特征直接报警，绕过平滑 MDP 保证低延迟
                 if is_fake and confidence >= 0.95:
                     payload_control = {
                         "type": "control", "action": "upgrade_level", "target_level": 3,
                         "config": {"ui_message": "【兜底熔断】检测到极度确信的AI合成语音，强制挂断！", "warning_mode": "fullscreen"} 
                     }
                     publish_control_command(user_id, payload_control)
-
+                                    
+                    # 触发监护人通知（音频极端高危）
+                    await notification_service.handle_detection_result(
+                        db=db, user_id=user_id, call_id=call_id,
+                        detection_type="音频熔断-极端高危", is_risk=True, 
+                        confidence=confidence,
+                        risk_level='critical',
+                        details=f"音频置信度: {confidence:.2f} | 检测到极度确信的AI合成语音"
+                    )
+                
                 return {"status": "success", "result": result}
             except Exception as e:
                 logger.error(f"Audio task failed: {e}", exc_info=True)
@@ -281,7 +301,7 @@ def detect_video_task(self, frame_data: list, user_id: int, call_id: int) -> Dic
                 debounce_data = apply_video_debounce(user_id, call_id, raw_is_fake)
                 curr_state = debounce_data.get("state", "SAFE")
 
-                r = redis.from_url(settings.REDIS_URL)
+                r = get_redis_pool()
                 r.setex(f"call:{call_id}:latest_video_conf", 3600, str(raw_conf))
                 r.setex(f"call:{call_id}:latest_video_state", 3600, curr_state)
 
@@ -308,6 +328,15 @@ def detect_video_task(self, frame_data: list, user_id: int, call_id: int) -> Dic
                         "config": {"video_fps": 30.0, "ui_message": "【熔断】画面出现严重篡改痕迹，高风险！", "warning_mode": "fullscreen"} 
                     }
                     publish_control_command(user_id, payload_control)
+                    
+                    # 触发监护人通知（视频极端高危）
+                    await notification_service.handle_detection_result(
+                        db=db, user_id=user_id, call_id=call_id,
+                        detection_type="视频熔断-极端高危", is_risk=True, 
+                        confidence=raw_conf,
+                        risk_level='critical',
+                        details=f"视频置信度: {raw_conf:.2f} | 画面出现严重篡改痕迹"
+                    )
                     
                 return {"status": "success", "result": raw_result, "debounce": debounce_data}
             except Exception as e:
@@ -385,7 +414,7 @@ def detect_text_task(self, text: str, user_id: int, call_id: int) -> Dict:
                 user_profile_str = "，".join(profile_parts) if profile_parts else "普通人群"
 
                 # 从黑板拉取多模态数据
-                r = redis.from_url(settings.REDIS_URL)
+                r = get_redis_pool()
                 audio_conf = float(r.get(f"call:{call_id}:latest_audio_conf") or 0.0)
                 raw_video_conf = float(r.get(f"call:{call_id}:latest_video_conf") or 0.0) if is_video_call else 0.0
                 
@@ -447,21 +476,14 @@ def detect_text_task(self, text: str, user_id: int, call_id: int) -> Dict:
                     record_verdict = DetectionResult.FAKE
                     ui_message = f"【极度高危】系统已阻断。防骗建议：{llm_result.get('advice', '请立刻停止操作！')}"
                     
-                    # 触发联动闭环 
-                    if user.family_id:
-                        # 1. 查询当前用户所属家庭组的所有监护人（即管理员，且排除自己）
-                        guardians_result = await db.execute(
-                            select(User).where(
-                                User.family_id == user.family_id,
-                                User.is_admin == True,
-                                User.user_id != user_id
-                            )
-                        )
-                        guardians = guardians_result.scalars().all()
-
-                        # 接入软件内提醒
-                    else:
-                        logger.info(f"用户 {user_id} 未加入家庭组，跳过监护人通知。")
+                    # 触发联动闭环 - 发送 WebSocket 和邮件通知给监护人
+                    await notification_service.handle_detection_result(
+                        db=db, user_id=user_id, call_id=call_id,
+                        detection_type="MDP三级防御-强制阻断", is_risk=True, 
+                        confidence=fused_score / 100.0,
+                        risk_level='critical',
+                        details=f"触发三级防御：{llm_result.get('match_script', '未知剧本')} | 融合分: {fused_score:.1f} | 建议: {llm_result.get('advice', '')}"
+                    )
 
                 elif action_level == 1:
                     # MDP 裁定：二级中度防御 (弹窗警告/强核验)

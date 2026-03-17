@@ -68,3 +68,7 @@ tests/
 data/competition_cases/
 
 dataset/
+
+.qoder/
+
+test*

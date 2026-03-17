@@ -1,4 +1,9 @@
+from typing import Optional
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
 from app.models.user import User
+from app.services.email_service import email_service
 from .mdp_env import UserVulnerability, RiskLevel, InteractionDepth, DefenseAction
 import json
 import os
@@ -43,13 +48,173 @@ class DynamicDefenseAgent:
 
     def get_best_action(self, vuln: UserVulnerability, risk: RiskLevel, depth: InteractionDepth) -> DefenseAction:
         """根据当前状态查询最佳防御动作"""
-        # 这里需要实现你的查表逻辑
-        # 比如将状态转为 string key 去 q_table 里面查
-        state_key = f"{vuln.value}_{risk.value}_{depth.value}"
+        # 使用枚举名作为 key，与 q_table_policy.json 格式保持一致
+        state_key = f"{vuln.name}_{risk.name}_{depth.name}"
         
         if state_key in self.q_table:
             action_value = self.q_table[state_key]
             return DefenseAction(action_value)
             
-        # 如果没查到，默认返回低级别防御
-        return DefenseAction.LEVEL_1
+        # 如果没查到，根据风险等级返回默认防御级别
+        if risk == RiskLevel.HIGH:
+            return DefenseAction.LEVEL_3
+        elif risk == RiskLevel.MEDIUM:
+            return DefenseAction.LEVEL_2
+        else:
+            return DefenseAction.LEVEL_1
+
+    async def notify_guardian_by_email(
+        self,
+        db: AsyncSession,
+        user_id: int,
+        risk_level: str,
+        details: str = ""
+    ) -> bool:
+        """
+        向家庭组管理员发送邮件预警
+        
+        Args:
+            db: 数据库会话
+            user_id: 当前用户ID（受害者）
+            risk_level: 风险等级
+            details: 风险详情
+            
+        Returns:
+            bool: 是否成功发送邮件
+        """
+        # 1. 查询受害者信息
+        result = await db.execute(select(User).where(User.user_id == user_id))
+        victim = result.scalar_one_or_none()
+        
+        if not victim or not victim.family_id:
+            return False
+        
+        # 2. 查询家庭组管理员（is_admin=True 且同一家庭组）
+        guardian_result = await db.execute(
+            select(User).where(
+                User.family_id == victim.family_id,
+                User.is_admin == True,
+                User.user_id != user_id,
+                User.email.isnot(None)  # 必须有邮箱
+            )
+        )
+        guardians = guardian_result.scalars().all()
+        
+        if not guardians:
+            return False
+        
+        # 3. 向每个管理员发送邮件
+        victim_name = victim.name or victim.username
+        success_count = 0
+        
+        for guardian in guardians:
+            if guardian.email:
+                sent = await email_service.send_guardian_alert(
+                    to_email=guardian.email,
+                    victim_name=victim_name,
+                    risk_level=risk_level,
+                    details=details
+                )
+                if sent:
+                    success_count += 1
+        
+        return success_count > 0
+
+    def get_defense_action(
+        self,
+        user: User,
+        current_risk_score: float,
+        message_count: int
+    ) -> int:
+        """
+        根据用户画像、风险分数和交互轮次获取防御动作等级
+        
+        Args:
+            user: 用户对象
+            current_risk_score: 当前风险分数 (0-100)
+            message_count: 交互轮次
+            
+        Returns:
+            int: 防御动作等级 (0=LEVEL_1, 1=LEVEL_2, 2=LEVEL_3)
+        """
+        # 1. 计算用户易感度
+        vuln = calculate_vulnerability(user)
+        
+        # 2. 根据风险分数确定风险等级
+        if current_risk_score >= 80:
+            risk = RiskLevel.HIGH
+        elif current_risk_score >= 40:
+            risk = RiskLevel.MEDIUM
+        else:
+            risk = RiskLevel.LOW
+        
+        # 3. 根据交互轮次确定交互深度
+        if message_count > 10:
+            depth = InteractionDepth.DEEP
+        elif message_count > 3:
+            depth = InteractionDepth.MEDIUM
+        else:
+            depth = InteractionDepth.SHALLOW
+        
+        # 4. 查询最佳防御动作
+        action = self.get_best_action(vuln, risk, depth)
+        
+        # 返回动作等级 (0, 1, 2)
+        return action.value
+
+    async def get_defense_action_with_notification(
+        self,
+        db: AsyncSession,
+        user_id: int,
+        user: User,
+        current_risk_score: float,
+        message_count: int,
+        details: str = ""
+    ) -> int:
+        """
+        获取防御动作，并在需要时发送邮件通知
+        
+        Args:
+            db: 数据库会话
+            user_id: 当前用户ID
+            user: 用户对象
+            current_risk_score: 当前风险分数 (0-100)
+            message_count: 交互轮次
+            details: 风险详情
+            
+        Returns:
+            int: 防御动作等级 (0=LEVEL_1, 1=LEVEL_2, 2=LEVEL_3)
+        """
+        # 1. 计算用户易感度
+        vuln = calculate_vulnerability(user)
+        
+        # 2. 根据风险分数确定风险等级
+        if current_risk_score >= 80:
+            risk = RiskLevel.HIGH
+        elif current_risk_score >= 40:
+            risk = RiskLevel.MEDIUM
+        else:
+            risk = RiskLevel.LOW
+        
+        # 3. 根据交互轮次确定交互深度
+        if message_count > 10:
+            depth = InteractionDepth.DEEP
+        elif message_count > 3:
+            depth = InteractionDepth.MEDIUM
+        else:
+            depth = InteractionDepth.SHALLOW
+        
+        # 4. 查询最佳防御动作
+        action = self.get_best_action(vuln, risk, depth)
+        
+        # 5. 当防御等级为 LEVEL_3（强制阻断）时，发送邮件通知监护人
+        if action == DefenseAction.LEVEL_3:
+            await self.notify_guardian_by_email(
+                db=db,
+                user_id=user_id,
+                risk_level=risk.name.lower(),
+                details=details
+            )
+        
+        # 返回动作等级 (0, 1, 2)
+        return action.value

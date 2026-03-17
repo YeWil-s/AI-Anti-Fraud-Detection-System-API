@@ -113,10 +113,42 @@ class LLMService:
 
     async def analyze_multimodal_risk(self, user_input: str, chat_history: str, user_profile: str = "青壮年", 
         call_type: str = "普通通话", audio_conf: float = 0.0, 
-        video_conf: str = "0.0", text_conf: float = 0.0) -> dict:
-        """多模态融合风控分析"""
+        video_conf: str = "0.0", text_conf: float = 0.0, 
+        db = None, user_id: int = None) -> dict:
+        """
+        多模态融合风控分析
+        
+        Args:
+            db: 数据库会话（用于获取推荐案例）
+            user_id: 用户ID（用于个性化推荐）
+        """
         try:
+            # 1. 获取知识库上下文
             context = await asyncio.to_thread(vector_db.get_context_for_llm, query=user_input, n_results=2)
+            
+            # 2. 如果提供了db和user_id，获取实时推荐案例
+            recommendations = None
+            if db and user_id:
+                try:
+                    # 延迟导入避免循环依赖
+                    from app.services.education_service import EducationService
+                    edu_service = EducationService(db)
+                    recommendations = await edu_service.recommend_by_conversation(
+                        user_id=user_id,
+                        conversation_text=user_input,
+                        top_k=2
+                    )
+                    # 将推荐案例追加到上下文
+                    if recommendations.get("cases"):
+                        rec_context = "\n\n【系统推荐的相似案例】:\n"
+                        for i, case in enumerate(recommendations["cases"][:2], 1):
+                            rec_context += f"案例{i}: {case.get('metadata', {}).get('title', '')}\n"
+                            rec_context += f"类型: {case.get('metadata', {}).get('fraud_type', '')}\n"
+                            rec_context += f"内容: {case.get('content', '')[:200]}...\n\n"
+                        context += rec_context
+                except Exception as rec_e:
+                    logger.warning(f"获取推荐案例失败: {rec_e}")
+            
             chain = self.prompt_template | self.llm | self.output_parser
             
             response = await chain.ainvoke({
@@ -127,9 +159,17 @@ class LLMService:
                 "user_input": user_input,
                 "text_conf": f"{text_conf:.4f}",
                 "audio_conf": f"{audio_conf:.4f}",
-                "video_conf": video_conf,  # 传入 N/A 或具体数值
+                "video_conf": video_conf,
                 "format_instructions": self.output_parser.get_format_instructions()
             })
+            
+            # 3. 将推荐信息添加到响应中
+            if recommendations:
+                response["recommendations"] = {
+                    "cases": recommendations.get("cases", []),
+                    "slogans": recommendations.get("slogans", []),
+                    "alert_message": recommendations.get("alert_message", "")
+                }
             
             logger.info(f"多模态决策完成: 诈骗={response['is_fraud']} | 等级={response['risk_level']} | T_conf={text_conf:.2f} | A_conf={audio_conf:.2f} | V_conf={video_conf}")
             return response

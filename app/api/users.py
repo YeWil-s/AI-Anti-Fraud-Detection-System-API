@@ -23,6 +23,7 @@ from app.schemas import (
 )
 from app.core.security import verify_password, get_password_hash, create_access_token, get_current_user_id
 from app.core.sms import verify_sms_code, send_sms_code
+from app.core.email_code import send_email_code, verify_email_code
 from app.core.logger import get_logger, bind_context
 
 logger = get_logger(__name__)
@@ -31,9 +32,37 @@ router = APIRouter(prefix="/api/users", tags=["用户管理"])
 
 @router.post("/send-code", response_model=ResponseModel)
 async def send_verification_code(request: PhoneRequest):
-    """发送短信验证码"""
-    # 验证手机号格式
+    """发送验证码（优先邮箱， fallback 到短信）"""
+    # 检查是否提供了邮箱
+    email = getattr(request, 'email', None)
     phone = request.phone
+    
+    # 如果提供了邮箱，优先使用邮箱验证码
+    if email:
+        # 验证邮箱格式（简单验证）
+        if '@' not in email or '.' not in email:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="邮箱格式不正确"
+            )
+        
+        # 发送邮箱验证码
+        success = await send_email_code(email)
+        if not success:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="邮箱验证码发送失败，请检查邮箱配置"
+            )
+        
+        logger.info(f"Email verification code sent to {email}")
+        return ResponseModel(
+            code=200,
+            message="验证码已发送至邮箱",
+            data={"email": email}
+        )
+    
+    # 否则使用短信验证码
+    # 验证手机号格式
     if len(phone) != 11 or not phone.isdigit():
         logger.debug(f"Invalid phone format: {phone}")
         raise HTTPException(
@@ -44,16 +73,15 @@ async def send_verification_code(request: PhoneRequest):
     # 发送验证码
     success = await send_sms_code(phone)
     if not success:
-        # 日志已在 send_sms_code 内部记录，这里只需抛出异常
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="验证码发送失败"
         )
     
-    logger.info(f"Verification code sent to {phone}")
+    logger.info(f"SMS verification code sent to {phone}")
     return ResponseModel(
         code=200,
-        message="验证码已发送",
+        message="验证码已发送至手机",
         data={"phone": phone}
     )
 
@@ -61,14 +89,26 @@ async def send_verification_code(request: PhoneRequest):
             response_model=ResponseModel, 
             status_code=status.HTTP_201_CREATED)
 async def register(user_data: UserCreate, db: AsyncSession = Depends(get_db)):
-    """用户注册"""
-    # 验证短信验证码
-    if not verify_sms_code(user_data.phone, user_data.sms_code):
-        logger.warning(f"Registration failed: Invalid SMS code for {user_data.phone}")
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="验证码错误或已过期"
-        )
+    """用户注册（支持邮箱或手机验证码）"""
+    # 判断使用邮箱验证码还是短信验证码
+    email = getattr(user_data, 'email', None)
+    
+    if email:
+        # 使用邮箱验证码验证
+        if not verify_email_code(email, user_data.sms_code):
+            logger.warning(f"Registration failed: Invalid email code for {email}")
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="验证码错误或已过期"
+            )
+    else:
+        # 使用短信验证码验证
+        if not verify_sms_code(user_data.phone, user_data.sms_code):
+            logger.warning(f"Registration failed: Invalid SMS code for {user_data.phone}")
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="验证码错误或已过期"
+            )
     
     # 检查手机号是否已存在
     result = await db.execute(select(User).where(User.phone == user_data.phone))
@@ -95,6 +135,7 @@ async def register(user_data: UserCreate, db: AsyncSession = Depends(get_db)):
     # 创建新用户
     new_user = User(
         phone=user_data.phone,
+        email=getattr(user_data, 'email', None),  # 保存用户邮箱
         username=user_data.username,
         name=user_data.name,
         password_hash=get_password_hash(user_data.password),

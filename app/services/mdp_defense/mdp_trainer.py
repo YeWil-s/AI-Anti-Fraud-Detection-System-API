@@ -3,10 +3,10 @@ import numpy as np
 import json
 import random
 import os
-from mdp_env import AntiFraudMDPEnv, UserVulnerability, RiskLevel, InteractionDepth, DefenseAction
+from .mdp_env import AntiFraudMDPEnv, UserVulnerability, RiskLevel, InteractionDepth, DefenseAction
 
 class MDPTrainer:
-    def __init__(self, env: AntiFraudMDPEnv):
+    def __init__(self, env: AntiFraudMDPEnv, seed: int = 42):
         self.env = env
         # 初始化 Q-Table，大小为 (27, 3)，全部填 0
         self.q_table = np.zeros((self.env.state_space_size, self.env.action_space_size))
@@ -18,6 +18,11 @@ class MDPTrainer:
         self.epsilon_decay = 0.995 # 探索衰减：慢慢减少随机，开始利用已有经验
         self.epsilon_min = 0.01
         self.episodes = 20000  # 训练轮数（模拟 2 万次诈骗对抗）
+        
+        # 设置随机种子，确保结果可复现
+        self.seed = seed
+        random.seed(seed)
+        np.random.seed(seed)
 
     def simulate_transition(self, vuln: UserVulnerability, risk: RiskLevel, depth: InteractionDepth, action: DefenseAction):
         """

@@ -20,11 +20,13 @@ class UserBase(BaseModel):
 class UserCreate(UserBase):
     """用户创建模型"""
     password: str = Field(..., min_length=6, max_length=20, description="密码")
-    sms_code: str = Field(..., min_length=4, max_length=6, description="短信验证码")
+    sms_code: str = Field(..., min_length=4, max_length=6, description="验证码")
+    email: Optional[str] = Field(None, description="邮箱（用于接收验证码）")
 
 
 class PhoneRequest(BaseModel):
     phone: str = Field(..., min_length=11, max_length=11, description="手机号")
+    email: Optional[str] = Field(None, description="邮箱（如果提供则发送邮箱验证码）")
 
 
 class UserLogin(BaseModel):
@@ -143,4 +145,56 @@ class KnowledgeItemResponse(BaseModel):
     fraud_type: Optional[str] = None
     
     class Config:
-        from_attributes = True  
+        from_attributes = True
+
+
+# ========== 推荐系统相关 ==========
+class RealtimeRecommendRequest(BaseModel):
+    """实时推荐请求"""
+    user_id: int
+    conversation_text: str = Field(..., description="当前对话内容/转录文本")
+    top_k: int = Field(3, ge=1, le=10, description="返回结果数量")
+
+
+class CaseRecommendation(BaseModel):
+    """案例推荐项"""
+    id: str
+    title: str
+    content: str
+    fraud_type: str
+    risk_level: Optional[str] = None
+    similarity: Optional[float] = None
+
+
+class SloganRecommendation(BaseModel):
+    """标语推荐项"""
+    id: str
+    content: str
+    fraud_type: str
+
+
+class VideoRecommendation(BaseModel):
+    """视频推荐项"""
+    id: str
+    title: str
+    url: str
+    fraud_type: str
+    description: Optional[str] = None
+
+
+class ProfileRecommendationResponse(BaseModel):
+    """基于画像的推荐响应"""
+    cases: List[CaseRecommendation]
+    slogans: List[SloganRecommendation]
+    videos: List[VideoRecommendation]
+    vulnerability_analysis: str
+    recommended_types: List[str]
+
+
+class RealtimeRecommendationResponse(BaseModel):
+    """实时推荐响应"""
+    cases: List[CaseRecommendation]
+    slogans: List[SloganRecommendation]
+    similarity_analysis: str
+    alert_message: str
+    matched_fraud_types: List[str]  

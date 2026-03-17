@@ -36,6 +36,15 @@ class Settings(BaseSettings):
     SMS_ACCESS_KEY: Optional[str] = None
     SMS_SECRET_KEY: Optional[str] = None
     
+    # 邮件服务配置
+    SMTP_HOST: str = "smtp.gmail.com"
+    SMTP_PORT: int = 587
+    SMTP_USER: Optional[str] = None
+    SMTP_PASSWORD: Optional[str] = None
+    SMTP_TLS: bool = True
+    EMAIL_FROM: str = "noreply@antifraud.com"
+    EMAIL_FROM_NAME: str = "AI反诈系统"
+    
     # Celery配置
     CELERY_BROKER_URL: str = "redis://localhost:6379/1"  
     CELERY_RESULT_BACKEND: str = "redis://localhost:6379/2"  

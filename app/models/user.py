@@ -12,6 +12,7 @@ class User(Base):
     
     user_id = Column(Integer, primary_key=True, index=True, autoincrement=True)
     phone = Column(String(20), unique=True, index=True, nullable=False, comment="手机号")
+    email = Column(String(100), unique=True, index=True, nullable=True, comment="邮箱")
     username = Column(String(50), unique=True, index=True, nullable=False, comment="用户名")
     name = Column(String(50), nullable=True, comment="用户姓名")
     password_hash = Column(String(255), nullable=False, comment="密码哈希")
