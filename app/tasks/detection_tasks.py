@@ -1,8 +1,11 @@
 """
-AI检测异步任务 (Celery Worker) 
-- 采用黑板模式(Blackboard)与文本意图驱动(Semantic-Driven)架构
-- 引入马尔可夫决策过程 (MDP) 实现动态防御阈值调整
+AI检测异步任务 
+- 采用黑板模式与文本意图驱动架构
+- 引入马尔可夫决策过程实现动态防御阈值调整
 """
+import cv2
+import tempfile
+import os
 import redis
 import json
 import asyncio
@@ -31,17 +34,8 @@ from app.models.ai_detection_log import AIDetectionLog
 from app.core.storage import upload_to_minio
 from app.core.config import settings
 from app.core.logger import get_logger, bind_context
-
-# [新增引入] 融合算分引擎与 MDP 决策大脑
 from app.services.risk_fusion_engine import fusion_engine
 from app.services.mdp_defense.dynamic_defense_agent import DynamicDefenseAgent
-
-# 尝试引入短信服务（若路径不同请自行调整）
-try:
-    from app.core.sms import send_guardian_sms
-except ImportError:
-    # 兼容性 Mock
-    async def send_guardian_sms(phone, msg): pass
 
 # 初始化模块级 logger
 logger = get_logger(__name__)
@@ -245,10 +239,44 @@ def detect_video_task(self, frame_data: list, user_id: int, call_id: int) -> Dic
                 evidence_url = ""
                 if raw_conf > getattr(settings, 'VIDEO_DETECTION_THRESHOLD', 0.8):
                     try:
-                        first_frame_bytes = base64.b64decode(frame_data[0])
-                        evidence_url = await save_audit_evidence(first_frame_bytes, user_id, call_id, "video", "jpg")
+                        # 1. 把传入的 base64 列表转回 OpenCV 图片格式
+                        frames = []
+                        for b64_str in frame_data:
+                            img_bytes = base64.b64decode(b64_str)
+                            nparr = np.frombuffer(img_bytes, np.uint8)
+                            frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+                            if frame is not None:
+                                frames.append(frame)
+
+                        # 2. 如果有画面，将其合成为 MP4
+                        if frames:
+                            height, width, _ = frames[0].shape
+                            
+                            # 生成一个临时文件路径
+                            with tempfile.NamedTemporaryFile(suffix='.mp4', delete=False) as temp_video:
+                                temp_video_path = temp_video.name
+
+                            # 初始化视频写入器 (mp4v 编码，假设前端传过来相当于 10 帧/秒)
+                            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+                            video_writer = cv2.VideoWriter(temp_video_path, fourcc, 10.0, (width, height))
+
+                            # 依次写入每一帧
+                            for frame in frames:
+                                video_writer.write(frame)
+                            
+                            video_writer.release() # 必须 release 才能保存完整
+
+                            # 3. 读取成字节流准备上传
+                            with open(temp_video_path, 'rb') as f:
+                                video_bytes = f.read()
+
+                            # 清理本地临时文件
+                            os.remove(temp_video_path)
+
+                            # 4. 调用新写的方法，上传生成的短视频！
+                            evidence_url = await save_video_evidence(video_bytes, user_id, call_id)
                     except Exception as e:
-                        pass
+                        logger.error(f"合成高危短视频失败: {e}", exc_info=True)
 
                 debounce_data = apply_video_debounce(user_id, call_id, raw_is_fake)
                 curr_state = debounce_data.get("state", "SAFE")
@@ -273,11 +301,11 @@ def detect_video_task(self, frame_data: list, user_id: int, call_id: int) -> Dic
                     await db.commit()
                     r.set(tech_log_key, now_ts, ex=3600)
 
-                # 保留视频极端高危的兜底熔断
+                # 保留视频极端高危的熔断
                 if curr_state == "ALARM" and raw_conf >= 0.95:
                     payload_control = {
                         "type": "control", "action": "upgrade_level", "target_level": 3,
-                        "config": {"video_fps": 30.0, "ui_message": "【兜底熔断】画面出现严重篡改痕迹，极高风险！", "warning_mode": "fullscreen"} 
+                        "config": {"video_fps": 30.0, "ui_message": "【熔断】画面出现严重篡改痕迹，高风险！", "warning_mode": "fullscreen"} 
                     }
                     publish_control_command(user_id, payload_control)
                     
@@ -291,10 +319,7 @@ def detect_video_task(self, frame_data: list, user_id: int, call_id: int) -> Dic
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
-
-# ==========================================
 # 核心中枢：多模态融合与 MDP 决策
-# ==========================================
 @celery_app.task(name="detect_text", bind=True)
 def detect_text_task(self, text: str, user_id: int, call_id: int) -> Dict:
     """文本触发器 & 大模型多模态融合决策司令部"""
@@ -366,13 +391,11 @@ def detect_text_task(self, text: str, user_id: int, call_id: int) -> Dict:
                 
                 call_type_desc = f"视频通话场景" if is_video_call else f"纯语音通话场景"
 
-                # 提取交互轮次 (用于 MDP 的 Depth)
+                # 提取交互轮次
                 chat_history = await memory_service.get_context(call_id)
                 msg_count = len(chat_history.split('\n')) if isinstance(chat_history, str) else 1
 
-                # ==========================================
                 # 3. LLM 感知层 (只负责输出分类和意图)
-                # ==========================================
                 llm_result = await llm_service.analyze_multimodal_risk(
                     user_input=text, 
                     chat_history=chat_history,
@@ -383,7 +406,7 @@ def detect_text_task(self, text: str, user_id: int, call_id: int) -> Dict:
                     text_conf=text_conf  
                 )
                 
-                # 4. 融合算分层 (科学加权避免大模型幻觉)
+                # 4. 融合算分层
                 fused_score = fusion_engine.calculate_score(
                     llm_classification=llm_result,
                     local_text_conf=text_conf,
@@ -403,7 +426,7 @@ def detect_text_task(self, text: str, user_id: int, call_id: int) -> Dict:
                 ai_log = AIDetectionLog(
                     call_id=call_id,
                     text_confidence=fused_score / 100.0, # 兼容老数据库格式 
-                    overall_score=fused_score,           # 核心：使用算分引擎得出的分数
+                    overall_score=fused_score,           # 得出的分数
                     detected_keywords=f"剧本:{llm_result.get('match_script', '无')}|意图:{llm_result.get('intent', '无')}",
                     time_offset=time_offset,
                     model_version="fusion-mdp-v1"
@@ -424,14 +447,21 @@ def detect_text_task(self, text: str, user_id: int, call_id: int) -> Dict:
                     record_verdict = DetectionResult.FAKE
                     ui_message = f"【极度高危】系统已阻断。防骗建议：{llm_result.get('advice', '请立刻停止操作！')}"
                     
-                    # 触发联动闭环 (大赛亮点)
-                    guardian_phone = getattr(user, 'guardian_phone', None)
-                    if guardian_phone:
-                        # 异步发送监护人短信
-                        try:
-                            await send_guardian_sms(guardian_phone, f"【防骗预警】您的家人正在遭遇高度疑似 [{llm_result.get('match_script', '诈骗')}] 类型的欺诈，系统已执行强制熔断，请立刻电话核实！")
-                        except Exception as e:
-                            logger.error(f"Failed to send guardian sms: {e}")
+                    # 触发联动闭环 
+                    if user.family_id:
+                        # 1. 查询当前用户所属家庭组的所有监护人（即管理员，且排除自己）
+                        guardians_result = await db.execute(
+                            select(User).where(
+                                User.family_id == user.family_id,
+                                User.is_admin == True,
+                                User.user_id != user_id
+                            )
+                        )
+                        guardians = guardians_result.scalars().all()
+
+                        # 接入软件内提醒
+                    else:
+                        logger.info(f"用户 {user_id} 未加入家庭组，跳过监护人通知。")
 
                 elif action_level == 1:
                     # MDP 裁定：二级中度防御 (弹窗警告/强核验)
@@ -494,12 +524,26 @@ async def save_audit_evidence(data: bytes, user_id: int, call_id: int, data_type
     try:
         timestamp = int(time.time() * 1000)
         filename = f"audit/{data_type}/{user_id}/{call_id}_{timestamp}.{ext}"
+
         content_type = "audio/wav" if data_type == "audio" else "image/jpeg"
         
         file_url = await upload_to_minio(data, filename, content_type=content_type)
         return file_url
     except Exception as e:
         logger.error(f"审计证据保存失败: {e}")
+        return ""
+
+async def save_video_evidence(video_bytes: bytes, user_id: int, call_id: int) -> str:
+    """专用于保存高危 MP4 视频证据到 MinIO 并返回访问路径"""
+    try:
+        timestamp = int(time.time() * 1000)
+        filename = f"audit/video/{user_id}/{call_id}_{timestamp}.mp4"
+        
+        # 明确指定 content_type 为 mp4
+        file_url = await upload_to_minio(video_bytes, filename, content_type="video/mp4")
+        return file_url
+    except Exception as e:
+        logger.error(f"视频证据保存失败: {e}")
         return ""
 
 @celery_app.task(name="generate_post_call_summary")
