@@ -74,6 +74,10 @@ class Settings(BaseSettings):
     LLM_API_KEY: str = ""
     LLM_BASE_URL: str = "https://api.deepseek.com/v1"
     
+    # 智谱AI GLM-4V-Flash 配置（用于图片OCR）
+    ZHIPU_API_KEY: str = ""
+    ZHIPU_BASE_URL: str = "https://open.bigmodel.cn/api/paas/v4"
+    
     # Pydantic V2 规范的配置写法：忽略额外变量，读取 .env
     model_config = SettingsConfigDict(
         env_file=".env",

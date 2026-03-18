@@ -20,11 +20,10 @@ from app.services.video_processor import VideoProcessor
 from app.models.call_record import CallRecord
 from app.schemas import ResponseModel
 
-# [Day 8 新增] 导入 Redis 工具以恢复状态
 from app.core.redis import get_all_user_preferences
 
 # 导入检测任务
-from app.tasks.detection_tasks import detect_video_task, detect_audio_task, detect_text_task
+from app.tasks.detection_tasks import detect_video_task, detect_audio_task, detect_text_task, detect_image_task
 
 router = APIRouter(prefix="/api/detection", tags=["实时检测"])
 logger = get_logger(__name__)
@@ -257,5 +256,53 @@ async def extract_video_frames(
             "frame_count": len(frames),
             "frame_rate": frame_rate,
             "frames": frames
+        }
+    )
+
+
+@router.post("/upload/image", response_model=ResponseModel)
+async def upload_image(
+    file: UploadFile = File(...),
+    call_id: Optional[int] = None,
+    current_user_id: int = Depends(get_current_user_id),
+    db: AsyncSession = Depends(get_db)
+):
+    """上传图片并触发OCR检测"""
+    allowed_types = ["image/jpeg", "image/png", "image/jpg", "image/webp"]
+    if file.content_type not in allowed_types:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"不支持的图片格式: {file.content_type}"
+        )
+    
+    content = await file.read()
+    
+    # 限制图片大小（最大10MB）
+    if len(content) > 10 * 1024 * 1024:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="图片大小不能超过10MB"
+        )
+    
+    # 上传到MinIO存储
+    file_url = await upload_to_minio(
+        content,
+        f"image/{current_user_id}/{file.filename}",
+        content_type=file.content_type
+    )
+    
+    # 触发图片OCR检测任务
+    import base64
+    image_base64 = base64.b64encode(content).decode('utf-8')
+    task = detect_image_task.delay(image_base64, current_user_id, call_id)
+    
+    return ResponseModel(
+        code=200,
+        message="图片上传成功，正在进行OCR识别",
+        data={
+            "url": file_url,
+            "filename": file.filename,
+            "size": len(content),
+            "task_id": task.id
         }
     )

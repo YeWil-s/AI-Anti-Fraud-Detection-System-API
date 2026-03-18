@@ -36,6 +36,7 @@ from app.core.config import settings
 from app.core.logger import get_logger, bind_context
 from app.services.risk_fusion_engine import fusion_engine
 from app.services.mdp_defense.dynamic_defense_agent import DynamicDefenseAgent
+from app.services.image_ocr_service import image_ocr_service
 from app.core.redis import get_redis
 
 # 初始化模块级 logger
@@ -567,6 +568,133 @@ async def save_video_evidence(video_bytes: bytes, user_id: int, call_id: int) ->
     except Exception as e:
         logger.error(f"视频证据保存失败: {e}")
         return ""
+
+@celery_app.task(name="detect_image", bind=True)
+def detect_image_task(self, image_base64: str, user_id: int, call_id: int) -> Dict:
+    """
+    图片检测任务 - 使用GLM-4V-Flash提取文字，支持去重和增量识别
+    """
+    bind_context(user_id=user_id, call_id=call_id)
+    
+    async def _process():
+        async with AsyncSessionLocal() as db:
+            try:
+                record = await ensure_call_record_exists(db, call_id, user_id)
+                
+                # 解码图片
+                try:
+                    image_bytes = base64.b64decode(image_base64)
+                except Exception as e:
+                    return {"status": "error", "message": "Invalid base64 image"}
+                
+                # 保存原始图片（如果需要）
+                if getattr(settings, 'COLLECT_TRAINING_DATA', False):
+                    await save_raw_data(image_bytes, user_id, call_id, "image", "jpg")
+                
+                # 使用OCR提取文字
+                logger.info(f"开始图片OCR，用户: {user_id}, 通话: {call_id}")
+                ocr_result = await image_ocr_service.extract_chat_from_screenshot(image_bytes)
+                
+                if not ocr_result or not ocr_result.get("text"):
+                    return {"status": "success", "result": {"text": "", "is_fraud": False, "source": "ocr_empty"}}
+                
+                extracted_text = ocr_result["text"]
+                logger.info(f"图片OCR完成，提取文字长度: {len(extracted_text)}")
+                
+                # 计算对话哈希
+                dialogue_hash = image_ocr_service.calculate_dialogue_hash(extracted_text)
+                
+                # 查询该通话最近10分钟的OCR记录，用于去重
+                from sqlalchemy import select, and_, desc
+                from datetime import timedelta
+                
+                ten_minutes_ago = datetime.now() - timedelta(minutes=10)
+                recent_logs_result = await db.execute(
+                    select(AIDetectionLog)
+                    .where(
+                        and_(
+                            AIDetectionLog.call_id == call_id,
+                            AIDetectionLog.detection_type == "image",
+                            AIDetectionLog.created_at >= ten_minutes_ago
+                        )
+                    )
+                    .order_by(desc(AIDetectionLog.created_at))
+                    .limit(5)
+                )
+                recent_logs = recent_logs_result.scalars().all()
+                
+                # 获取之前的对话文本用于增量识别
+                previous_texts = [log.image_ocr_text for log in recent_logs if log.image_ocr_text]
+                
+                # 增量识别：找出新增对话
+                increment_result = image_ocr_service.extract_new_dialogues(
+                    current_text=extracted_text,
+                    previous_texts=previous_texts,
+                    similarity_threshold=0.85
+                )
+                
+                # 记录OCR结果到数据库
+                now = datetime.now()
+                call_start_time = record.start_time if record and hasattr(record, 'start_time') and record.start_time else now
+                time_offset = int((now - call_start_time).total_seconds())
+                if time_offset < 0: time_offset = 0
+                
+                ai_log = AIDetectionLog(
+                    call_id=call_id,
+                    detection_type="image",
+                    detected_keywords=f"图片OCR提取: {extracted_text[:100]}...",
+                    image_ocr_text=extracted_text,  # 保存完整OCR文本
+                    ocr_dialogue_hash=dialogue_hash,  # 保存哈希用于去重
+                    overall_score=0,
+                    time_offset=time_offset,
+                    model_version="glm-4v-flash-ocr"
+                )
+                db.add(ai_log)
+                await db.commit()
+                
+                # 如果是重复内容，只记录不触发检测
+                if increment_result["is_duplicate"]:
+                    logger.info(f"图片内容重复，相似度: {increment_result['similarity']:.2%}，跳过检测")
+                    return {
+                        "status": "success", 
+                        "result": {
+                            "text": extracted_text,
+                            "is_duplicate": True,
+                            "similarity": increment_result["similarity"],
+                            "source": "ocr_duplicate"
+                        }
+                    }
+                
+                # 使用新增内容触发文本检测
+                new_content = increment_result["new_content"] or extracted_text
+                new_lines = increment_result["new_lines"]
+                
+                if len(new_content.strip()) > 2:
+                    logger.info(f"触发文本检测，新增内容长度: {len(new_content)}, 新增行数: {len(new_lines)}")
+                    detect_text_task.delay(new_content, user_id, call_id)
+                
+                return {
+                    "status": "success", 
+                    "result": {
+                        "text": extracted_text,
+                        "new_content": new_content,
+                        "new_lines": new_lines,
+                        "similarity": increment_result["similarity"],
+                        "is_duplicate": False,
+                        "dialogue": ocr_result.get("dialogue", []),
+                        "source": "ocr"
+                    }
+                }
+                
+            except Exception as e:
+                logger.error(f"Image task failed: {e}", exc_info=True)
+                return {"status": "error", "message": str(e)}
+    
+    try:
+        return async_to_sync(_process)()
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
 
 @celery_app.task(name="generate_post_call_summary")
 def generate_post_call_summary_task(call_id: int, user_id: int):
