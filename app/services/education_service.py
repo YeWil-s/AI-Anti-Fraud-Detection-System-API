@@ -91,15 +91,17 @@ class EducationService:
         """
         功能2: 在向量数据库中匹配相似案例或法律法规
         当用户正在遭遇诈骗通话时调用
+        
+        案例和法律分开检索，提高检索效率和准确性
         """
-        # 从防诈案例库拉取相似案例
+        # 从案例库拉取相似案例（anti_fraud_cases）
         similar_cases = self.vector_db.search_similar(
             collection_name="anti_fraud_cases",
             text=transcript,
             top_k=top_k
         )
         
-        # 从法律法规库拉取相关法条
+        # 从法律法规库拉取相关法条（anti_fraud_laws）
         similar_laws = self.vector_db.search_similar(
             collection_name="anti_fraud_laws",
             text=transcript,
@@ -247,6 +249,91 @@ class EducationService:
             "alert_message": analysis_result.get("alert", ""),
             "matched_fraud_types": list(set([case.get("metadata", {}).get("fraud_type", "") 
                                               for case in similar_cases if case.get("similarity", 0) > 0.7]))
+        }
+    
+    async def recommend_from_case_and_law_library(
+        self,
+        user_id: int,
+        fraud_type: str = None,
+        limit: int = 5
+    ) -> Dict[str, Any]:
+        """
+        从案例库和法律库中推荐内容
+        
+        融合大赛提供的案例库和法律库数据
+        案例和法律分别存储在不同的集合中，分开检索
+        
+        Args:
+            user_id: 用户ID
+            fraud_type: 指定诈骗类型（可选）
+            limit: 返回数量
+            
+        Returns:
+            {
+                "cases": [案例列表],
+                "laws": [法律条文列表],
+                "mixed_recommendations": [混合推荐],
+                "source_stats": {"cases": n, "laws": n}
+            }
+        """
+        user = self.db.query(User).filter(User.user_id == user_id).first()
+        
+        # 1. 确定查询的诈骗类型
+        query_types = []
+        if fraud_type:
+            query_types = [fraud_type]
+        elif user and user.role_type:
+            query_types = ROLE_VULNERABILITY_MAP.get(user.role_type, ["刷单返利诈骗"])
+        else:
+            query_types = ["刷单返利诈骗", "冒充客服诈骗"]
+        
+        all_cases = []
+        all_laws = []
+        
+        # 2. 从案例集合检索案例（anti_fraud_cases）
+        for ftype in query_types[:2]:  # 最多2种类型
+            cases = self.vector_db.search_by_fraud_type("anti_fraud_cases", ftype, top_k=limit)
+            for case in cases:
+                case["source_label"] = "大赛案例库"
+                all_cases.append(case)
+        
+        # 3. 从法律集合检索法律条文（anti_fraud_laws）
+        for ftype in query_types[:2]:
+            laws = self.vector_db.search_by_fraud_type("anti_fraud_laws", ftype, top_k=2)
+            for law in laws:
+                law["source_label"] = "反诈法"
+                all_laws.append(law)
+        
+        # 4. 混合推荐：案例 + 法律条文
+        mixed = []
+        case_idx = 0
+        law_idx = 0
+        
+        while len(mixed) < limit and (case_idx < len(all_cases) or law_idx < len(all_laws)):
+            if case_idx < len(all_cases):
+                mixed.append({
+                    "type": "case",
+                    "content": all_cases[case_idx],
+                    "priority": 1
+                })
+                case_idx += 1
+            if law_idx < len(all_laws) and len(mixed) < limit:
+                mixed.append({
+                    "type": "law",
+                    "content": all_laws[law_idx],
+                    "priority": 2
+                })
+                law_idx += 1
+        
+        return {
+            "cases": all_cases[:limit],
+            "laws": all_laws[:limit//2],
+            "mixed_recommendations": mixed,
+            "source_stats": {
+                "cases": len(all_cases),
+                "laws": len(all_laws)
+            },
+            "query_types": query_types
         }
     
     async def _generate_vulnerability_analysis(

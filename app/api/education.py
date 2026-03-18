@@ -101,3 +101,38 @@ async def get_realtime_recommendations(request: RealtimeRecommendRequest, db: Se
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/recommendations/library/{user_id}", response_model=ResponseModel)
+async def get_library_recommendations(
+    user_id: int, 
+    fraud_type: str = None,
+    limit: int = 5, 
+    db: Session = Depends(get_db)
+):
+    """
+    从案例库和法律库中推荐内容
+    
+    融合大赛提供的案例库（300数据集标注）和法律库（反诈法条文）
+    为用户提供案例警示和法律知识学习
+    
+    Args:
+        user_id: 用户ID
+        fraud_type: 可选，指定诈骗类型（如：冒充公检法诈骗）
+        limit: 返回数量，默认5条
+    """
+    service = EducationService(db)
+    try:
+        result = await service.recommend_from_case_and_law_library(
+            user_id=user_id,
+            fraud_type=fraud_type,
+            limit=limit
+        )
+        
+        return ResponseModel(
+            code=200,
+            message=f"获取案例库和法律库推荐成功，共{result['source_stats']['cases']}个案例，{result['source_stats']['laws']}条法律",
+            data=result
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))

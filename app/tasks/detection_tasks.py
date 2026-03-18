@@ -209,22 +209,25 @@ def detect_audio_task(self, audio_base64: str, user_id: int, call_id: int) -> Di
                     record.audio_url = evidence_url
                     await db.commit()
                 
-                # 保留底层雷达的"兜底熔断"机制：遇到极端高危特征直接报警，绕过平滑 MDP 保证低延迟
+                # 音频高危特征：提升防御等级，但不直接触发警报
+                # 最终决策交给文本检测融合判断
                 if is_fake and confidence >= 0.95:
+                    # 只提升防御等级，增加检测频率
                     payload_control = {
-                        "type": "control", "action": "upgrade_level", "target_level": 3,
-                        "config": {"ui_message": "【兜底熔断】检测到极度确信的AI合成语音，强制挂断！", "warning_mode": "fullscreen"} 
+                        "type": "control", "action": "upgrade_level", "target_level": 2,
+                        "config": {
+                            "ui_message": "【风险提示】检测到AI合成语音特征，请提高警惕", 
+                            "warning_mode": "normal",
+                            "video_fps": 15.0  # 增加检测频率
+                        } 
                     }
                     publish_control_command(user_id, payload_control)
-                                    
-                    # 触发监护人通知（音频极端高危）
-                    await notification_service.handle_detection_result(
-                        db=db, user_id=user_id, call_id=call_id,
-                        detection_type="音频熔断-极端高危", is_risk=True, 
-                        confidence=confidence,
-                        risk_level='critical',
-                        details=f"音频置信度: {confidence:.2f} | 检测到极度确信的AI合成语音"
-                    )
+                    
+                    # 记录到Redis，供文本检测融合时参考
+                    r = get_redis_pool()
+                    r.setex(f"call:{call_id}:audio_high_risk_flag", 300, "1")
+                    
+                    logger.warning(f"音频检测到高危特征，已提升防御等级，等待文本融合判断 | 置信度: {confidence:.2f}")
                 
                 return {"status": "success", "result": result}
             except Exception as e:
@@ -322,22 +325,24 @@ def detect_video_task(self, frame_data: list, user_id: int, call_id: int) -> Dic
                     await db.commit()
                     r.set(tech_log_key, now_ts, ex=3600)
 
-                # 保留视频极端高危的熔断
+                # 视频高危特征：提升防御等级，但不直接触发警报
+                # 最终决策交给文本检测融合判断
                 if curr_state == "ALARM" and raw_conf >= 0.95:
+                    # 只提升防御等级，增加检测频率
                     payload_control = {
-                        "type": "control", "action": "upgrade_level", "target_level": 3,
-                        "config": {"video_fps": 30.0, "ui_message": "【熔断】画面出现严重篡改痕迹，高风险！", "warning_mode": "fullscreen"} 
+                        "type": "control", "action": "upgrade_level", "target_level": 2,
+                        "config": {
+                            "video_fps": 30.0, 
+                            "ui_message": "【风险提示】画面存在异常，请提高警惕", 
+                            "warning_mode": "normal"
+                        } 
                     }
                     publish_control_command(user_id, payload_control)
                     
-                    # 触发监护人通知（视频极端高危）
-                    await notification_service.handle_detection_result(
-                        db=db, user_id=user_id, call_id=call_id,
-                        detection_type="视频熔断-极端高危", is_risk=True, 
-                        confidence=raw_conf,
-                        risk_level='critical',
-                        details=f"视频置信度: {raw_conf:.2f} | 画面出现严重篡改痕迹"
-                    )
+                    # 记录到Redis，供文本检测融合时参考
+                    r.setex(f"call:{call_id}:video_high_risk_flag", 300, "1")
+                    
+                    logger.warning(f"视频检测到高危特征，已提升防御等级，等待文本融合判断 | 置信度: {raw_conf:.2f}")
                     
                 return {"status": "success", "result": raw_result, "debounce": debounce_data}
             except Exception as e:
@@ -392,7 +397,7 @@ def detect_text_task(self, text: str, user_id: int, call_id: int) -> Dict:
                     if force_llm:
                         text_conf = max(text_conf, 0.95) 
                     elif text_conf < 0.3:
-                        logger.info("ONNX 判定为极度安全闲聊，跳过重量级决策")
+                        logger.info("ONNX 判定为安全闲聊，跳过重量级决策")
                         return {"status": "success", "result": {"is_fraud": False, "risk_level": "safe", "source": "onnx"}}
                 except Exception as e:
                     logger.error(f"ONNX 文本快筛异常: {e}")
@@ -403,7 +408,7 @@ def detect_text_task(self, text: str, user_id: int, call_id: int) -> Dict:
                 platform_str = platform_raw.name if hasattr(platform_raw, 'name') else str(platform_raw)
                 is_video_call = "video" in platform_str.lower() or "视频" in platform_str.lower()
 
-                # 用户画像 (User Profile)
+                # 用户画像
                 user_stmt = select(User).where(User.user_id == user_id)
                 user_result = await db.execute(user_stmt)
                 user = user_result.scalar_one_or_none()
@@ -418,6 +423,19 @@ def detect_text_task(self, text: str, user_id: int, call_id: int) -> Dict:
                 r = get_redis_pool()
                 audio_conf = float(r.get(f"call:{call_id}:latest_audio_conf") or 0.0)
                 raw_video_conf = float(r.get(f"call:{call_id}:latest_video_conf") or 0.0) if is_video_call else 0.0
+                
+                # 检查音视频高危标志（由音视频检测设置）
+                audio_high_risk = r.get(f"call:{call_id}:audio_high_risk_flag") == "1"
+                video_high_risk = r.get(f"call:{call_id}:video_high_risk_flag") == "1"
+                
+                # 如果有音视频高危标志，提升本地文本置信度
+                if audio_high_risk and text_conf < 0.5:
+                    text_conf = max(text_conf, 0.5)
+                    logger.warning(f"音频高危标志触发，提升文本置信度至 {text_conf:.2f}")
+                
+                if video_high_risk and text_conf < 0.5:
+                    text_conf = max(text_conf, 0.5)
+                    logger.warning(f"视频高危标志触发，提升文本置信度至 {text_conf:.2f}")
                 
                 call_type_desc = f"视频通话场景" if is_video_call else f"纯语音通话场景"
 
