@@ -66,7 +66,6 @@ async def websocket_endpoint(
     # [关键] 为每个连接创建独立的处理器实例
     # 视频: 设置 sequence_length=10 (积攒10帧才检测)
     local_video_processor = VideoProcessor(sequence_length=10)
-    # 音频: 用于简单预处理或校验
     local_audio_processor = AudioProcessor()
 
     try:

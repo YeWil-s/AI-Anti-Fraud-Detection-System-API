@@ -41,6 +41,9 @@ class CallRecord(Base):
         comment="检测结果(safe/suspicious/fake)"
     )
     
+    # 诈骗类型（由LLM分析或管理员标注）
+    fraud_type = Column(String(50), nullable=True, comment="诈骗类型")
+    
     # [新增/修改] 媒体存储字段
     audio_url = Column(String(500), nullable=True, comment="录音文件URL")
     video_url = Column(String(500), nullable=True, comment="视频文件URL(如果是视频通话)") # 新增

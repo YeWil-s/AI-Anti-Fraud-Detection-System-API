@@ -4,12 +4,27 @@ FastAPI主应用入口
 import os
 import sys
 from unittest.mock import MagicMock
+
+# 禁用所有遥测/统计功能（必须在导入ChromaDB之前设置）
 os.environ["ANONYMIZED_TELEMETRY"] = "false"
 os.environ["CHROMA_TELEMETRY"] = "false"
 os.environ["POSTHOG_DISABLED"] = "1"
 os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
-sys.modules['chromadb.telemetry.posthog'] = MagicMock()
+os.environ["DISABLE_TELEMETRY"] = "1"
+os.environ["CHROMA_DISABLE_TELEMETRY"] = "true"
+
+# 创建一个模拟的telemetry模块，让它返回可调用对象
+class MockTelemetry:
+    def __init__(self, *args, **kwargs):
+        pass
+    def __call__(self, *args, **kwargs):
+        return self
+    def capture(self, *args, **kwargs):
+        pass
+
+# 只Mock最顶层的posthog模块
 sys.modules['posthog'] = MagicMock()
+sys.modules['chromadb.telemetry.posthog'] = MagicMock()
 import asyncio
 import json
 import uuid

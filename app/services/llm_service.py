@@ -24,6 +24,7 @@ class RiskAssessmentOutput(BaseModel):
     is_fraud: bool = Field(description="是否判定为诈骗风险")
     risk_level: str = Field(description="风险等级分类：'safe' (安全), 'suspicious' (可疑), 'fake' (高危诈骗)")
     match_script: str = Field(description="匹配的典型诈骗剧本，如'杀猪盘','冒充公检法','刷单返利','虚假投资','亲属出事'等。如未匹配填'无'")
+    fraud_type: str = Field(description="诈骗类型分类，必须从以下10种标准类型中选择：刷单返利诈骗、虚假投资理财诈骗、冒充客服诈骗、冒充公检法诈骗、杀猪盘网恋诈骗、虚假贷款诈骗、冒充领导熟人诈骗、游戏产品虚假交易、婚恋交友诈骗、消除不良记录诈骗。如无法确定填'其他'")
     intent: str = Field(description="核心意图识别，如'诱导转账/汇款','索要验证码/密码','要求屏幕共享','常规业务沟通'等")
     analysis: str = Field(description="对用户意图和话术套路的逻辑分析过程")
     advice: str = Field(description="针对特定受众人群给出的个性化防骗建议")

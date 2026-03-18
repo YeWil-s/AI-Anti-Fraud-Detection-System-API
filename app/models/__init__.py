@@ -9,6 +9,7 @@ from .risk_rule import RiskRule
 from .blacklist import NumberBlacklist
 from .message_log import MessageLog
 from app.models.education import KnowledgeItem, UserLearningRecord
+from .admin import Admin, AdminLog, SystemMonitor
 
 __all__ = [
     "User",
@@ -22,4 +23,7 @@ __all__ = [
     "FamilyApplication",
     "KnowledgeItem",
     "UserLearningRecord",
+    "Admin",
+    "AdminLog",
+    "SystemMonitor",
 ]

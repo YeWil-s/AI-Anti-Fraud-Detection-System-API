@@ -522,6 +522,10 @@ def detect_text_task(self, text: str, user_id: int, call_id: int) -> Dict:
                 if record:
                     record.analysis = llm_result.get('analysis', '')
                     record.advice = llm_result.get('advice', '')
+                    # 保存LLM识别的诈骗类型
+                    fraud_type = llm_result.get('fraud_type', '')
+                    if fraud_type and fraud_type != '其他':
+                        record.fraud_type = fraud_type
                     
                     current_verdict = record.detected_result
                     if record_verdict == DetectionResult.FAKE:
