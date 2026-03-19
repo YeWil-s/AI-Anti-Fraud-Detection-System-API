@@ -72,5 +72,25 @@ export default {
     updateUserStatus: (id, isActive) => api.patch(`/admin/users/${id}/status`, { is_active: isActive }),
     deleteUser: (id) => api.delete(`/admin/users/${id}`),
     getUserCallStats: (id) => api.get(`/admin/users/${id}/call-stats`),
-    getFamilyGroups: () => api.get('/admin/family-groups')
+    getFamilyGroups: () => api.get('/admin/family-groups'),
+    
+    // =======================
+    // 全过程记录接口（新增）
+    // =======================
+    getDetectionTimeline: (callId) => api.get(`/admin/call-records/${callId}/detection-timeline`),
+    getChatHistory: (callId) => api.get(`/admin/call-records/${callId}/chat-history`),
+    getEvidenceDetail: (logId) => api.get(`/admin/detection/${logId}/evidence`),
+    
+    // =======================
+    // 家庭组管理（新增）
+    // =======================
+    createFamilyGroup: (name) => api.post('/family/create', null, { params: { name } }),
+    applyJoinFamily: (familyId) => api.post(`/family/${familyId}/apply`),
+    getFamilyApplications: () => api.get('/family/applications'),
+    reviewApplication: (appId, isApprove) => api.put(`/family/applications/${appId}`, null, { params: { is_approve: isApprove } }),
+    getFamilyMembers: () => api.get('/family/members'),
+    setMemberAdminRole: (userId, role) => api.put(`/family/members/${userId}/admin-role`, null, { params: { role } }),
+    removeFamilyMember: (userId) => api.delete(`/family/members/${userId}`),
+    leaveFamilyGroup: () => api.post('/family/leave'),
+    getFamilyInfo: () => api.get('/family/info')
 };

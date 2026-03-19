@@ -18,7 +18,7 @@ from datetime import datetime
 from asgiref.sync import async_to_sync
 
 from sqlalchemy import select
-from app.models.call_record import CallRecord, DetectionResult
+from app.models.call_record import CallRecord, DetectionResult, CallPlatform
 
 from app.services.memory_service import memory_service
 from app.services.llm_service import llm_service
@@ -30,11 +30,12 @@ from app.services.security_service import security_service
 from app.services.notification_service import notification_service
 from app.db.database import AsyncSessionLocal
 from app.models.ai_detection_log import AIDetectionLog
+from app.models.chat_message import ChatMessage
 
 from app.core.storage import upload_to_minio
 from app.core.config import settings
 from app.core.logger import get_logger, bind_context
-from app.services.risk_fusion_engine import fusion_engine
+from app.services.risk_fusion_engine import fusion_engine, fusion_engine_v2
 from app.services.mdp_defense.dynamic_defense_agent import DynamicDefenseAgent
 from app.services.image_ocr_service import image_ocr_service
 from app.core.redis import get_redis
@@ -117,42 +118,83 @@ def publish_control_command(user_id: int, payload: dict):
     except Exception as e:
         logger.error(f"Failed to publish control command: {e}")
 
-def apply_video_debounce(user_id: int, call_id: int, raw_is_fake: bool) -> dict:
-    """使用 Redis 实现滑动窗口防抖和状态机"""
+def apply_video_debounce(user_id: int, call_id: int, raw_is_fake: bool, confidence: float = 0.0) -> dict:
+    """
+    使用 Redis 实现置信度加权滑动窗口防抖和状态机
+    
+    优化点：
+    - 存储置信度而非简单0/1
+    - 加权投票：高置信度样本权重更大
+    - 滞后区设计：避免状态抖动
+    """
     try:
         r = get_redis_pool()
+        # 存储置信度（用于加权投票）
+        conf_window_key = f"detect:window_conf:{call_id}"
+        # 保留二进制窗口用于兼容（可选）
         window_key = f"detect:window:{call_id}"
         state_key = f"detect:state:{call_id}"
         
+        # 存储置信度值
+        r.lpush(conf_window_key, confidence)
+        r.ltrim(conf_window_key, 0, 4)  # 保留最近5帧
+        r.expire(conf_window_key, 3600)
+        
+        # 兼容：仍存储二进制值
         val = 1 if raw_is_fake else 0
         r.lpush(window_key, val)
-        r.ltrim(window_key, 0, 4) 
+        r.ltrim(window_key, 0, 4)
         r.expire(window_key, 3600)
         
-        history = r.lrange(window_key, 0, -1)
-        fake_count = sum(int(x) for x in history)
+        # 读取置信度历史
+        conf_history = r.lrange(conf_window_key, 0, -1)
+        conf_values = [float(x) for x in conf_history]
         
+        # 置信度加权投票
+        # 策略：置信度>0.5的帧参与加权，权重=置信度
+        weighted_sum = 0.0
+        valid_count = 0
+        for conf in conf_values:
+            if conf > 0.5:  # 只统计疑似伪造的帧
+                weighted_sum += conf
+                valid_count += 1
+        
+        # 计算加权平均风险度
+        avg_risk = weighted_sum / len(conf_values) if conf_values else 0.0
+        
+        # 读取历史状态
         prev_state_bytes = r.get(state_key)
         prev_state = prev_state_bytes.decode('utf-8') if prev_state_bytes else "SAFE"
-            
-        current_state = prev_state 
-        if fake_count >= 3:
+        
+        # 状态机转换（带滞后区）
+        current_state = prev_state
+        
+        # ALARM阈值：加权平均>=0.6 且 至少3帧有检测
+        if avg_risk >= 0.60 and valid_count >= 3:
             current_state = "ALARM"
-        elif fake_count <= 1:
+        # SAFE阈值：加权平均<=0.3 或 有效帧<2
+        elif avg_risk <= 0.30 or valid_count <= 1:
             current_state = "SAFE"
+        # 0.3~0.6 为滞后区：保持原状态（避免抖动）
+        else:
+            current_state = prev_state
+            logger.debug(f"视频防抖滞后区: avg_risk={avg_risk:.2f}, 保持状态={prev_state}")
         
         if current_state != prev_state:
             r.setex(state_key, 3600, current_state)
-            
+            logger.info(f"视频状态切换: {prev_state} -> {current_state} (avg_risk={avg_risk:.2f}, weighted_sum={weighted_sum:.2f})")
+        
         return {
-            "final_is_fake": (current_state == "ALARM"), 
-            "fake_count": fake_count,
+            "final_is_fake": (current_state == "ALARM"),
+            "fake_count": valid_count,
+            "avg_risk": round(avg_risk, 3),
+            "weighted_sum": round(weighted_sum, 3),
             "state": current_state,
             "prev_state": prev_state
         }
     except Exception as e:
         logger.error(f"Debounce logic failed: {e}")
-        return {"final_is_fake": raw_is_fake, "state": "UNKNOWN", "prev_state": "UNKNOWN", "fake_count": -1}
+        return {"final_is_fake": raw_is_fake, "state": "UNKNOWN", "prev_state": "UNKNOWN", "fake_count": -1, "avg_risk": 0.0}
 
 
 @celery_app.task(name="detect_audio", bind=True)
@@ -302,7 +344,7 @@ def detect_video_task(self, frame_data: list, user_id: int, call_id: int) -> Dic
                     except Exception as e:
                         logger.error(f"合成高危短视频失败: {e}", exc_info=True)
 
-                debounce_data = apply_video_debounce(user_id, call_id, raw_is_fake)
+                debounce_data = apply_video_debounce(user_id, call_id, raw_is_fake, raw_conf)
                 curr_state = debounce_data.get("state", "SAFE")
 
                 r = get_redis_pool()
@@ -454,12 +496,13 @@ def detect_text_task(self, text: str, user_id: int, call_id: int) -> Dict:
                     text_conf=text_conf  
                 )
                 
-                # 4. 融合算分层
-                fused_score = fusion_engine.calculate_score(
+                # 4. 融合算分层 (使用增强版V2引擎)
+                fused_score = fusion_engine_v2.calculate_score(
                     llm_classification=llm_result,
                     local_text_conf=text_conf,
                     audio_conf=audio_conf,
-                    video_conf=raw_video_conf
+                    video_conf=raw_video_conf,
+                    call_id=call_id  # 传入call_id用于时序平滑
                 )
 
                 # 5. 马尔可夫决策层
@@ -471,16 +514,26 @@ def detect_text_task(self, text: str, user_id: int, call_id: int) -> Dict:
                 )
 
                 # 将日志数据落盘
+                # 提取敏感关键词（从检测文本中）
+                detected_text = text[:500] if len(text) > 500 else text  # 保存检测到的文本
+                sensitive_keywords = await _extract_sensitive_keywords(text)
+                
                 ai_log = AIDetectionLog(
                     call_id=call_id,
                     text_confidence=fused_score / 100.0, # 兼容老数据库格式 
                     overall_score=fused_score,           # 得出的分数
-                    detected_keywords=f"剧本:{llm_result.get('match_script', '无')}|意图:{llm_result.get('intent', '无')}",
+                    detected_text=detected_text,         # 检测到的完整文本
+                    detected_keywords=sensitive_keywords, # 敏感关键词
+                    match_script=llm_result.get('match_script', None),  # 匹配的剧本
+                    intent=llm_result.get('intent', None),              # 识别的意图
                     time_offset=time_offset,
                     model_version="fusion-mdp-v1"
                 )
                 db.add(ai_log)
                 await db.commit()
+                
+                # 同时保存到对话历史表
+                await _save_chat_message(db, call_id, msg_count, "other", text)
 
                 # 6. 转化与执行 MDP 的拦截指令
                 alert_level = 'safe'
@@ -623,6 +676,39 @@ def detect_image_task(self, image_base64: str, user_id: int, call_id: int) -> Di
                 extracted_text = ocr_result["text"]
                 logger.info(f"图片OCR完成，提取文字长度: {len(extracted_text)}")
                 
+                # 提取通话环境信息并更新call_record
+                environment = ocr_result.get("environment", {})
+                if environment:
+                    platform_str = environment.get("platform", "other")
+                    caller_number = environment.get("caller_number", "")
+                    target_name = environment.get("target_name", "")
+                    
+                    # 转换平台字符串为枚举
+                    platform_map = {
+                        "wechat": CallPlatform.WECHAT,
+                        "qq": CallPlatform.QQ,
+                        "phone": CallPlatform.PHONE,
+                        "video_call": CallPlatform.VIDEO_CALL,
+                        "other": CallPlatform.OTHER
+                    }
+                    detected_platform = platform_map.get(platform_str.lower(), CallPlatform.OTHER)
+                    
+                    # 更新call_record（仅当字段为空时）
+                    updated = False
+                    if record.platform == CallPlatform.PHONE or record.platform is None:
+                        record.platform = detected_platform
+                        updated = True
+                    if not record.caller_number and caller_number:
+                        record.caller_number = caller_number
+                        updated = True
+                    if not record.target_name and target_name:
+                        record.target_name = target_name
+                        updated = True
+                    
+                    if updated:
+                        await db.commit()
+                        logger.info(f"更新通话环境: platform={detected_platform.value}, caller={caller_number or target_name}")
+                
                 # 计算对话哈希
                 dialogue_hash = image_ocr_service.calculate_dialogue_hash(extracted_text)
                 
@@ -757,3 +843,37 @@ def generate_post_call_summary_task(call_id: int, user_id: int):
         return async_to_sync(_process)()
     except Exception as e:
         return {"status": "error", "message": str(e)}
+
+
+# ============================================================================
+# 辅助函数
+# ============================================================================
+
+SENSITIVE_KEYWORDS = [
+    "转账", "汇款", "验证码", "密码", "银行卡", "信用卡", "账户",
+    "屏幕共享", "远程控制", "下载", "链接", "点击", "APP", "安装",
+    "安全账户", "冻结", "涉嫌", "违法", "法院", "公安", "警察", "逮捕"
+]
+
+async def _extract_sensitive_keywords(text: str) -> str:
+    """从文本中提取敏感关键词"""
+    found = []
+    for keyword in SENSITIVE_KEYWORDS:
+        if keyword in text:
+            found.append(keyword)
+    return ",".join(found) if found else ""
+
+async def _save_chat_message(db, call_id: int, sequence: int, speaker: str, content: str):
+    """保存对话消息到数据库"""
+    try:
+        msg = ChatMessage(
+            call_id=call_id,
+            sequence=sequence,
+            speaker=speaker,
+            content=content[:1000] if len(content) > 1000 else content  # 限制长度
+        )
+        db.add(msg)
+        await db.commit()
+    except Exception as e:
+        logger.error(f"保存对话消息失败: {e}")
+        await db.rollback()

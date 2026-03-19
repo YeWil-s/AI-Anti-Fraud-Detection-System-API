@@ -911,3 +911,177 @@ async def get_family_groups(
         })
     
     return group_list
+
+
+# =======================
+# 全过程记录接口（管理后台）
+# =======================
+
+@router.get("/call-records/{call_id}/detection-timeline", summary="获取检测时间轴（管理员）")
+async def admin_get_detection_timeline(
+    call_id: int,
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    管理员获取指定通话的详细检测时间轴
+    """
+    # 查询通话记录
+    result = await db.execute(
+        select(CallRecord).where(CallRecord.call_id == call_id)
+    )
+    record = result.scalar_one_or_none()
+    if not record:
+        raise HTTPException(status_code=404, detail="通话记录不存在")
+    
+    # 获取AI检测日志
+    ai_logs_result = await db.execute(
+        select(AIDetectionLog)
+        .where(AIDetectionLog.call_id == call_id)
+        .order_by(AIDetectionLog.time_offset.asc())
+    )
+    ai_logs = ai_logs_result.scalars().all()
+    
+    # 构建时间轴
+    timeline = []
+    for log in ai_logs:
+        timeline.append({
+            "time_offset": log.time_offset,
+            "timestamp": log.created_at.isoformat() if log.created_at else None,
+            "modalities": {
+                "text": {
+                    "confidence": log.text_confidence,
+                    "score": log.text_confidence * 100 if log.text_confidence else 0,
+                    "detected_text": log.detected_text,
+                    "detected_keywords": log.detected_keywords,
+                    "match_script": log.match_script,
+                    "intent": log.intent
+                },
+                "voice": {
+                    "confidence": log.voice_confidence,
+                    "score": log.voice_confidence * 100 if log.voice_confidence else 0
+                },
+                "video": {
+                    "confidence": log.video_confidence,
+                    "score": log.video_confidence * 100 if log.video_confidence else 0
+                }
+            },
+            "overall_score": log.overall_score,
+            "fused_risk_level": _get_risk_level(log.overall_score),
+            "detection_type": log.detection_type,
+            "model_version": log.model_version,
+            "evidence_url": log.evidence_snapshot,
+            "log_id": log.log_id
+        })
+    
+    return {
+        "call_id": call_id,
+        "user_id": record.user_id,
+        "timeline": timeline,
+        "statistics": {
+            "total_events": len(timeline),
+            "max_overall_score": max([t["overall_score"] for t in timeline]) if timeline else 0,
+            "duration_seconds": timeline[-1]["time_offset"] if timeline else 0
+        }
+    }
+
+
+def _get_risk_level(score: float) -> str:
+    """根据分数获取风险等级"""
+    if score >= 80:
+        return "high"
+    elif score >= 50:
+        return "medium"
+    else:
+        return "low"
+
+
+@router.get("/call-records/{call_id}/chat-history", summary="获取对话历史（管理员）")
+async def admin_get_chat_history(
+    call_id: int,
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    管理员获取指定通话的对话历史
+    """
+    from app.models.chat_message import ChatMessage
+    
+    # 查询通话记录
+    result = await db.execute(
+        select(CallRecord).where(CallRecord.call_id == call_id)
+    )
+    record = result.scalar_one_or_none()
+    if not record:
+        raise HTTPException(status_code=404, detail="通话记录不存在")
+    
+    # 获取对话历史
+    messages_result = await db.execute(
+        select(ChatMessage)
+        .where(ChatMessage.call_id == call_id)
+        .order_by(ChatMessage.sequence.asc())
+    )
+    messages = messages_result.scalars().all()
+    
+    return {
+        "call_id": call_id,
+        "user_id": record.user_id,
+        "message_count": len(messages),
+        "messages": [
+            {
+                "sequence": m.sequence,
+                "speaker": m.speaker,
+                "content": m.content,
+                "timestamp": m.timestamp.isoformat() if m.timestamp else None
+            }
+            for m in messages
+        ]
+    }
+
+
+@router.get("/detection/{log_id}/evidence", summary="获取检测证据详情（管理员）")
+async def admin_get_evidence_detail(
+    log_id: int,
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    管理员获取指定检测日志的详细证据信息
+    """
+    result = await db.execute(
+        select(AIDetectionLog).where(AIDetectionLog.log_id == log_id)
+    )
+    log = result.scalar_one_or_none()
+    if not log:
+        raise HTTPException(status_code=404, detail="检测日志不存在")
+    
+    return {
+        "log_id": log.log_id,
+        "call_id": log.call_id,
+        "time_offset": log.time_offset,
+        "created_at": log.created_at.isoformat() if log.created_at else None,
+        "detection_type": log.detection_type,
+        "modalities": {
+            "text": {
+                "confidence": log.text_confidence,
+                "detected_text": log.detected_text,
+                "detected_keywords": log.detected_keywords,
+                "match_script": log.match_script,
+                "intent": log.intent
+            },
+            "voice": {
+                "confidence": log.voice_confidence
+            },
+            "video": {
+                "confidence": log.video_confidence
+            }
+        },
+        "overall_score": log.overall_score,
+        "risk_level": _get_risk_level(log.overall_score),
+        "evidence": {
+            "snapshot_url": log.evidence_snapshot,
+            "ocr_text": log.image_ocr_text,
+            "ocr_dialogue_hash": log.ocr_dialogue_hash
+        },
+        "technical_details": {
+            "algorithm_details": log.algorithm_details,
+            "model_version": log.model_version
+        }
+    }

@@ -43,6 +43,7 @@ class CallRecord(Base):
     
     # 诈骗类型（由LLM分析或管理员标注）
     fraud_type = Column(String(50), nullable=True, comment="诈骗类型")
+    match_script = Column(String(100), nullable=True, comment="匹配的主要诈骗剧本")
     
     # [新增/修改] 媒体存储字段
     audio_url = Column(String(500), nullable=True, comment="录音文件URL")

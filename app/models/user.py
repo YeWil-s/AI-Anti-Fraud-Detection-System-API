@@ -1,9 +1,17 @@
 """
 用户模型
 """
-from sqlalchemy import Column, Integer, String, DateTime, Boolean, ForeignKey
+from sqlalchemy import Column, Integer, String, DateTime, Boolean, ForeignKey, Enum as SQLEnum
 from sqlalchemy.sql import func
 from app.db.database import Base
+import enum
+
+
+class AdminRole(str, enum.Enum):
+    """管理员角色枚举"""
+    NONE = "none"           # 普通成员
+    SECONDARY = "secondary" # 副管理员（可接收告警，有限权限）
+    PRIMARY = "primary"     # 主管理员（完全权限）
 
 
 class User(Base):
@@ -22,9 +30,26 @@ class User(Base):
     profession = Column(String(50), nullable=True, comment="职业")
     marital_status = Column(String(20), nullable=True, comment="婚姻状况(单身/已婚/离异)")
     is_active = Column(Boolean, default=True, comment="账号是否激活")
-    is_admin = Column(Boolean, default=False, comment="是否为家庭管理员(监护人)")
+    is_admin = Column(Boolean, default=False, comment="是否为家庭管理员(监护人)")  # 保留兼容
+    admin_role = Column(String(20), nullable=True, index=True, comment="管理员角色: none/secondary/primary")
+    guardian_phone = Column(String(20), nullable=True, comment="监护人手机号")  # 备用监护人
     created_at = Column(DateTime(timezone=True), server_default=func.now(), comment="创建时间")
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), comment="更新时间")
+    
+    @property
+    def is_primary_admin(self) -> bool:
+        """是否为主管理员"""
+        return self.admin_role == AdminRole.PRIMARY.value
+    
+    @property
+    def is_secondary_admin(self) -> bool:
+        """是否为副管理员"""
+        return self.admin_role == AdminRole.SECONDARY.value
+    
+    @property
+    def is_any_admin(self) -> bool:
+        """是否为任意管理员"""
+        return self.admin_role in (AdminRole.PRIMARY.value, AdminRole.SECONDARY.value)
     
     def __repr__(self):
         return f"<User(user_id={self.user_id}, username={self.username}, role={self.role_type}, phone={self.phone})>"

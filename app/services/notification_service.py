@@ -94,7 +94,12 @@ class NotificationService:
             
     async def _notify_family_in_app(self, db: AsyncSession, current_user_id: int, original_payload: dict):
         """
-        核心任务：通过 WebSocket 向家庭组监护人发送预警
+        核心任务：通过 WebSocket 向家庭组管理员发送预警
+        
+        智能通知逻辑：
+        1. 如果被检测用户是普通成员 → 通知主管理员和副管理员
+        2. 如果被检测用户是副管理员 → 通知主管理员
+        3. 如果被检测用户是主管理员 → 通知副管理员（避免主管理员被诈骗时无人通知）
         """
         # 1. 查询受害者信息
         result = await db.execute(select(User).where(User.user_id == current_user_id))
@@ -103,17 +108,41 @@ class NotificationService:
         if not victim or not victim.family_id:
             return
 
-        # 2. 查询家庭组其他成员 (监护人)
-        family_members = await db.execute(
+        # 2. 查询家庭组所有管理员
+        all_admins_result = await db.execute(
             select(User).where(
                 User.family_id == victim.family_id,
-                User.is_admin == True,
                 User.user_id != current_user_id
             )
         )
-        guardians = family_members.scalars().all()
+        all_members = all_admins_result.scalars().all()
         
-        # 3. 构造给监护人的特定预警 Payload
+        # 3. 根据受害者角色智能选择通知对象
+        guardians = []
+        
+        if victim.is_primary_admin:
+            # 主管理员被检测 → 通知副管理员
+            guardians = [m for m in all_members if m.is_secondary_admin]
+            logger.info(f"主管理员 {current_user_id} 被检测，通知副管理员")
+            
+        elif victim.is_secondary_admin:
+            # 副管理员被检测 → 通知主管理员
+            guardians = [m for m in all_members if m.is_primary_admin]
+            if not guardians:
+                # 没有主管理员，通知其他副管理员
+                guardians = [m for m in all_members if m.is_secondary_admin]
+            logger.info(f"副管理员 {current_user_id} 被检测，通知其他管理员")
+            
+        else:
+            # 普通成员被检测 → 通知所有管理员
+            guardians = [m for m in all_members if m.is_any_admin]
+            logger.info(f"普通成员 {current_user_id} 被检测，通知所有管理员")
+        
+        if not guardians:
+            logger.warning(f"User {current_user_id} 的家庭组没有可通知的管理员")
+            return
+        
+        # 4. 构造给监护人的特定预警 Payload
         guardian_payload = {
             "type": "family_alert",
             "data": {
@@ -121,15 +150,17 @@ class NotificationService:
                 "message": f"您的家人【{victim.name or victim.username}】疑似正在遭遇诈骗。{original_payload['data']['message']}",
                 "risk_level": original_payload['data']['risk_level'],
                 "victim_id": current_user_id,
+                "victim_role": victim.admin_role or "none",
                 "timestamp": original_payload['data']['timestamp'],
-                "display_mode": "popup" # 监护人端强制弹窗
+                "display_mode": "popup", # 监护人端强制弹窗
+                "action": "vibrate"  # 前端可执行的动作：震动提醒
             }
         }
         
-        # 4. 逐一发布消息到 Redis 频道，确保每个监护人只能收到与自己相关的预警
+        # 5. 逐一发布消息到 Redis 频道
         for guardian in guardians:
             self._publish_to_redis(guardian.user_id, guardian_payload)
-            logger.info(f"Sent family alert for User {current_user_id} to Guardian {guardian.user_id}")
+            logger.info(f"Sent family alert for User {current_user_id} to Guardian {guardian.user_id} (role={guardian.admin_role})")
 
     async def _notify_guardian_by_email(
         self, 
@@ -139,7 +170,7 @@ class NotificationService:
         details: str = ""
     ):
         """
-        通过邮件向监护人发送预警
+        通过邮件向监护人发送预警（智能选择通知对象）
         """
         try:
             # 1. 查询受害者信息
@@ -149,22 +180,36 @@ class NotificationService:
             if not victim or not victim.family_id:
                 return
 
-            # 2. 查询家庭组管理员（is_admin=True 且同一家庭组）
-            guardian_result = await db.execute(
+            # 2. 查询家庭组所有成员
+            all_members_result = await db.execute(
                 select(User).where(
                     User.family_id == victim.family_id,
-                    User.is_admin == True,
                     User.user_id != current_user_id,
                     User.email.isnot(None)  # 必须有邮箱
                 )
             )
-            guardians = guardian_result.scalars().all()
+            all_members = all_members_result.scalars().all()
+            
+            # 3. 智能选择通知对象
+            guardians = []
+            
+            if victim.is_primary_admin:
+                # 主管理员被检测 → 通知副管理员
+                guardians = [m for m in all_members if m.is_secondary_admin]
+            elif victim.is_secondary_admin:
+                # 副管理员被检测 → 通知主管理员
+                guardians = [m for m in all_members if m.is_primary_admin]
+                if not guardians:
+                    guardians = [m for m in all_members if m.is_secondary_admin]
+            else:
+                # 普通成员被检测 → 通知所有管理员
+                guardians = [m for m in all_members if m.is_any_admin]
             
             if not guardians:
                 logger.info(f"User {current_user_id} 的家庭组没有配置邮箱的管理员")
                 return
             
-            # 3. 向每个管理员发送邮件
+            # 4. 向每个管理员发送邮件
             victim_name = victim.name or victim.username
             
             for guardian in guardians:
@@ -175,7 +220,7 @@ class NotificationService:
                         risk_level=risk_level,
                         details=details
                     )
-                    logger.info(f"Sent email alert for User {current_user_id} to Guardian {guardian.user_id}")
+                    logger.info(f"Sent email alert for User {current_user_id} to Guardian {guardian.user_id} (role={guardian.admin_role})")
                     
         except Exception as e:
             logger.error(f"Failed to send guardian email: {e}")
