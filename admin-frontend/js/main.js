@@ -5,6 +5,7 @@ import Blacklist from '../views/Blacklist.js';
 import TestConsole from '../views/TestConsole.js';
 import CaseLearning from '../views/CaseLearning.js';
 import UserManagement from '../views/UserManagement.js';
+import FamilyManagement from '../views/FamilyManagement.js';
 
 const routes = [
     { path: '/', component: Dashboard, name: '监控仪表盘' },
@@ -12,7 +13,8 @@ const routes = [
     { path: '/blacklist', component: Blacklist, name: '黑名单数据库' },
     { path: '/test', component: TestConsole, name: '功能测试台' },
     { path: '/case-learning', component: CaseLearning, name: '案例学习' },
-    { path: '/users', component: UserManagement, name: '用户管理' }
+    { path: '/users', component: UserManagement, name: '用户管理' },
+    { path: '/families', component: FamilyManagement, name: '家庭组管理' }
 ];
 
 const router = VueRouter.createRouter({

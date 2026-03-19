@@ -75,6 +75,13 @@ export default {
     getFamilyGroups: () => api.get('/admin/family-groups'),
     
     // =======================
+    // 管理端家庭组接口
+    // =======================
+    getFamilyGroups: () => api.get('/admin/family-groups'),
+    getFamilyGroupMembers: (familyId) => api.get(`/admin/family-groups/${familyId}/members`),
+    getFamilyStats: () => api.get('/admin/family-stats'),
+    
+    // =======================
     // 全过程记录接口（新增）
     // =======================
     getDetectionTimeline: (callId) => api.get(`/admin/call-records/${callId}/detection-timeline`),
@@ -82,7 +89,7 @@ export default {
     getEvidenceDetail: (logId) => api.get(`/admin/detection/${logId}/evidence`),
     
     // =======================
-    // 家庭组管理（新增）
+    // 家庭组管理（新权限模型）
     // =======================
     createFamilyGroup: (name) => api.post('/family/create', null, { params: { name } }),
     applyJoinFamily: (familyId) => api.post(`/family/${familyId}/apply`),
@@ -92,5 +99,6 @@ export default {
     setMemberAdminRole: (userId, role) => api.put(`/family/members/${userId}/admin-role`, null, { params: { role } }),
     removeFamilyMember: (userId) => api.delete(`/family/members/${userId}`),
     leaveFamilyGroup: () => api.post('/family/leave'),
-    getFamilyInfo: () => api.get('/family/info')
+    getFamilyInfo: () => api.get('/family/info'),
+    getMyAdminFamilies: () => api.get('/family/my-admin-families')
 };

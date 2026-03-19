@@ -22,15 +22,22 @@ def upgrade() -> None:
                   comment='管理员角色: None/secondary/primary')
     )
     
-    # 2. 迁移现有数据：is_admin=True的设为primary
+    # 2. 添加guardian_phone字段（备用监护人手机号）
+    op.add_column('users',
+        sa.Column('guardian_phone', sa.String(20), nullable=True,
+                  comment='备用监护人手机号')
+    )
+    
+    # 3. 迁移现有数据：is_admin=True的设为primary
     op.execute("""
         UPDATE users SET admin_role = 'primary' WHERE is_admin = 1
     """)
     
-    # 3. 添加索引
+    # 4. 添加索引
     op.create_index('ix_users_admin_role', 'users', ['admin_role'], unique=False)
 
 
 def downgrade() -> None:
     op.drop_index('ix_users_admin_role', table_name='users')
+    op.drop_column('users', 'guardian_phone')
     op.drop_column('users', 'admin_role')

@@ -4,13 +4,51 @@ from sqlalchemy import select, and_, delete, update
 
 from app.db.database import get_db
 from app.core.security import get_current_user_id
-from app.models.family_group import FamilyGroup, FamilyApplication, ApplicationStatus
-from app.models.user import User, AdminRole
+from app.models.family_group import FamilyGroup, FamilyApplication, FamilyAdmin, ApplicationStatus
+from app.models.user import User
 from app.schemas import ResponseModel
 from app.core.logger import get_logger
 
 logger = get_logger(__name__)
 router = APIRouter(prefix="/api/family", tags=["家庭组管理"])
+
+
+# =======================
+# 辅助函数
+# =======================
+async def get_user_family_role(db: AsyncSession, user_id: int, family_id: int):
+    """获取用户在某家庭组的管理员角色"""
+    result = await db.execute(
+        select(FamilyAdmin).where(
+            and_(FamilyAdmin.user_id == user_id, FamilyAdmin.family_id == family_id)
+        )
+    )
+    admin_record = result.scalar_one_or_none()
+    return admin_record.admin_role if admin_record else None
+
+
+async def is_family_admin(db: AsyncSession, user_id: int, family_id: int) -> bool:
+    """检查用户是否是某家庭组的管理员"""
+    result = await db.execute(
+        select(FamilyAdmin).where(
+            and_(FamilyAdmin.user_id == user_id, FamilyAdmin.family_id == family_id)
+        )
+    )
+    return result.scalar_one_or_none() is not None
+
+
+async def is_primary_admin(db: AsyncSession, user_id: int, family_id: int) -> bool:
+    """检查用户是否是某家庭组的主管理员"""
+    result = await db.execute(
+        select(FamilyAdmin).where(
+            and_(
+                FamilyAdmin.user_id == user_id,
+                FamilyAdmin.family_id == family_id,
+                FamilyAdmin.admin_role == "primary"
+            )
+        )
+    )
+    return result.scalar_one_or_none() is not None
 
 
 # =======================
@@ -22,12 +60,12 @@ async def create_family_group(
     current_user_id: int = Depends(get_current_user_id), 
     db: AsyncSession = Depends(get_db)
 ):
-    """创建家庭组：自动将创建者设为主管理员(primary)"""
-    # 1. 检查用户是否已在家庭组中
+    """创建家庭组：自动将创建者设为主管理员"""
+    # 1. 检查用户是否已有家庭组（普通成员只能有一个）
     result = await db.execute(select(User).where(User.user_id == current_user_id))
     user = result.scalar_one_or_none()
     if user and user.family_id:
-        return ResponseModel(code=400, message="您已在一个家庭组中，请先退出当前家庭组")
+        return ResponseModel(code=400, message="您已加入一个家庭组，请先退出")
     
     # 2. 创建群组 
     new_family = FamilyGroup(group_name=name, admin_id=current_user_id) 
@@ -35,14 +73,21 @@ async def create_family_group(
     await db.commit()
     await db.refresh(new_family)
 
-    # 3. 将创建者绑定到新组，设为主管理员
+    # 3. 将创建者绑定到新组，并在family_admins表设为主管理员
     if user:
         user.family_id = new_family.id
-        user.is_admin = True  # 兼容老字段
-        user.admin_role = AdminRole.PRIMARY.value
+        user.is_admin = True
+        
+        # 添加到family_admins表
+        admin_record = FamilyAdmin(
+            user_id=current_user_id,
+            family_id=new_family.id,
+            admin_role="primary"
+        )
+        db.add(admin_record)
         await db.commit()
 
-    logger.info(f"用户 {current_user_id} 创建家庭组 {new_family.id}，设为主管理员")
+    logger.info(f"用户 {current_user_id} 创建家庭组 {new_family.id}")
 
     return ResponseModel(
         code=200, 
@@ -66,11 +111,11 @@ async def apply_join_family(
     if not result.scalar_one_or_none():
         return ResponseModel(code=404, message="未找到该ID的家庭组")
 
-    # 2. 检查用户是否已在其他家庭组
+    # 2. 检查用户是否已有家庭组（普通成员只能有一个）
     user_result = await db.execute(select(User).where(User.user_id == current_user_id))
     user = user_result.scalar_one_or_none()
     if user and user.family_id:
-        return ResponseModel(code=400, message="您已在其他家庭组中，请先退出")
+        return ResponseModel(code=400, message="您已加入一个家庭组，请先退出")
 
     # 3. 防重复申请
     app_result = await db.execute(
@@ -101,32 +146,35 @@ async def get_applications(
     current_user_id: int = Depends(get_current_user_id), 
     db: AsyncSession = Depends(get_db)
 ):
-    """【管理员端】获取本群组的待审批列表（主/副管理员均可）"""
-    # 1. 判断是否是管理员
-    user_result = await db.execute(select(User).where(User.user_id == current_user_id))
-    user = user_result.scalar_one_or_none()
+    """【管理员端】获取待审批列表（用户是所有管理员的组）"""
+    # 1. 查询用户是管理员的所有家庭组
+    admin_families = await db.execute(
+        select(FamilyAdmin.family_id).where(FamilyAdmin.user_id == current_user_id)
+    )
+    family_ids = [row[0] for row in admin_families.all()]
     
-    if not user or not user.is_any_admin:
-        return ResponseModel(code=403, message="无权查看，您不是家庭组管理员")
-    
-    if not user.family_id:
-        return ResponseModel(code=400, message="您还未加入家庭组")
+    if not family_ids:
+        return ResponseModel(code=403, message="您不是任何家庭组的管理员")
 
-    # 2. 联表查询：找出申请人的基本信息
+    # 2. 查询这些家庭组的待审批申请
     apps_result = await db.execute(
-        select(FamilyApplication, User).join(User, FamilyApplication.user_id == User.user_id)
+        select(FamilyApplication, User, FamilyGroup)
+        .join(User, FamilyApplication.user_id == User.user_id)
+        .join(FamilyGroup, FamilyApplication.family_id == FamilyGroup.id)
         .where(
             and_(
-                FamilyApplication.family_id == user.family_id, 
+                FamilyApplication.family_id.in_(family_ids),
                 FamilyApplication.status == ApplicationStatus.PENDING
             )
         )
     )
     
     data = []
-    for app, applicant in apps_result.all():
+    for app, applicant, family in apps_result.all():
         data.append({
             "application_id": app.id,
+            "family_id": family.id,
+            "family_name": family.group_name,
             "user_id": applicant.user_id,
             "username": applicant.username,
             "phone": applicant.phone,
@@ -147,31 +195,33 @@ async def review_application(
     current_user_id: int = Depends(get_current_user_id), 
     db: AsyncSession = Depends(get_db)
 ):
-    """【管理员端】同意/拒绝成员加入（主/副管理员均可）"""
+    """【管理员端】同意/拒绝成员加入"""
     # 1. 找申请记录
-    app_result = await db.execute(select(FamilyApplication).where(FamilyApplication.id == app_id))
-    application = app_result.scalar_one_or_none()
-    if not application or application.status != ApplicationStatus.PENDING:
-        return ResponseModel(code=404, message="无效的申请或已处理")
+    app_result = await db.execute(
+        select(FamilyApplication, FamilyGroup)
+        .join(FamilyGroup, FamilyApplication.family_id == FamilyGroup.id)
+        .where(FamilyApplication.id == app_id)
+    )
+    app_data = app_result.first()
+    if not app_data:
+        return ResponseModel(code=404, message="申请不存在")
+    
+    application, family = app_data
+    if application.status != ApplicationStatus.PENDING:
+        return ResponseModel(code=400, message="该申请已处理")
 
-    # 2. 鉴权：确认操作者是管理员且属于同一家庭组
-    user_result = await db.execute(select(User).where(User.user_id == current_user_id))
-    current_user = user_result.scalar_one_or_none()
-    
-    if not current_user or not current_user.is_any_admin:
-        return ResponseModel(code=403, message="无权审批此申请")
-    
-    if current_user.family_id != application.family_id:
+    # 2. 鉴权：确认操作者是该家庭组的管理员
+    if not await is_family_admin(db, current_user_id, application.family_id):
         return ResponseModel(code=403, message="无权审批此申请")
 
     # 3. 执行审批
     if is_approve:
         application.status = ApplicationStatus.APPROVED
         # 将该成员的 family_id 更新
-        applicant_result = await db.execute(select(User).where(User.user_id == application.user_id))
-        applicant = applicant_result.scalar_one_or_none()
-        if applicant:
-            applicant.family_id = application.family_id
+        user_result = await db.execute(select(User).where(User.user_id == application.user_id))
+        user = user_result.scalar_one_or_none()
+        if user:
+            user.family_id = application.family_id
         msg = "已同意"
     else:
         application.status = ApplicationStatus.REJECTED
@@ -190,7 +240,7 @@ async def get_family_members(
     current_user_id: int = Depends(get_current_user_id),
     db: AsyncSession = Depends(get_db)
 ):
-    """获取家庭组成员列表（含管理员角色信息）"""
+    """获取用户所在家庭组的成员列表"""
     # 1. 查找当前用户
     user_result = await db.execute(select(User).where(User.user_id == current_user_id))
     current_user = user_result.scalar_one_or_none()
@@ -213,7 +263,13 @@ async def get_family_members(
     )
     members = members_result.scalars().all()
     
-    # 4. 组装返回数据
+    # 4. 查询该家庭组的所有管理员
+    admins_result = await db.execute(
+        select(FamilyAdmin).where(FamilyAdmin.family_id == current_user.family_id)
+    )
+    admin_map = {a.user_id: a.admin_role for a in admins_result.scalars().all()}
+    
+    # 5. 组装返回数据
     return ResponseModel(
         code=200,
         message="获取成员列表成功",
@@ -227,9 +283,8 @@ async def get_family_members(
                     "name": member.name,
                     "phone": member.phone,
                     "role_type": member.role_type,
-                    "admin_role": member.admin_role or "none",
-                    "is_primary_admin": member.is_primary_admin,
-                    "is_secondary_admin": member.is_secondary_admin,
+                    "admin_role": admin_map.get(member.user_id, "none"),
+                    "is_me": member.user_id == current_user_id
                 }
                 for member in members
             ]
@@ -252,36 +307,62 @@ async def set_member_admin_role(
     
     规则：
     - 只有主管理员可以设置其他成员的角色
-    - 主管理员可以将自己降级为普通成员（需先指定新的主管理员）
     - 一个家庭组只能有一个主管理员
     """
-    # 1. 验证当前用户是否为主管理员
+    # 1. 获取当前用户所在家庭组
     current_result = await db.execute(select(User).where(User.user_id == current_user_id))
     current_user = current_result.scalar_one_or_none()
     
-    if not current_user or not current_user.is_primary_admin:
+    if not current_user or not current_user.family_id:
+        return ResponseModel(code=400, message="您还未加入家庭组")
+    
+    family_id = current_user.family_id
+    
+    # 2. 验证当前用户是否为主管理员
+    if not await is_primary_admin(db, current_user_id, family_id):
         return ResponseModel(code=403, message="只有主管理员可以设置成员角色")
     
-    # 2. 验证目标用户是否在同一家庭组
+    # 3. 验证目标用户是否在同一家庭组
     target_result = await db.execute(select(User).where(User.user_id == user_id))
     target_user = target_result.scalar_one_or_none()
     
-    if not target_user or target_user.family_id != current_user.family_id:
+    if not target_user or target_user.family_id != family_id:
         return ResponseModel(code=404, message="该用户不在您的家庭组中")
     
-    # 3. 验证角色值
-    if role not in [AdminRole.NONE.value, AdminRole.SECONDARY.value, AdminRole.PRIMARY.value]:
+    # 4. 验证角色值
+    if role not in ["none", "secondary", "primary"]:
         return ResponseModel(code=400, message="无效的角色值，可选: none/secondary/primary")
     
-    # 4. 特殊处理：设置主管理员
-    if role == AdminRole.PRIMARY.value:
-        # 先将当前主管理员降级
-        current_user.admin_role = AdminRole.SECONDARY.value
-        current_user.is_admin = True  # 保持兼容
+    # 5. 查询现有的管理员记录
+    existing_result = await db.execute(
+        select(FamilyAdmin).where(
+            and_(FamilyAdmin.user_id == user_id, FamilyAdmin.family_id == family_id)
+        )
+    )
+    existing_record = existing_result.scalar_one_or_none()
+    
+    # 6. 处理角色变更
+    if role == "none":
+        # 取消管理员
+        if existing_record:
+            await db.delete(existing_record)
+            target_user.is_admin = False
+            await db.commit()
+        return ResponseModel(code=200, message=f"已取消 {target_user.username} 的管理员权限")
+    
+    elif role == "primary":
+        # 设置为主管理员：先将当前主管理员降级
+        current_primary = await db.execute(
+            select(FamilyAdmin).where(
+                and_(FamilyAdmin.family_id == family_id, FamilyAdmin.admin_role == "primary")
+            )
+        )
+        for record in current_primary.scalars().all():
+            record.admin_role = "secondary"
         
         # 更新家庭组的admin_id
         family_result = await db.execute(
-            select(FamilyGroup).where(FamilyGroup.id == current_user.family_id)
+            select(FamilyGroup).where(FamilyGroup.id == family_id)
         )
         family = family_result.scalar_one_or_none()
         if family:
@@ -289,18 +370,21 @@ async def set_member_admin_role(
         
         logger.info(f"主管理员转让: {current_user_id} -> {user_id}")
     
-    # 5. 更新目标用户角色
-    target_user.admin_role = role
-    target_user.is_admin = (role != AdminRole.NONE.value)  # 兼容老字段
+    # 7. 更新或创建管理员记录
+    if existing_record:
+        existing_record.admin_role = role
+    else:
+        new_admin = FamilyAdmin(
+            user_id=user_id,
+            family_id=family_id,
+            admin_role=role
+        )
+        db.add(new_admin)
+        target_user.is_admin = True
     
     await db.commit()
     
-    role_names = {
-        AdminRole.NONE.value: "普通成员",
-        AdminRole.SECONDARY.value: "副管理员",
-        AdminRole.PRIMARY.value: "主管理员"
-    }
-    
+    role_names = {"none": "普通成员", "secondary": "副管理员", "primary": "主管理员"}
     return ResponseModel(
         code=200, 
         message=f"已将 {target_user.username} 设置为{role_names.get(role, role)}"
@@ -316,33 +400,48 @@ async def remove_family_member(
     current_user_id: int = Depends(get_current_user_id),
     db: AsyncSession = Depends(get_db)
 ):
-    """【管理员】将成员移出家庭组（主/副管理员均可）"""
-    # 1. 验证当前用户是否为管理员
+    """【管理员】将成员移出家庭组"""
+    # 1. 获取当前用户所在家庭组
     current_result = await db.execute(select(User).where(User.user_id == current_user_id))
     current_user = current_result.scalar_one_or_none()
     
-    if not current_user or not current_user.is_any_admin:
+    if not current_user or not current_user.family_id:
+        return ResponseModel(code=400, message="您还未加入家庭组")
+    
+    family_id = current_user.family_id
+    
+    # 2. 验证当前用户是否为管理员
+    current_role = await get_user_family_role(db, current_user_id, family_id)
+    if not current_role:
         return ResponseModel(code=403, message="只有管理员可以移除成员")
     
-    # 2. 验证目标用户
+    # 3. 验证目标用户
     target_result = await db.execute(select(User).where(User.user_id == user_id))
     target_user = target_result.scalar_one_or_none()
     
-    if not target_user or target_user.family_id != current_user.family_id:
+    if not target_user or target_user.family_id != family_id:
         return ResponseModel(code=404, message="该用户不在您的家庭组中")
     
-    # 3. 不能移除主管理员
-    if target_user.is_primary_admin:
+    # 4. 不能移除主管理员
+    target_role = await get_user_family_role(db, user_id, family_id)
+    if target_role == "primary":
         return ResponseModel(code=400, message="不能移除主管理员")
     
-    # 4. 副管理员不能移除其他副管理员
-    if current_user.is_secondary_admin and target_user.is_secondary_admin:
+    # 5. 副管理员不能移除其他副管理员
+    if current_role == "secondary" and target_role == "secondary":
         return ResponseModel(code=403, message="副管理员不能移除其他副管理员")
     
-    # 5. 执行移除
+    # 6. 执行移除
     target_user.family_id = None
-    target_user.admin_role = None
     target_user.is_admin = False
+    
+    # 删除管理员记录（如果有）
+    if target_role:
+        await db.execute(
+            delete(FamilyAdmin).where(
+                and_(FamilyAdmin.user_id == user_id, FamilyAdmin.family_id == family_id)
+            )
+        )
     
     await db.commit()
     logger.info(f"管理员 {current_user_id} 移除成员 {user_id}")
@@ -370,9 +469,10 @@ async def leave_family_group(
         )
         
     target_family_id = current_user.family_id
+    user_role = await get_user_family_role(db, current_user_id, target_family_id)
 
     # 2. 判断身份并执行对应退出逻辑
-    if current_user.is_primary_admin:
+    if user_role == "primary":
         # ==========================================
         # 主管理员退出逻辑：检查是否有其他成员
         # ==========================================
@@ -388,36 +488,39 @@ async def leave_family_group(
             )
         
         # 只剩主管理员一人，解散家庭组
-        # 删除申请记录
         await db.execute(
             delete(FamilyApplication).where(FamilyApplication.family_id == target_family_id)
         )
-        
-        # 删除家庭组
+        await db.execute(
+            delete(FamilyAdmin).where(FamilyAdmin.family_id == target_family_id)
+        )
         await db.execute(
             delete(FamilyGroup).where(FamilyGroup.id == target_family_id)
         )
         
         current_user.family_id = None
-        current_user.admin_role = None
         current_user.is_admin = False
         
         msg = "家庭组已解散"
         
-    elif current_user.is_secondary_admin:
-        # ==========================================
-        # 副管理员退出：直接退出
-        # ==========================================
-        current_user.family_id = None
-        current_user.admin_role = None
-        current_user.is_admin = False
-        msg = "已退出家庭组"
-        
     else:
         # ==========================================
-        # 普通成员退出
+        # 普通成员或副管理员退出
         # ==========================================
         current_user.family_id = None
+        current_user.is_admin = False
+        
+        # 删除管理员记录（如果有）
+        if user_role:
+            await db.execute(
+                delete(FamilyAdmin).where(
+                    and_(
+                        FamilyAdmin.user_id == current_user_id,
+                        FamilyAdmin.family_id == target_family_id
+                    )
+                )
+            )
+        
         msg = "已退出家庭组"
     
     await db.commit()
@@ -464,8 +567,15 @@ async def get_family_info(
     members = count_result.scalars().all()
     
     # 5. 统计管理员数量
-    primary_count = sum(1 for m in members if m.is_primary_admin)
-    secondary_count = sum(1 for m in members if m.is_secondary_admin)
+    admins_result = await db.execute(
+        select(FamilyAdmin).where(FamilyAdmin.family_id == current_user.family_id)
+    )
+    admins = admins_result.scalars().all()
+    primary_count = sum(1 for a in admins if a.admin_role == "primary")
+    secondary_count = sum(1 for a in admins if a.admin_role == "secondary")
+    
+    # 6. 获取当前用户在该组的角色
+    my_role = await get_user_family_role(db, current_user_id, current_user.family_id)
     
     return ResponseModel(
         code=200,
@@ -474,7 +584,7 @@ async def get_family_info(
             "family_id": family.id,
             "group_name": family.group_name,
             "created_at": family.created_at.isoformat() if family.created_at else None,
-            "my_role": current_user.admin_role or "none",
+            "my_role": my_role or "member",
             "primary_admin": {
                 "user_id": primary_admin.user_id,
                 "username": primary_admin.username,
@@ -488,3 +598,37 @@ async def get_family_info(
             }
         }
     )
+
+
+# =======================
+# 10. 获取我管理的家庭组列表
+# =======================
+@router.get("/my-admin-families", response_model=ResponseModel)
+async def get_my_admin_families(
+    current_user_id: int = Depends(get_current_user_id),
+    db: AsyncSession = Depends(get_db)
+):
+    """获取当前用户作为管理员的所有家庭组"""
+    result = await db.execute(
+        select(FamilyAdmin, FamilyGroup)
+        .join(FamilyGroup, FamilyAdmin.family_id == FamilyGroup.id)
+        .where(FamilyAdmin.user_id == current_user_id)
+    )
+    
+    data = []
+    for admin_record, family in result.all():
+        # 统计成员数
+        member_count = await db.execute(
+            select(User).where(User.family_id == family.id)
+        )
+        count = len(member_count.scalars().all())
+        
+        data.append({
+            "family_id": family.id,
+            "group_name": family.group_name,
+            "my_role": admin_record.admin_role,
+            "member_count": count,
+            "created_at": family.created_at.isoformat() if family.created_at else None
+        })
+    
+    return ResponseModel(code=200, message="获取成功", data={"items": data})

@@ -1,8 +1,8 @@
 """
 数据模型模块
 """
-from .family_group import FamilyGroup, FamilyApplication
-from .user import User, AdminRole
+from .family_group import FamilyGroup, FamilyApplication, FamilyAdmin, ApplicationStatus
+from .user import User
 from .call_record import CallRecord, DetectionResult
 from .ai_detection_log import AIDetectionLog
 from .risk_rule import RiskRule
@@ -14,7 +14,6 @@ from .chat_message import ChatMessage
 
 __all__ = [
     "User",
-    "AdminRole",
     "CallRecord",
     "DetectionResult",
     "AIDetectionLog",
@@ -22,7 +21,9 @@ __all__ = [
     "NumberBlacklist",
     "MessageLog",
     "FamilyGroup",
+    "FamilyAdmin",
     "FamilyApplication",
+    "ApplicationStatus",
     "KnowledgeItem",
     "UserLearningRecord",
     "Admin",

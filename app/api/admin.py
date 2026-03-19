@@ -881,8 +881,8 @@ async def get_family_groups(
     limit: int = 100,
     db: AsyncSession = Depends(get_db)
 ):
-    """获取所有家庭组列表"""
-    from app.models.family_group import FamilyGroup
+    """获取所有家庭组列表（适配新权限模型）"""
+    from app.models.family_group import FamilyGroup, FamilyAdmin
     from app.models.user import User
     
     result = await db.execute(
@@ -893,7 +893,7 @@ async def get_family_groups(
     )
     groups = result.scalars().all()
     
-    # 查询每个家庭的成员数
+    # 查询每个家庭的详细信息
     group_list = []
     for g in groups:
         # 统计该家庭的成员数
@@ -902,15 +902,115 @@ async def get_family_groups(
         )
         member_count = member_result.scalar() or 0
         
+        # 查询主管理员信息
+        admin_result = await db.execute(
+            select(User).where(User.user_id == g.admin_id)
+        )
+        admin = admin_result.scalar_one_or_none()
+        
+        # 查询该家庭组的管理员统计
+        admins_result = await db.execute(
+            select(FamilyAdmin).where(FamilyAdmin.family_id == g.id)
+        )
+        admins = admins_result.scalars().all()
+        primary_count = sum(1 for a in admins if a.admin_role == "primary")
+        secondary_count = sum(1 for a in admins if a.admin_role == "secondary")
+        
         group_list.append({
             "id": g.id,
-            "name": g.group_name,
+            "group_name": g.group_name,
             "admin_id": g.admin_id,
-            "member_count": member_count,
+            "primary_admin": {
+                "user_id": admin.user_id,
+                "username": admin.username,
+                "phone": admin.phone
+            } if admin else None,
+            "statistics": {
+                "total_members": member_count,
+                "primary_admins": primary_count,
+                "secondary_admins": secondary_count
+            },
             "created_at": g.created_at.isoformat() if g.created_at else None
         })
     
-    return group_list
+    return {"items": group_list, "total": len(group_list)}
+
+
+@router.get("/family-groups/{family_id}/members", summary="获取家庭组成员列表")
+async def get_family_group_members(
+    family_id: int,
+    db: AsyncSession = Depends(get_db)
+):
+    """获取指定家庭组的成员列表（管理端）"""
+    from app.models.family_group import FamilyGroup, FamilyAdmin
+    from app.models.user import User
+    
+    # 检查家庭组是否存在
+    family_result = await db.execute(
+        select(FamilyGroup).where(FamilyGroup.id == family_id)
+    )
+    family = family_result.scalar_one_or_none()
+    if not family:
+        raise HTTPException(status_code=404, detail="家庭组不存在")
+    
+    # 查询成员
+    members_result = await db.execute(
+        select(User).where(User.family_id == family_id)
+    )
+    members = members_result.scalars().all()
+    
+    # 查询管理员角色
+    admins_result = await db.execute(
+        select(FamilyAdmin).where(FamilyAdmin.family_id == family_id)
+    )
+    admin_map = {a.user_id: a.admin_role for a in admins_result.scalars().all()}
+    
+    return {
+        "family_id": family_id,
+        "group_name": family.group_name,
+        "members": [
+            {
+                "user_id": m.user_id,
+                "username": m.username,
+                "name": m.name,
+                "phone": m.phone,
+                "email": m.email,
+                "role_type": m.role_type,
+                "admin_role": admin_map.get(m.user_id, "none"),
+                "is_active": m.is_active
+            }
+            for m in members
+        ]
+    }
+
+
+@router.get("/family-stats", summary="获取家庭组统计")
+async def get_family_stats(
+    db: AsyncSession = Depends(get_db)
+):
+    """获取家庭组统计数据"""
+    from app.models.family_group import FamilyGroup, FamilyAdmin
+    from app.models.user import User
+    
+    # 家庭组总数
+    families_result = await db.execute(select(func.count(FamilyGroup.id)))
+    total_families = families_result.scalar() or 0
+    
+    # 成员总数
+    members_result = await db.execute(
+        select(func.count(User.user_id)).where(User.family_id.isnot(None))
+    )
+    total_members = members_result.scalar() or 0
+    
+    # 管理员总数
+    admins_result = await db.execute(select(func.count(FamilyAdmin.id)))
+    total_admins = admins_result.scalar() or 0
+    
+    return {
+        "total_families": total_families,
+        "total_members": total_members,
+        "total_admins": total_admins
+    }
 
 
 # =======================
