@@ -3,6 +3,7 @@
 """
 from .family_group import FamilyGroup, FamilyApplication, FamilyAdmin, ApplicationStatus
 from .user import User
+from .user_memory import UserMemory, MemoryType
 from .call_record import CallRecord, DetectionResult
 from .ai_detection_log import AIDetectionLog
 from .risk_rule import RiskRule
@@ -14,6 +15,8 @@ from .chat_message import ChatMessage
 
 __all__ = [
     "User",
+    "UserMemory",
+    "MemoryType",
     "CallRecord",
     "DetectionResult",
     "AIDetectionLog",

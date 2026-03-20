@@ -1,7 +1,7 @@
 """
 用户模型
 """
-from sqlalchemy import Column, Integer, String, DateTime, Boolean, ForeignKey
+from sqlalchemy import Column, Integer, String, DateTime, Boolean, ForeignKey, Text
 from sqlalchemy.sql import func
 from sqlalchemy.orm import relationship
 from app.db.database import Base
@@ -24,11 +24,13 @@ class User(Base):
     marital_status = Column(String(20), nullable=True, comment="婚姻状况(单身/已婚/离异)")
     is_active = Column(Boolean, default=True, comment="账号是否激活")
     is_admin = Column(Boolean, default=False, comment="是否为某家庭组的管理员")
+    memory_summary = Column(Text, nullable=True, comment="长期记忆摘要（由系统自动生成）")
     created_at = Column(DateTime(timezone=True), server_default=func.now(), comment="创建时间")
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), comment="更新时间")
     
     # 关系
     admin_families = relationship("FamilyAdmin", back_populates="user", cascade="all, delete-orphan")
+    memories = relationship("UserMemory", back_populates="user", cascade="all, delete-orphan", order_by="UserMemory.importance.desc()")
     
     def __repr__(self):
         return f"<User(user_id={self.user_id}, username={self.username}, role={self.role_type}, phone={self.phone})>"

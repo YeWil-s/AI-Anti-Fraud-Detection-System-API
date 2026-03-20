@@ -1095,6 +1095,137 @@ def _get_risk_level(score: float) -> str:
         return "low"
 
 
+# =======================
+# 用户长期记忆管理接口
+# =======================
+
+@router.get("/users/{user_id}/memories", summary="获取用户长期记忆")
+async def get_user_memories(
+    user_id: int,
+    memory_type: Optional[str] = None,
+    min_importance: int = Query(1, ge=1, le=5),
+    limit: int = Query(20, le=100),
+    db: AsyncSession = Depends(get_db)
+):
+    """获取用户的长期记忆列表"""
+    from app.services.long_term_memory_service import long_term_memory_service
+    
+    memories = await long_term_memory_service.get_memories(
+        db, user_id, memory_type, min_importance, limit
+    )
+    
+    return {
+        "items": [
+            {
+                "memory_id": m.memory_id,
+                "memory_type": m.memory_type,
+                "content": m.content,
+                "importance": m.importance,
+                "source_call_id": m.source_call_id,
+                "created_at": m.created_at.isoformat() if m.created_at else None
+            }
+            for m in memories
+        ]
+    }
+
+
+@router.post("/users/{user_id}/memories", summary="添加用户长期记忆")
+async def add_user_memory(
+    user_id: int,
+    memory_type: str = Query(..., description="记忆类型: fraud_experience/alert_response/preference/risk_pattern"),
+    content: str = Query(..., description="记忆内容"),
+    importance: int = Query(3, ge=1, le=5, description="重要性 1-5"),
+    source_call_id: Optional[int] = None,
+    db: AsyncSession = Depends(get_db)
+):
+    """手动添加用户的长期记忆"""
+    from app.services.long_term_memory_service import long_term_memory_service
+    
+    # 检查用户是否存在
+    user_result = await db.execute(select(User).where(User.user_id == user_id))
+    if not user_result.scalar_one_or_none():
+        raise HTTPException(status_code=404, detail="用户不存在")
+    
+    memory = await long_term_memory_service.add_memory(
+        db, user_id, memory_type, content, importance, source_call_id
+    )
+    
+    if memory:
+        # 更新摘要
+        await long_term_memory_service.update_memory_summary(db, user_id)
+        return {"code": 200, "message": "记忆添加成功", "memory_id": memory.memory_id}
+    else:
+        return {"code": 200, "message": "相似记忆已存在，无需重复添加"}
+
+
+@router.delete("/memories/{memory_id}", summary="删除长期记忆")
+async def delete_memory(
+    memory_id: int,
+    db: AsyncSession = Depends(get_db)
+):
+    """删除指定的长期记忆"""
+    from app.models.user_memory import UserMemory
+    
+    result = await db.execute(select(UserMemory).where(UserMemory.memory_id == memory_id))
+    memory = result.scalar_one_or_none()
+    
+    if not memory:
+        raise HTTPException(status_code=404, detail="记忆不存在")
+    
+    user_id = memory.user_id
+    await db.delete(memory)
+    await db.commit()
+    
+    # 更新摘要
+    from app.services.long_term_memory_service import long_term_memory_service
+    await long_term_memory_service.update_memory_summary(db, user_id)
+    
+    return {"code": 200, "message": "记忆删除成功"}
+
+
+@router.get("/users/{user_id}/memory-summary", summary="获取用户记忆摘要")
+async def get_user_memory_summary(
+    user_id: int,
+    db: AsyncSession = Depends(get_db)
+):
+    """获取用户的记忆摘要（用于展示）"""
+    from app.services.long_term_memory_service import long_term_memory_service
+    
+    summary = await long_term_memory_service.get_memory_summary(db, user_id)
+    
+    # 同时获取统计信息
+    from app.models.user_memory import UserMemory
+    stats_result = await db.execute(
+        select(UserMemory.memory_type, func.count(UserMemory.memory_id))
+        .where(UserMemory.user_id == user_id)
+        .group_by(UserMemory.memory_type)
+    )
+    stats = {row[0]: row[1] for row in stats_result.all()}
+    
+    return {
+        "user_id": user_id,
+        "summary": summary,
+        "statistics": stats
+    }
+
+
+@router.post("/users/{user_id}/refresh-memory-summary", summary="刷新用户记忆摘要")
+async def refresh_memory_summary(
+    user_id: int,
+    db: AsyncSession = Depends(get_db)
+):
+    """手动刷新用户的记忆摘要"""
+    from app.services.long_term_memory_service import long_term_memory_service
+    
+    summary = await long_term_memory_service.update_memory_summary(db, user_id)
+    
+    return {
+        "code": 200,
+        "message": "记忆摘要已刷新",
+        "summary": summary
+    }
+
+
 @router.get("/call-records/{call_id}/chat-history", summary="获取对话历史（管理员）")
 async def admin_get_chat_history(
     call_id: int,

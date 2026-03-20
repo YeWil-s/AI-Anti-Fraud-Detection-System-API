@@ -15,6 +15,7 @@ from app.services.vector_db_service import vector_db
 from app.models.user import User
 from app.models.call_record import CallRecord
 from app.models.ai_detection_log import AIDetectionLog
+from app.services.long_term_memory_service import long_term_memory_service
 from langchain_core.messages import SystemMessage, HumanMessage
 
 logger = get_logger(__name__)
@@ -64,6 +65,9 @@ class LLMService:
 【近期对话上下文】（请结合这些历史记录来理解当前输入的真实意图）：
 {chat_history}
 
+【用户长期记忆（跨通话历史）】：
+{long_term_memory}
+
 【底层AI模型多模态特征分析结果】（极其重要！）：
 - 本地文本预检(Text-ONNX)置信度：{text_conf} （0~1.0，>0.85通常代表话术高度匹配已知模板）
 - 语音伪造(Voice Clone)置信度：{audio_conf} （0~1.0，>0.8通常代表极大可能是AI合成变声）
@@ -74,6 +78,7 @@ class LLMService:
 2. 剧本匹配与交叉验证：如果文本涉及要钱/转账，且【语音/视频伪造置信度】高，必须判定 is_fraud=True，risk_level="fake"，并在 match_script 中给出对应的剧本名称。
 3. 纠正误报：如果语音置信度较高，但结合上下文完全是正常业务（intent为常规沟通，如送件），请结合常识判定为 safe，纠正底层误报。
 4. 双重印证：如果【本地文本预检置信度】极高(>0.9)，即使音视频真实，也说明内容极具煽动性，请重点提取其危险意图并倾向判定为高风险。
+5. 历史记忆参考：如果用户有多次忽略告警的记录，应提高告警强度；如果用户曾遭遇相似诈骗，应提前预警。
 
 请综合推理，并严格按照 JSON 格式输出最终裁定结果。
 {format_instructions}
@@ -117,21 +122,35 @@ class LLMService:
         video_conf: str = "0.0", text_conf: float = 0.0, 
         db = None, user_id: int = None) -> dict:
         """
-        多模态融合风控分析
+        多模态融合风控分析（增强版：支持长期记忆）
         
         Args:
-            db: 数据库会话（用于获取推荐案例）
-            user_id: 用户ID（用于个性化推荐）
+            user_input: 用户输入文本
+            chat_history: 对话历史
+            user_profile: 用户画像
+            call_type: 通话类型
+            audio_conf: 音频置信度
+            video_conf: 视频置信度
+            text_conf: 文本置信度
+            db: 数据库会话
+            user_id: 用户ID（用于获取长期记忆）
         """
         try:
-            # 1. 获取知识库上下文
+            # 1. 获取知识库上下文 (RAG)
             context = await asyncio.to_thread(vector_db.get_context_for_llm, query=user_input, n_results=2)
             
-            # 2. 如果提供了db和user_id，获取实时推荐案例
+            # 2. 获取长期记忆
+            long_term_memory = ""
+            if db and user_id:
+                try:
+                    long_term_memory = await long_term_memory_service.get_context_for_prompt(db, user_id)
+                except Exception as mem_e:
+                    logger.warning(f"获取长期记忆失败: {mem_e}")
+            
+            # 3. 如果提供了db和user_id，获取实时推荐案例
             recommendations = None
             if db and user_id:
                 try:
-                    # 延迟导入避免循环依赖
                     from app.services.education_service import EducationService
                     edu_service = EducationService(db)
                     recommendations = await edu_service.recommend_by_conversation(
@@ -139,7 +158,6 @@ class LLMService:
                         conversation_text=user_input,
                         top_k=2
                     )
-                    # 将推荐案例追加到上下文
                     if recommendations.get("cases"):
                         rec_context = "\n\n【系统推荐的相似案例】:\n"
                         for i, case in enumerate(recommendations["cases"][:2], 1):
@@ -157,6 +175,7 @@ class LLMService:
                 "call_type": call_type,
                 "context": context,
                 "chat_history": chat_history,
+                "long_term_memory": long_term_memory or "该用户暂无历史记忆。",
                 "user_input": user_input,
                 "text_conf": f"{text_conf:.4f}",
                 "audio_conf": f"{audio_conf:.4f}",
@@ -164,13 +183,21 @@ class LLMService:
                 "format_instructions": self.output_parser.get_format_instructions()
             })
             
-            # 3. 将推荐信息添加到响应中
+            # 4. 将推荐信息添加到响应中
             if recommendations:
                 response["recommendations"] = {
                     "cases": recommendations.get("cases", []),
                     "slogans": recommendations.get("slogans", []),
                     "alert_message": recommendations.get("alert_message", "")
                 }
+            
+            # 5. 提取并保存长期记忆
+            if db and user_id:
+                try:
+                    # 这里需要call_id，但当前方法没有传入，需要上层调用时处理
+                    pass
+                except Exception as save_e:
+                    logger.warning(f"保存长期记忆失败: {save_e}")
             
             logger.info(f"多模态决策完成: 诈骗={response['is_fraud']} | 等级={response['risk_level']} | T_conf={text_conf:.2f} | A_conf={audio_conf:.2f} | V_conf={video_conf}")
             return response
