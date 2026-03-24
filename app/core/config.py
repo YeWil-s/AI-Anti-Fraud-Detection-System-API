@@ -49,12 +49,32 @@ class Settings(BaseSettings):
     CELERY_BROKER_URL: str = "redis://localhost:6379/1"  
     CELERY_RESULT_BACKEND: str = "redis://localhost:6379/2"  
     
-    # AI模型路径
-    VOICE_MODEL_PATH: str = "./models/voice_detection.onnx"
+    # AI模型路径 - 音频检测
+    VOICE_MODEL_PATH: str = "./models/voice_detection.onnx"  # 旧版ONNX模型（备用）
+    AASIST_MODEL_PATH: str = "./models/audio_anti_spoof/best_model.pth"  # 微调后的AASIST模型
+    AASIST_CODE_PATH: str = "./models/aasist"  # AASIST源码路径
+    
+    # AI模型路径 - 视频检测
     VIDEO_MODEL_PATH: str = "./models/video_detection.onnx"
-    TEXT_MODEL_PATH: str = "./models/text_fraud_model.onnx"
+    
+    # AI模型路径 - 文本检测
+    TEXT_MODEL_PATH: str = "./models/text_fraud_model.onnx"  # 旧版ONNX模型（备用）
     TEXT_VOCAB_PATH: str = "./models"
+    BERT_FINETUNED_PATH: str = "./models/bert_finetuned"  # 微调后的BERT模型
+    BERT_BASE_PATH: str = "./models/damo/nlp_bert_backbone_base_std"  # 基础BERT backbone
+    
+    # 数据收集开关
     COLLECT_TRAINING_DATA: bool = True
+    
+    # AASIST 模型配置（与训练时保持一致）
+    AASIST_CONFIG: dict = {
+        "filts": [70, [1, 32], [32, 32], [32, 64], [64, 64]],  # 第一个元素是初始通道数
+        "gat_dims": [64, 32],
+        "pool_ratios": [0.5, 0.7, 0.5],
+        "temperatures": [2.0, 2.0, 100.0],
+        "first_conv": 128,  # 与AASIST.conf保持一致
+        "nb_samp": 64600,   # 音频采样点数（约4秒@16kHz）
+    }
 
     # 视频预处理标准
     VIDEO_INPUT_SIZE: tuple = (224, 224) 
@@ -62,7 +82,7 @@ class Settings(BaseSettings):
     VIDEO_NORM_STD: list = [0.229, 0.224, 0.225]
 
     # AI 检测阈值配置
-    VOICE_DETECTION_THRESHOLD: float = 0.80
+    VOICE_DETECTION_THRESHOLD: float = 0.75
     VIDEO_DETECTION_THRESHOLD: float = 0.75   
     TEXT_DETECTION_THRESHOLD: float = 0.80   
     

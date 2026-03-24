@@ -21,6 +21,7 @@ from sqlalchemy import select
 from app.models.call_record import CallRecord, DetectionResult, CallPlatform
 
 from app.services.memory_service import memory_service
+from app.services.long_term_memory_service import long_term_memory_service
 from app.services.llm_service import llm_service
 from app.models.user import User
 from app.tasks.celery_app import celery_app
@@ -242,7 +243,7 @@ def detect_audio_task(self, audio_base64: str, user_id: int, call_id: int) -> Di
                     overall_score=confidence * 100,
                     evidence_snapshot=evidence_url,
                     time_offset=time_offset,
-                    model_version="v1.0"
+                    model_version=result.get('model_version', 'unknown')
                 )
                 db.add(ai_log)
                 await db.commit()
@@ -361,7 +362,7 @@ def detect_video_task(self, frame_data: list, user_id: int, call_id: int) -> Dic
                         call_id=call_id, video_confidence=raw_conf,
                         overall_score=raw_conf * 100, time_offset=time_offset,
                         evidence_snapshot=evidence_url,
-                        model_version=raw_result.get("model_version", "v1.0")
+                        model_version=raw_result.get("model_version", "unknown")
                     )
                     db.add(ai_log)
                     await db.commit()
@@ -527,7 +528,7 @@ def detect_text_task(self, text: str, user_id: int, call_id: int) -> Dict:
                     match_script=llm_result.get('match_script', None),  # 匹配的剧本
                     intent=llm_result.get('intent', None),              # 识别的意图
                     time_offset=time_offset,
-                    model_version="fusion-mdp-v1"
+                    model_version=f"fusion-mdp-v1-{text_result.get('model_type', 'unknown')}"
                 )
                 db.add(ai_log)
                 await db.commit()
@@ -833,6 +834,26 @@ def generate_post_call_summary_task(call_id: int, user_id: int):
 
                     record.detected_result = record_verdict
                     await db.commit()
+                    
+                    # 提取并保存长期记忆
+                    if record.detected_result in [DetectionResult.FAKE, DetectionResult.SUSPICIOUS]:
+                        try:
+                            detection_result = {
+                                "is_fraud": record.detected_result == DetectionResult.FAKE,
+                                "risk_level": final_risk,
+                                "fraud_type": getattr(record, 'fraud_type', '未知类型'),
+                                "match_script": getattr(record, 'match_script', ''),
+                                "intent": ""
+                            }
+                            await long_term_memory_service.extract_and_save_memories(
+                                db=db,
+                                user_id=user_id,
+                                call_id=call_id,
+                                detection_result=detection_result
+                            )
+                            logger.info(f"已保存用户 {user_id} 的长期记忆")
+                        except Exception as mem_e:
+                            logger.error(f"保存长期记忆失败: {mem_e}")
             return {"status": "success"}
         except Exception as e:
             return {"status": "error", "message": str(e)}

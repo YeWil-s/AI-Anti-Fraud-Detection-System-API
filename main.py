@@ -20,11 +20,33 @@ class MockTelemetry:
     def __call__(self, *args, **kwargs):
         return self
     def capture(self, *args, **kwargs):
-        pass
+        # ChromaDB 可能以多种方式调用 capture，需要兼容所有情况
+        return self
+    def identify(self, *args, **kwargs):
+        return self
+    def alias(self, *args, **kwargs):
+        return self
+    def group(self, *args, **kwargs):
+        return self
 
-# 只Mock最顶层的posthog模块
-sys.modules['posthog'] = MagicMock()
+# 创建完整的 Mock posthog 模块
+mock_posthog = MagicMock()
+mock_posthog.capture = MockTelemetry().capture
+mock_posthog.identify = MockTelemetry().identify
+mock_posthog.alias = MockTelemetry().alias
+mock_posthog.group = MockTelemetry().group
+
+# Mock posthog 相关模块
+sys.modules['posthog'] = mock_posthog
 sys.modules['chromadb.telemetry.posthog'] = MagicMock()
+
+# 同时 Mock chromadb 的 telemetry 相关模块
+try:
+    import chromadb
+    if hasattr(chromadb, 'telemetry'):
+        sys.modules['chromadb.telemetry'] = MagicMock()
+except ImportError:
+    pass
 import asyncio
 import json
 import uuid

@@ -632,3 +632,200 @@ async def get_my_admin_families(
         })
     
     return ResponseModel(code=200, message="获取成功", data={"items": data})
+
+
+# =======================
+# 11. 一键通报：用户主动向监护人发送求助
+# =======================
+@router.post("/sos", response_model=ResponseModel)
+async def send_sos_alert(
+    call_id: int = Query(..., description="当前通话ID"),
+    message: str = Query(default="我正在遭遇可疑通话，请立即联系我！", description="求助信息"),
+    current_user_id: int = Depends(get_current_user_id),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    一键通报功能：用户主动向家庭组监护人发送求助信号
+    
+    场景：用户察觉到异常但系统尚未告警，或需要监护人立即介入时使用
+    """
+    import redis
+    import json
+    from datetime import datetime
+    from app.core.config import settings
+    
+    # 1. 获取用户信息
+    result = await db.execute(select(User).where(User.user_id == current_user_id))
+    user = result.scalar_one_or_none()
+    
+    if not user:
+        raise HTTPException(status_code=404, detail="用户不存在")
+    
+    if not user.family_id:
+        return ResponseModel(code=400, message="您未加入任何家庭组，无法使用此功能")
+    
+    # 2. 查询家庭组所有管理员
+    admins_result = await db.execute(
+        select(FamilyAdmin, User)
+        .join(User, FamilyAdmin.user_id == User.user_id)
+        .where(FamilyAdmin.family_id == user.family_id)
+    )
+    admins = admins_result.all()
+    
+    if not admins:
+        return ResponseModel(code=400, message="您的家庭组没有监护人，无法发送求助")
+    
+    # 3. 构造求助消息
+    sos_payload = {
+        "type": "sos_alert",
+        "data": {
+            "title": "紧急求助",
+            "message": f"您的家人【{user.name or user.username}】正在请求帮助！{message}",
+            "victim_id": current_user_id,
+            "victim_name": user.name or user.username,
+            "victim_phone": user.phone,
+            "call_id": call_id,
+            "family_id": user.family_id,
+            "timestamp": datetime.now().isoformat(),
+            "display_mode": "popup",
+            "action": "vibrate",  # 前端执行震动
+            "urgency": "high"
+        }
+    }
+    
+    # 4. 通过WebSocket推送给所有监护人
+    redis_client = redis.Redis.from_url(settings.REDIS_URL, decode_responses=True)
+    notified_count = 0
+    
+    for admin_record, admin_user in admins:
+        try:
+            message_data = {
+                "user_id": admin_user.user_id,
+                "payload": sos_payload
+            }
+            redis_client.publish("fraud_alerts", json.dumps(message_data))
+            notified_count += 1
+            logger.info(f"SOS sent to Admin {admin_user.user_id} (role={admin_record.admin_role})")
+        except Exception as e:
+            logger.error(f"Failed to send SOS to Admin {admin_user.user_id}: {e}")
+    
+    return ResponseModel(
+        code=200, 
+        message=f"求助信号已发送给 {notified_count} 位监护人",
+        data={
+            "notified_count": notified_count,
+            "call_id": call_id,
+            "timestamp": datetime.now().isoformat()
+        }
+    )
+
+
+# =======================
+# 12. 远程干预：监护人远程控制被监护人通话
+# =======================
+@router.post("/remote-intervene", response_model=ResponseModel)
+async def remote_intervene(
+    target_user_id: int = Query(..., description="被干预的用户ID"),
+    action: str = Query(..., description="干预动作: block_call(强制挂断) / warn(发送警告) / check_status(检查状态)"),
+    message: str = Query(default="", description="附加消息"),
+    current_user_id: int = Depends(get_current_user_id),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    远程干预功能：监护人远程控制被监护人的通话
+    
+    支持的动作：
+    - block_call: 强制挂断当前通话
+    - warn: 向被监护人发送警告消息
+    - check_status: 检查被监护人当前状态
+    """
+    import redis
+    import json
+    from datetime import datetime
+    from app.core.config import settings
+    
+    # 1. 验证操作者是管理员
+    admin_result = await db.execute(select(User).where(User.user_id == current_user_id))
+    admin_user = admin_result.scalar_one_or_none()
+    
+    if not admin_user:
+        raise HTTPException(status_code=404, detail="用户不存在")
+    
+    # 2. 验证目标用户与操作者在同一家庭组
+    target_result = await db.execute(select(User).where(User.user_id == target_user_id))
+    target_user = target_result.scalar_one_or_none()
+    
+    if not target_user:
+        raise HTTPException(status_code=404, detail="目标用户不存在")
+    
+    # 3. 权限检查：操作者必须是目标用户所在家庭组的管理员
+    if not admin_user.family_id or admin_user.family_id != target_user.family_id:
+        raise HTTPException(status_code=403, detail="您无权干预该用户")
+    
+    admin_role_result = await db.execute(
+        select(FamilyAdmin).where(
+            and_(FamilyAdmin.user_id == current_user_id, FamilyAdmin.family_id == admin_user.family_id)
+        )
+    )
+    admin_role = admin_role_result.scalar_one_or_none()
+    
+    if not admin_role:
+        raise HTTPException(status_code=403, detail="您不是该家庭组的管理员")
+    
+    # 4. 构造干预指令
+    control_payload = {
+        "type": "remote_control",
+        "data": {
+            "action": action,
+            "from_admin_id": current_user_id,
+            "from_admin_name": admin_user.name or admin_user.username,
+            "target_user_id": target_user_id,
+            "message": message,
+            "timestamp": datetime.now().isoformat()
+        }
+    }
+    
+    # 5. 根据动作类型设置具体指令
+    if action == "block_call":
+        control_payload["data"]["control"] = {
+            "block_call": True,
+            "warning_mode": "fullscreen",
+            "ui_message": f"监护人 {admin_user.name or admin_user.username} 已为您强制挂断此通话"
+        }
+    elif action == "warn":
+        control_payload["data"]["control"] = {
+            "block_call": False,
+            "warning_mode": "popup",
+            "ui_message": message or f"监护人 {admin_user.name or admin_user.username} 提醒您注意通话安全"
+        }
+    elif action == "check_status":
+        control_payload["data"]["control"] = {
+            "request_status": True
+        }
+    else:
+        return ResponseModel(code=400, message=f"不支持的操作类型: {action}")
+    
+    # 6. 发送指令到目标用户
+    redis_client = redis.Redis.from_url(settings.REDIS_URL, decode_responses=True)
+    
+    try:
+        message_data = {
+            "user_id": target_user_id,
+            "payload": control_payload
+        }
+        redis_client.publish("fraud_alerts", json.dumps(message_data))
+        logger.info(f"Remote control sent: Admin {current_user_id} -> User {target_user_id}, action={action}")
+    except Exception as e:
+        logger.error(f"Failed to send remote control: {e}")
+        return ResponseModel(code=500, message=f"指令发送失败: {str(e)}")
+    
+    return ResponseModel(
+        code=200, 
+        message=f"干预指令已发送给 {target_user.name or target_user.username}",
+        data={
+            "action": action,
+            "target_user_id": target_user_id,
+            "target_user_name": target_user.name or target_user.username,
+            "timestamp": datetime.now().isoformat()
+        }
+    )
