@@ -1,6 +1,43 @@
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, List
 from datetime import datetime
+
+
+# --- 案例上传模型 ---
+class CaseUploadRequest(BaseModel):
+    """案例上传请求"""
+    modality: str  # text/audio/video/image
+    fraud_type: str  # 诈骗类型
+    risk_level: str  # 高危/中危/低危
+    content: str  # 案例内容
+    source: Optional[str] = None  # 来源
+    tags: Optional[List[str]] = None  # 标签列表
+    uploader: Optional[str] = None  # 上传者
+
+
+# --- 仪表盘统计模型 ---
+class DashboardStats(BaseModel):
+    """仪表盘统计数据"""
+    total_users: int
+    total_calls: int
+    fraud_blocked: int
+    blacklist_count: int
+    active_rules: int
+    new_users_today: int
+    detections_today: int
+    blocked_today: int
+    avg_risk_score: float
+    system_health: str
+    detection_rate: float
+
+
+class TrendData(BaseModel):
+    """趋势数据"""
+    date: str
+    detections: int
+    blocked: int
+    new_users: int
+
 
 # --- 风险规则 (Risk Rule) 模型 ---
 class RiskRuleBase(BaseModel):

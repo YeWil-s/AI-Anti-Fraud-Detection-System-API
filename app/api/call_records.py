@@ -1,20 +1,28 @@
 """
 通话记录管理API路由 - 数据隔离
 """
-from fastapi import APIRouter, Depends, HTTPException, status, Query
+from fastapi import APIRouter, Depends, HTTPException, status, Query,BackgroundTasks
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, and_, func
 from typing import Optional
 from datetime import datetime  
-
-from app.db.database import get_db
+from pydantic import BaseModel
+from app.db.database import get_db, AsyncSessionLocal
 from app.core.security import get_current_user_id
-
+from app.models.message_log import MessageLog
+from app.tasks.celery_app import celery_app
 from app.models.call_record import CallRecord, DetectionResult, CallPlatform
 from app.models.ai_detection_log import AIDetectionLog
+from app.models.chat_message import ChatMessage
 from app.models.user import User
 from app.schemas import ResponseModel
 
+from app.services.memory_service import memory_service
+from app.services.llm_service import llm_service
+from app.services.risk_fusion_engine import fusion_engine_v2
+from app.core.logger import get_logger
+
+logger = get_logger(__name__)
 router = APIRouter(prefix="/api/call-records", tags=["通话记录"])
 
 
@@ -59,6 +67,8 @@ async def get_my_call_records(
                     "duration": r.duration,
                     "detected_result": r.detected_result.value if r.detected_result else None,
                     "audio_url": r.audio_url,
+                    "analysis": r.analysis, 
+                    "advice": r.advice,
                     "created_at": r.created_at.isoformat() if r.created_at else None
                 }
                 for r in records
@@ -142,6 +152,8 @@ async def get_call_record_detail(
                 "duration": record.duration,
                 "detected_result": record.detected_result.value,
                 "audio_url": record.audio_url,
+                "analysis": record.analysis,  
+                "advice": record.advice,
                 "created_at": record.created_at.isoformat()
             },
             # 详情页通常需要更详细的AI数据
@@ -211,6 +223,8 @@ async def get_family_call_records(
                     "start_time": r.start_time.isoformat() if r.start_time else None,
                     "duration": r.duration,
                     "detected_result": r.detected_result.value if r.detected_result else None,
+                    "analysis": r.analysis, 
+                    "advice": r.advice,
                     "created_at": r.created_at.isoformat() if r.created_at else None
                 }
                 for r in records
@@ -260,4 +274,464 @@ async def delete_call_record(
         code=200,
         message="删除成功",
         data={"call_id": call_id}
+    )
+
+# 定义接收前端请求的数据结构
+class CallRecordEndRequest(BaseModel):
+    audio_url: Optional[str] = None
+    video_url: Optional[str] = None
+    cover_image: Optional[str] = None
+
+@router.post("/{call_id}/end", response_model=ResponseModel)
+async def end_call_record(
+    call_id: int,
+    payload: CallRecordEndRequest,
+    current_user_id: int = Depends(get_current_user_id),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    结束通话监测，更新最终音视频文件URL，并下发AI全局总结任务给Celery
+    """
+    # 1. 验证所有权
+    result = await db.execute(
+        select(CallRecord).where(
+            and_(
+                CallRecord.call_id == call_id,
+                CallRecord.user_id == current_user_id
+            )
+        )
+    )
+    record = result.scalar_one_or_none()
+    
+    if not record:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, 
+            detail="通话记录不存在或无权限"
+        )
+    
+    # 2. 更新结束时间和通话时长
+    record.end_time = datetime.now()
+    if record.start_time:
+        record.duration = int((record.end_time - record.start_time).total_seconds())
+        
+    # 3. 更新完整的音视频文件和封面 URL
+    if payload.audio_url:
+        record.audio_url = payload.audio_url
+    if payload.video_url:
+        record.video_url = payload.video_url
+    if payload.cover_image:
+        record.cover_image = payload.cover_image
+        
+    await db.commit()
+    
+    # ==========================================
+    # [核心修改] 不再由 FastAPI 查内存，直接交给 Celery 决策
+    # ==========================================
+    celery_app.send_task("generate_post_call_summary", args=[call_id, current_user_id])
+    
+    # 持久化Redis中的对话历史到数据库
+    await _persist_chat_history(db, call_id)
+    
+    # 清理风险融合引擎的时序缓存
+    fusion_engine_v2.clear_temporal_cache(str(call_id))
+    
+    return ResponseModel(
+        code=200, 
+        message="通话记录归档成功，已交由异步引擎生成AI全局总结", 
+        data={"duration": record.duration}
+    )
+
+
+async def _persist_chat_history(db: AsyncSession, call_id: int):
+    """将Redis中的对话历史持久化到数据库"""
+    try:
+        # 从Redis获取对话历史
+        chat_history = await memory_service.get_context(call_id)
+        
+        if not chat_history or chat_history == "暂无历史上下文。":
+            logger.info(f"通话 {call_id} 没有对话历史需要持久化")
+            return
+        
+        # 检查数据库中是否已有记录
+        existing_result = await db.execute(
+            select(ChatMessage).where(ChatMessage.call_id == call_id)
+        )
+        if existing_result.scalars().first():
+            logger.info(f"通话 {call_id} 的对话历史已存在，跳过持久化")
+            return
+        
+        # 解析并保存对话
+        messages = []
+        for line in chat_history.split('\n'):
+            if line.strip() and '. ' in line:
+                parts = line.split('. ', 1)
+                if len(parts) == 2:
+                    seq_str, content = parts
+                    try:
+                        seq = int(seq_str)
+                        msg = ChatMessage(
+                            call_id=call_id,
+                            sequence=seq,
+                            speaker="other",  # Redis中不区分说话人
+                            content=content[:1000] if len(content) > 1000 else content
+                        )
+                        messages.append(msg)
+                    except ValueError:
+                        continue
+        
+        if messages:
+            for msg in messages:
+                db.add(msg)
+            await db.commit()
+            logger.info(f"通话 {call_id} 的对话历史已持久化，共 {len(messages)} 条消息")
+        
+    except Exception as e:
+        logger.error(f"持久化对话历史失败 call_id={call_id}: {e}")
+        await db.rollback()
+
+@router.get("/{call_id}/audit-logs", response_model=ResponseModel)
+async def get_call_audit_logs(
+    call_id: int,
+    current_user_id: int = Depends(get_current_user_id),
+    db: AsyncSession = Depends(get_db)
+):
+    """获取指定通话的详细审计日志（时间轴）"""
+    # 1. 查询通话记录及其归属
+    result = await db.execute(select(CallRecord).where(CallRecord.call_id == call_id))
+    record = result.scalar_one_or_none()
+    if not record:
+        raise HTTPException(status_code=404, detail="通话记录不存在")
+
+    # 2. 权限校验：本人或其家庭组管理员可看
+    user_result = await db.execute(select(User).where(User.user_id == current_user_id))
+    current_user = user_result.scalar_one_or_none()
+
+    if record.user_id != current_user_id:
+        owner_result = await db.execute(select(User).where(User.user_id == record.user_id))
+        owner = owner_result.scalar_one_or_none()
+        if not owner or owner.family_id != current_user.family_id or not current_user.is_admin:
+            raise HTTPException(status_code=403, detail="无权查看该记录的审计日志")
+
+    # 3. 获取底层 AI 检测日志
+    ai_logs_result = await db.execute(
+        select(AIDetectionLog).where(AIDetectionLog.call_id == call_id).order_by(AIDetectionLog.time_offset.asc())
+    )
+    ai_logs = ai_logs_result.scalars().all()
+
+    # 4. 获取告警消息日志
+    msg_logs_result = await db.execute(
+        select(MessageLog).where(MessageLog.call_id == call_id).order_by(MessageLog.created_at.asc())
+    )
+    msg_logs = msg_logs_result.scalars().all()
+
+    return ResponseModel(
+        code=200,
+        message="获取审计日志成功",
+        data={
+            "ai_events": [{
+                "time_offset": log.time_offset,
+                "overall_score": log.overall_score,
+                "voice_conf": log.voice_confidence,
+                "video_conf": log.video_confidence,
+                "text_conf": log.text_confidence,
+                "evidence_url": log.evidence_snapshot,
+                "text_content": log.detected_keywords,
+            } for log in ai_logs],
+            "alert_events": [{
+                "created_at": log.created_at.isoformat() if log.created_at else None,
+                "msg_type": log.msg_type,
+                "risk_level": log.risk_level,
+                "title": log.title,
+                "content": log.content
+            } for log in msg_logs]
+        }
+    )
+
+@router.post("/{call_id}/report-to-admin", response_model=ResponseModel)
+async def report_call_to_admin(
+    call_id: int,
+    current_user_id: int = Depends(get_current_user_id),
+    db: AsyncSession = Depends(get_db)
+):
+    """家庭组长审查后，提交给系统管理员喂给智能体学习"""
+    # 1. 权限校验
+    result = await db.execute(select(CallRecord).where(CallRecord.call_id == call_id))
+    record = result.scalar_one_or_none()
+    if not record:
+        raise HTTPException(status_code=404, detail="通话记录不存在")
+
+    user_result = await db.execute(select(User).where(User.user_id == current_user_id))
+    current_user = user_result.scalar_one_or_none()
+
+    # 必须是管理员，且这条记录是自己家人的
+    if not current_user.is_admin:
+        raise HTTPException(status_code=403, detail="仅家庭组管理员可提交审查")
+
+    owner_result = await db.execute(select(User).where(User.user_id == record.user_id))
+    owner = owner_result.scalar_one_or_none()
+    if not owner or owner.family_id != current_user.family_id:
+        raise HTTPException(status_code=403, detail="只能提交家庭组成员的记录")
+
+    # 2. 将检测结果标记为 FAKE (欺诈)，以便 admin.py 中的 get_fraud_cases 接口能捕获到
+    record.detected_result = DetectionResult.FAKE
+    await db.commit()
+
+    return ResponseModel(code=200, message="已成功提交至系统防诈特征库待审核队列")
+
+
+@router.get("/{call_id}/chat-history", response_model=ResponseModel)
+async def get_call_chat_history(
+    call_id: int,
+    current_user_id: int = Depends(get_current_user_id),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    获取通话的文本对话历史记录
+    
+    从数据库中获取持久化的对话记录，包含用户和对方的文本内容
+    """
+    # 1. 查询通话记录并校验权限
+    result = await db.execute(select(CallRecord).where(CallRecord.call_id == call_id))
+    record = result.scalar_one_or_none()
+    if not record:
+        raise HTTPException(status_code=404, detail="通话记录不存在")
+    
+    # 权限校验：本人或家庭组管理员
+    if record.user_id != current_user_id:
+        user_result = await db.execute(select(User).where(User.user_id == current_user_id))
+        current_user = user_result.scalar_one_or_none()
+        owner_result = await db.execute(select(User).where(User.user_id == record.user_id))
+        owner = owner_result.scalar_one_or_none()
+        if not owner or owner.family_id != current_user.family_id or not current_user.is_admin:
+            raise HTTPException(status_code=403, detail="无权查看该记录的对话历史")
+    
+    # 2. 从数据库获取对话历史（优先），Redis作为实时补充
+    try:
+        # 先尝试从数据库获取持久化的对话
+        db_result = await db.execute(
+            select(ChatMessage)
+            .where(ChatMessage.call_id == call_id)
+            .order_by(ChatMessage.sequence.asc())
+        )
+        db_messages = db_result.scalars().all()
+        
+        messages = []
+        for msg in db_messages:
+            messages.append({
+                "sequence": msg.sequence,
+                "speaker": msg.speaker,
+                "content": msg.content,
+                "timestamp": msg.timestamp.isoformat() if msg.timestamp else None
+            })
+        
+        # 如果数据库没有，尝试从Redis获取（实时通话中）
+        source = "database"
+        if not messages:
+            chat_history = await memory_service.get_context(call_id)
+            if chat_history and chat_history != "暂无历史上下文。":
+                source = "redis"
+                for line in chat_history.split('\n'):
+                    if line.strip() and '. ' in line:
+                        parts = line.split('. ', 1)
+                        if len(parts) == 2:
+                            seq, content = parts
+                            messages.append({
+                                "sequence": int(seq),
+                                "speaker": "other",  # Redis中不区分说话人
+                                "content": content,
+                                "timestamp": None
+                            })
+        
+        return ResponseModel(
+            code=200,
+            message="获取对话历史成功",
+            data={
+                "call_id": call_id,
+                "message_count": len(messages),
+                "messages": messages,
+                "source": source
+            }
+        )
+    except Exception as e:
+        logger.error(f"获取对话历史失败: {e}")
+        raise HTTPException(status_code=500, detail="获取对话历史失败")
+
+
+@router.get("/{call_id}/detection-timeline", response_model=ResponseModel)
+async def get_detection_timeline(
+    call_id: int,
+    current_user_id: int = Depends(get_current_user_id),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    获取详细的检测时间轴数据
+    
+    提供每个时间点的三模态详细检测数据，用于前端展示检测过程曲线
+    """
+    # 1. 查询通话记录并校验权限
+    result = await db.execute(
+        select(CallRecord).where(CallRecord.call_id == call_id)
+    )
+    record = result.scalar_one_or_none()
+    if not record:
+        raise HTTPException(status_code=404, detail="通话记录不存在")
+    
+    # 权限校验
+    if record.user_id != current_user_id:
+        user_result = await db.execute(select(User).where(User.user_id == current_user_id))
+        current_user = user_result.scalar_one_or_none()
+        owner_result = await db.execute(select(User).where(User.user_id == record.user_id))
+        owner = owner_result.scalar_one_or_none()
+        if not owner or owner.family_id != current_user.family_id or not current_user.is_admin:
+            raise HTTPException(status_code=403, detail="无权查看该记录的检测时间轴")
+    
+    # 2. 获取AI检测日志（按时间排序）
+    ai_logs_result = await db.execute(
+        select(AIDetectionLog)
+        .where(AIDetectionLog.call_id == call_id)
+        .order_by(AIDetectionLog.time_offset.asc())
+    )
+    ai_logs = ai_logs_result.scalars().all()
+    
+    # 3. 构建时间轴数据
+    timeline = []
+    for log in ai_logs:
+        timeline.append({
+            "time_offset": log.time_offset,
+            "timestamp": log.created_at.isoformat() if log.created_at else None,
+            "modalities": {
+                "text": {
+                    "confidence": log.text_confidence,
+                    "score": log.text_confidence * 100 if log.text_confidence else 0
+                },
+                "voice": {
+                    "confidence": log.voice_confidence,
+                    "score": log.voice_confidence * 100 if log.voice_confidence else 0
+                },
+                "video": {
+                    "confidence": log.video_confidence,
+                    "score": log.video_confidence * 100 if log.video_confidence else 0
+                }
+            },
+            "overall_score": log.overall_score,
+            "fused_risk_level": _get_risk_level(log.overall_score),
+            "detected_text": log.detected_text,  # 检测到的完整文本
+            "detected_keywords": log.detected_keywords,  # 敏感关键词
+            "match_script": log.match_script,  # 匹配的剧本
+            "intent": log.intent,  # 识别的意图
+            "detection_type": log.detection_type,
+            "model_version": log.model_version,
+            "evidence_url": log.evidence_snapshot,
+            "log_id": log.log_id
+        })
+    
+    # 4. 计算统计数据
+    stats = {
+        "total_events": len(timeline),
+        "max_overall_score": max([t["overall_score"] for t in timeline]) if timeline else 0,
+        "avg_text_conf": sum([t["modalities"]["text"]["confidence"] for t in timeline]) / len(timeline) if timeline else 0,
+        "avg_voice_conf": sum([t["modalities"]["voice"]["confidence"] for t in timeline]) / len(timeline) if timeline else 0,
+        "avg_video_conf": sum([t["modalities"]["video"]["confidence"] for t in timeline]) / len(timeline) if timeline else 0,
+        "duration_seconds": timeline[-1]["time_offset"] if timeline else 0
+    }
+    
+    return ResponseModel(
+        code=200,
+        message="获取检测时间轴成功",
+        data={
+            "call_id": call_id,
+            "timeline": timeline,
+            "statistics": stats
+        }
+    )
+
+
+def _get_risk_level(score: float) -> str:
+    """根据分数获取风险等级"""
+    if score >= 80:
+        return "high"
+    elif score >= 50:
+        return "medium"
+    else:
+        return "low"
+
+
+@router.get("/{call_id}/evidence/{log_id}")
+async def get_evidence_detail(
+    call_id: int,
+    log_id: int,
+    current_user_id: int = Depends(get_current_user_id),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    获取指定检测日志的详细证据信息
+    
+    包括证据截图、检测详情、技术参数等
+    """
+    # 1. 查询检测日志
+    result = await db.execute(
+        select(AIDetectionLog).where(
+            and_(
+                AIDetectionLog.log_id == log_id,
+                AIDetectionLog.call_id == call_id
+            )
+        )
+    )
+    log = result.scalar_one_or_none()
+    if not log:
+        raise HTTPException(status_code=404, detail="检测日志不存在")
+    
+    # 2. 查询通话记录并校验权限
+    record_result = await db.execute(
+        select(CallRecord).where(CallRecord.call_id == call_id)
+    )
+    record = record_result.scalar_one_or_none()
+    
+    if record.user_id != current_user_id:
+        user_result = await db.execute(select(User).where(User.user_id == current_user_id))
+        current_user = user_result.scalar_one_or_none()
+        owner_result = await db.execute(select(User).where(User.user_id == record.user_id))
+        owner = owner_result.scalar_one_or_none()
+        if not owner or owner.family_id != current_user.family_id or not current_user.is_admin:
+            raise HTTPException(status_code=403, detail="无权查看该证据")
+    
+    # 3. 构建证据详情
+    evidence_detail = {
+        "log_id": log.log_id,
+        "call_id": log.call_id,
+        "time_offset": log.time_offset,
+        "created_at": log.created_at.isoformat() if log.created_at else None,
+        "detection_type": log.detection_type,
+        "modalities": {
+            "text": {
+                "confidence": log.text_confidence,
+                "detected_text": log.detected_text,  # 检测到的完整文本
+                "detected_keywords": log.detected_keywords,  # 敏感关键词
+                "match_script": log.match_script,  # 匹配的剧本
+                "intent": log.intent  # 识别的意图
+            },
+            "voice": {
+                "confidence": log.voice_confidence
+            },
+            "video": {
+                "confidence": log.video_confidence
+            }
+        },
+        "overall_score": log.overall_score,
+        "risk_level": _get_risk_level(log.overall_score),
+        "evidence": {
+            "snapshot_url": log.evidence_snapshot,
+            "ocr_text": log.image_ocr_text if log.detection_type == "image" else None,
+            "ocr_dialogue_hash": log.ocr_dialogue_hash if log.detection_type == "image" else None
+        },
+        "technical_details": {
+            "algorithm_details": log.algorithm_details,
+            "model_version": log.model_version
+        }
+    }
+    
+    return ResponseModel(
+        code=200,
+        message="获取证据详情成功",
+        data=evidence_detail
     )
