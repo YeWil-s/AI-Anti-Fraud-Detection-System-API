@@ -60,12 +60,32 @@ async def create_family_group(
     current_user_id: int = Depends(get_current_user_id), 
     db: AsyncSession = Depends(get_db)
 ):
-    """创建家庭组：自动将创建者设为主管理员"""
+    """创建家庭组：自动将创建者设为主管理员
+    
+    支持一个用户作为管理员管理多个家庭组，但作为普通成员只能属于一个家庭组
+    """
     # 1. 检查用户是否已有家庭组（普通成员只能有一个）
     result = await db.execute(select(User).where(User.user_id == current_user_id))
     user = result.scalar_one_or_none()
+    
     if user and user.family_id:
-        return ResponseModel(code=400, message="您已加入一个家庭组，请先退出")
+        # 检查用户是否以管理员身份在该家庭组
+        admin_result = await db.execute(
+            select(FamilyAdmin).where(
+                and_(
+                    FamilyAdmin.user_id == current_user_id, 
+                    FamilyAdmin.family_id == user.family_id
+                )
+            )
+        )
+        is_admin_in_current_family = admin_result.scalar_one_or_none() is not None
+        
+        # 如果不是管理员（只是普通成员），则不允许创建新家庭组
+        if not is_admin_in_current_family:
+            return ResponseModel(code=400, message="您已作为普通成员加入一个家庭组，请先退出")
+        
+        # 如果是管理员，允许创建新的家庭组（成为多家庭组管理员）
+        logger.info(f"用户 {current_user_id} 已是家庭组 {user.family_id} 的管理员，允许创建新家庭组")
     
     # 2. 创建群组 
     new_family = FamilyGroup(group_name=name, admin_id=current_user_id) 
@@ -75,6 +95,8 @@ async def create_family_group(
 
     # 3. 将创建者绑定到新组，并在family_admins表设为主管理员
     if user:
+        # 如果用户还没有family_id（或者已经是其他家庭组的管理员），则更新为新的家庭组
+        # 注意：这里会改变用户的"当前活跃家庭组"，但保留其在其他家庭组的管理员身份
         user.family_id = new_family.id
         user.is_admin = True
         
@@ -237,35 +259,77 @@ async def review_application(
 # =======================
 @router.get("/members", response_model=ResponseModel)
 async def get_family_members(
+    family_id: int = Query(None, description="家庭组ID，不传则查询当前用户所在家庭组"),
     current_user_id: int = Depends(get_current_user_id),
     db: AsyncSession = Depends(get_db)
 ):
-    """获取用户所在家庭组的成员列表"""
-    # 1. 查找当前用户
-    user_result = await db.execute(select(User).where(User.user_id == current_user_id))
-    current_user = user_result.scalar_one_or_none()
+    """获取家庭组成员列表
     
-    if not current_user or not current_user.family_id:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST, 
-            detail="您还未加入任何家庭组"
+    - 如果传入 family_id：查询指定家庭组的成员（需要是当前用户管理的家庭组）
+    - 如果不传 family_id：查询当前用户所在家庭组的成员
+    """
+    # 1. 确定要查询的家庭组ID
+    target_family_id = family_id
+    
+    if target_family_id is None:
+        # 未传入family_id，使用当前用户的family_id
+        user_result = await db.execute(select(User).where(User.user_id == current_user_id))
+        current_user = user_result.scalar_one_or_none()
+        
+        if not current_user or not current_user.family_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST, 
+                detail="您还未加入任何家庭组"
+            )
+        target_family_id = current_user.family_id
+    else:
+        # 传入了family_id，需要验证当前用户是否有权限查看该家庭组
+        # 检查当前用户是否是该家庭组的管理员
+        is_admin_result = await db.execute(
+            select(FamilyAdmin).where(
+                and_(
+                    FamilyAdmin.user_id == current_user_id,
+                    FamilyAdmin.family_id == target_family_id
+                )
+            )
         )
+        if not is_admin_result.scalar_one_or_none():
+            # 不是管理员，检查是否是该家庭组的普通成员
+            member_result = await db.execute(
+                select(User).where(
+                    and_(
+                        User.user_id == current_user_id,
+                        User.family_id == target_family_id
+                    )
+                )
+            )
+            if not member_result.scalar_one_or_none():
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="您无权查看该家庭组的成员信息"
+                )
     
     # 2. 获取家庭组信息
     family_result = await db.execute(
-        select(FamilyGroup).where(FamilyGroup.id == current_user.family_id)
+        select(FamilyGroup).where(FamilyGroup.id == target_family_id)
     )
     family = family_result.scalar_one_or_none()
+    
+    if not family:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="家庭组不存在"
+        )
         
     # 3. 查询同 family_id 的所有成员
     members_result = await db.execute(
-        select(User).where(User.family_id == current_user.family_id)
+        select(User).where(User.family_id == target_family_id)
     )
     members = members_result.scalars().all()
     
     # 4. 查询该家庭组的所有管理员
     admins_result = await db.execute(
-        select(FamilyAdmin).where(FamilyAdmin.family_id == current_user.family_id)
+        select(FamilyAdmin).where(FamilyAdmin.family_id == target_family_id)
     )
     admin_map = {a.user_id: a.admin_role for a in admins_result.scalars().all()}
     
@@ -274,7 +338,7 @@ async def get_family_members(
         code=200,
         message="获取成员列表成功",
         data={
-            "family_id": current_user.family_id,
+            "family_id": target_family_id,
             "group_name": family.group_name if family else "",
             "members": [
                 {

@@ -231,5 +231,15 @@ async def health_check():
         }
     }
 
+# 导出 app 供 ASGI 服务器使用
+__all__ = ["app"]
+
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=settings.DEBUG)
+    import platform
+    
+    if platform.system() == "Windows":
+        # Windows 下直接传入 app 对象，避免模块重新导入问题
+        uvicorn.run(app, host="0.0.0.0", port=8000)
+    else:
+        # 其他系统可以使用 reload 模式
+        uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=settings.DEBUG)

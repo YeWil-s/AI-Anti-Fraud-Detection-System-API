@@ -9,7 +9,7 @@ import enum
 class CallPlatform(str, enum.Enum):
     PHONE = "phone"      # 传统电话
     WECHAT = "wechat"    # 微信音频
-    VIDEO_CALL = "video_call" # [新增] 视频通话
+    VIDEO_CALL = "video_call" # 视频通话
     QQ = "qq"            # QQ
     OTHER = "other"
 

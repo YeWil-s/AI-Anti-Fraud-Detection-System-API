@@ -3,8 +3,6 @@
 用于存储和检索反诈骗典型案例与法律法规
 """
 import os
-
-# 禁用 ChromaDB 所有遥测（必须在导入 chromadb 之前设置）
 os.environ["ANONYMIZED_TELEMETRY"] = "false"
 os.environ["CHROMA_TELEMETRY"] = "false"
 os.environ["POSTHOG_DISABLED"] = "1"
@@ -17,44 +15,41 @@ from app.core.logger import get_logger
 
 logger = get_logger(__name__)
 
-# 获取项目根目录，在根目录下创建一个 chroma_data 文件夹用于持久化存储向量数据
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 CHROMA_DATA_PATH = os.path.join(BASE_DIR, "chroma_data")
 
 class VectorDBService:
     def __init__(self):
-        # 初始化持久化客户端（重启后数据不丢失）
+        # 初始化持久化客户端
         self.client = chromadb.PersistentClient(
             path=CHROMA_DATA_PATH,
             settings=Settings(anonymized_telemetry=False))
-        
-        # 使用轻量级开源多语言 Embedding 模型
         self.embedding_fn = embedding_functions.SentenceTransformerEmbeddingFunction(
             model_name="paraphrase-multilingual-MiniLM-L12-v2"
         )
         
-        # 1. 典型案例库 (原有)
+        # 1. 典型案例库
         self.cases_collection = self.client.get_or_create_collection(
             name="anti_fraud_cases",
             embedding_function=self.embedding_fn,
             metadata={"hnsw:space": "cosine"} # 使用余弦相似度进行检索
         )
         
-        # 2. 法律法规库 (新增)
+        # 2. 法律法规库
         self.laws_collection = self.client.get_or_create_collection(
             name="anti_fraud_laws",
             embedding_function=self.embedding_fn,
             metadata={"hnsw:space": "cosine"} 
         )
         
-        # 3. 宣传标语库 (新增)
+        # 3. 宣传标语库 
         self.slogans_collection = self.client.get_or_create_collection(
             name="anti_fraud_slogans",
             embedding_function=self.embedding_fn,
             metadata={"hnsw:space": "cosine"}
         )
         
-        # 4. 宣传视频库 (新增)
+        # 4. 宣传视频库 
         self.videos_collection = self.client.get_or_create_collection(
             name="anti_fraud_videos",
             embedding_function=self.embedding_fn,
@@ -63,17 +58,15 @@ class VectorDBService:
         
         logger.info("ChromaDB Vector DB initialized successfully with cases, laws, slogans and videos collections.")
 
-    # ================= 原有兼容方法 =================
     def add_cases(self, documents: list[str], metadatas: list[dict], ids: list[str]):
-        """向知识库中添加新的反诈案例 (兼容老代码)"""
+        """向知识库中添加新的反诈案例"""
         self.cases_collection.upsert(documents=documents, metadatas=metadatas, ids=ids)
         logger.info(f"Successfully upserted {len(ids)} cases into Vector DB.")
 
     def search_similar_cases(self, query: str, n_results: int = 3) -> dict:
-        """根据用户输入，检索最相似的历史案例 (兼容老代码返回原生格式)"""
+        """根据用户输入，检索最相似的历史案例"""
         return self.cases_collection.query(query_texts=[query], n_results=n_results)
-    
-    # ================= 新增通用方法 =================
+
     def add_data(self, collection_name: str, documents: list[str], metadatas: list[dict], ids: list[str]):
         """通用数据入库方法"""
         collection = self.cases_collection if collection_name == "anti_fraud_cases" else self.laws_collection
@@ -93,7 +86,7 @@ class VectorDBService:
     def search_similar(self, collection_name: str, text: str, top_k: int = 2, 
                        filter_dict: dict = None) -> list:
         """
-        通用检索方法 (供 EducationService 使用)
+        通用检索方法
         返回格式化好的字典列表
         
         Args:

@@ -305,11 +305,18 @@ async def update_user_profile(
         }
     )
 
-# 个人安全报告生成
+# 个人安全报告生成（支持流式输出）
 @router.get("/{user_id}/security-report", summary="生成用户专属安全监测报告")
-async def get_user_security_report(user_id: int, db: AsyncSession = Depends(get_db)):
+async def get_user_security_report(
+    user_id: int, 
+    stream: bool = Query(default=False, description="是否使用流式输出"),
+    db: AsyncSession = Depends(get_db)
+):
     """
     分析该用户近期的通话记录，调用大模型生成 Markdown 格式的专属防诈报告
+    
+    - stream=false: 返回完整报告 JSON
+    - stream=true: 使用 SSE 流式输出，前端可实时显示生成内容
     """
     # 1. 校验用户是否存在
     result = await db.execute(select(User).where(User.user_id == user_id))
@@ -328,15 +335,163 @@ async def get_user_security_report(user_id: int, db: AsyncSession = Depends(get_
     )
     recent_calls_with_logs = calls_result.all()
 
-    # 3. 调用 LLM 生成报告
+    # 3. 获取统计数据（用于结构化展示）
+    stats = await _get_user_call_stats(db, user_id)
+
+    # 4. 流式输出模式
+    if stream:
+        from fastapi.responses import StreamingResponse
+        import json
+        
+        async def report_stream_generator():
+            """生成报告流"""
+            # 首先发送元数据和统计信息
+            metadata = {
+                "type": "metadata",
+                "data": {
+                    "user_id": user_id,
+                    "username": user.username,
+                    "report_generated_at": datetime.now().isoformat(),
+                    "stats": stats
+                }
+            }
+            yield f"data: {json.dumps(metadata, ensure_ascii=False)}\n\n"
+            
+            # 然后流式生成报告内容
+            content_buffer = ""
+            async for chunk in llm_service.generate_security_report_stream(user, recent_calls_with_logs):
+                content_buffer += chunk
+                chunk_data = {
+                    "type": "content",
+                    "data": {
+                        "chunk": chunk,
+                        "content": content_buffer
+                    }
+                }
+                yield f"data: {json.dumps(chunk_data, ensure_ascii=False)}\n\n"
+            
+            # 发送完成标记
+            complete_data = {
+                "type": "complete",
+                "data": {
+                    "user_id": user_id,
+                    "username": user.username,
+                    "report_generated_at": datetime.now().isoformat(),
+                    "report_content": content_buffer,
+                    "stats": stats
+                }
+            }
+            yield f"data: {json.dumps(complete_data, ensure_ascii=False)}\n\n"
+        
+        return StreamingResponse(
+            report_stream_generator(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no"
+            }
+        )
+    
+    # 5. 非流式模式：直接返回完整报告
     report_markdown = await llm_service.generate_security_report(user, recent_calls_with_logs)
 
-    # 4. 返回 JSON 数据
     return {
         "user_id": user_id,
         "username": user.username,
         "report_generated_at": datetime.now().isoformat(),
-        "report_content": report_markdown
+        "report_content": report_markdown,
+        "stats": stats
+    }
+
+
+async def _get_user_call_stats(db: AsyncSession, user_id: int) -> dict:
+    """获取用户通话统计数据"""
+    from sqlalchemy import func
+    from app.models.call_record import CallRecord
+    
+    # 总通话数
+    total_calls_result = await db.execute(
+        select(func.count(CallRecord.call_id)).where(CallRecord.user_id == user_id)
+    )
+    total_calls = total_calls_result.scalar() or 0
+    
+    # 风险通话统计
+    risk_calls_result = await db.execute(
+        select(func.count(CallRecord.call_id)).where(
+            CallRecord.user_id == user_id,
+            CallRecord.detected_result.in_(["fake", "suspicious"])
+        )
+    )
+    risk_calls = risk_calls_result.scalar() or 0
+    
+    # 各类风险统计
+    fake_calls_result = await db.execute(
+        select(func.count(CallRecord.call_id)).where(
+            CallRecord.user_id == user_id,
+            CallRecord.detected_result == "fake"
+        )
+    )
+    fake_calls = fake_calls_result.scalar() or 0
+    
+    suspicious_calls_result = await db.execute(
+        select(func.count(CallRecord.call_id)).where(
+            CallRecord.user_id == user_id,
+            CallRecord.detected_result == "suspicious"
+        )
+    )
+    suspicious_calls = suspicious_calls_result.scalar() or 0
+    
+    # 最近7天通话趋势
+    from datetime import timedelta
+    seven_days_ago = datetime.now() - timedelta(days=7)
+    
+    daily_stats_result = await db.execute(
+        select(
+            func.date(CallRecord.start_time).label("date"),
+            func.count(CallRecord.call_id).label("count"),
+            func.sum(func.case((CallRecord.detected_result.in_(["fake", "suspicious"]), 1), else_=0)).label("risk_count")
+        )
+        .where(
+            CallRecord.user_id == user_id,
+            CallRecord.start_time >= seven_days_ago
+        )
+        .group_by(func.date(CallRecord.start_time))
+        .order_by(func.date(CallRecord.start_time))
+    )
+    daily_stats = [
+        {
+            "date": str(row.date),
+            "total": row.count,
+            "risk": row.risk_count or 0
+        }
+        for row in daily_stats_result.all()
+    ]
+    
+    # 诈骗类型分布
+    fraud_types_result = await db.execute(
+        select(CallRecord.fraud_type, func.count(CallRecord.call_id))
+        .where(
+            CallRecord.user_id == user_id,
+            CallRecord.fraud_type.isnot(None),
+            CallRecord.fraud_type != ""
+        )
+        .group_by(CallRecord.fraud_type)
+    )
+    fraud_types = [
+        {"type": row[0], "count": row[1]}
+        for row in fraud_types_result.all()
+    ]
+    
+    return {
+        "total_calls": total_calls,
+        "risk_calls": risk_calls,
+        "fake_calls": fake_calls,
+        "suspicious_calls": suspicious_calls,
+        "safe_calls": total_calls - risk_calls,
+        "risk_rate": round(risk_calls / total_calls * 100, 2) if total_calls > 0 else 0,
+        "daily_trend": daily_stats,
+        "fraud_type_distribution": fraud_types
     }
 
 @router.get("/guardian", summary="获取当前用户的监护人信息")

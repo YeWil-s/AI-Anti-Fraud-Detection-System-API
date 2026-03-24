@@ -304,6 +304,98 @@ class LLMService:
             logger.error(f"Failed to generate security report: {e}")
             return "## 报告生成失败\n系统当前繁忙，无法生成安全报告，请稍后再试。"
     
+    async def generate_security_report_stream(self, user: User, recent_calls_with_logs: list):
+        """
+        流式生成个人安全监测报告
+        返回异步生成器，每次yield一个内容片段
+        """
+        # 1. 整理用户的近期通话摘要
+        call_summary = ""
+        risk_count = 0
+        
+        if not recent_calls_with_logs:
+            call_summary = "该用户近期无通话记录。"
+        else:
+            for item in recent_calls_with_logs:
+                if isinstance(item, tuple) or hasattr(item, '_mapping'):
+                    call = item[0]
+                    log = item[1] if len(item) > 1 else None
+                else:
+                    call = item
+                    log = None
+
+                status = "安全"
+                if call.detected_result:
+                    val = getattr(call.detected_result, 'name', str(call.detected_result))
+                    if 'FAKE' in val:
+                        status = "高风险(诈骗)"
+                        risk_count += 1
+                
+                start_time_str = call.start_time.strftime("%Y-%m-%d %H:%M:%S") if call.start_time else "未知时间"
+                
+                details_str = "未检测到异常"
+                if log:
+                    details_list = []
+                    if getattr(log, 'overall_score', 0) > 0:
+                        details_list.append(f"综合得分: {log.overall_score:.1f}")
+                    if getattr(log, 'detected_keywords', None):
+                        details_list.append(f"敏感词: {log.detected_keywords}")
+                    if getattr(log, 'voice_confidence', 0) > 0:
+                        details_list.append(f"语音伪造率: {log.voice_confidence:.2f}")
+                    if getattr(log, 'video_confidence', 0) > 0:
+                        details_list.append(f"画面伪造率: {log.video_confidence:.2f}")
+                    
+                    if details_list:
+                        details_str = " | ".join(details_list)
+
+                call_summary += (
+                    f"- 时间：{start_time_str}\n"
+                    f"  号码：{call.target_name}\n"
+                    f"  判定结果：{status}\n"
+                    f"  检测详情：{details_str}\n\n"
+                )
+
+        # 2. 构建 Prompt
+        system_prompt = """你是一个专业的反诈风控专家。
+请根据提供的【用户画像】和【近期通话检测记录】，为该用户生成一份专属的《个人反诈安全监测报告》。
+
+报告要求：
+1. 必须使用 Markdown 格式排版，包含标题、加粗、列表等元素，使其美观易读。
+2. 结构建议包含：
+   -  核心评估结论（综合安全评级：如优秀、良好、极度危险）
+   -  近期风险数据回顾（拦截了多少次，触发了哪些敏感词）
+   -  暴露的薄弱点分析
+   -  专属防骗建议（结合该用户的【角色类型】给出定制化建议）
+3. 语气要专业、关怀。"""
+
+        is_bound = '是' if getattr(user, 'family_id', None) else '否'
+
+        user_content = f"""
+【用户画像】
+- 用户姓名：{user.name or user.username}
+- 角色类型：{user.role_type}
+- 监护人已绑定：{is_bound}
+
+【近期通话检测记录】(共 {len(recent_calls_with_logs)} 条，其中高风险 {risk_count} 条)
+{call_summary}
+"""
+        
+        # 3. 流式调用大模型
+        try:
+            messages = [
+                SystemMessage(content=system_prompt),
+                HumanMessage(content=user_content)
+            ]
+            
+            # 使用 astream 方法进行流式输出
+            async for chunk in self.llm.astream(messages):
+                if chunk.content:
+                    yield chunk.content
+                    
+        except Exception as e:
+            logger.error(f"Failed to stream security report: {e}")
+            yield "## 报告生成失败\n系统当前繁忙，无法生成安全报告，请稍后再试。"
+    
     async def generate_final_summary(self, chat_history: list | str) -> dict:
         """
         通话结束时，根据全局对话历史生成最终总结

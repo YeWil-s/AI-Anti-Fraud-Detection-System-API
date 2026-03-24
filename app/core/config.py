@@ -1,5 +1,5 @@
 """
-应用配置模块 (Pydantic V2 重构版)
+应用配置模块
 """
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from typing import Optional
@@ -94,7 +94,7 @@ class Settings(BaseSettings):
     LLM_API_KEY: str = ""
     LLM_BASE_URL: str = "https://api.deepseek.com/v1"
     
-    # 智谱AI GLM-4V-Flash 配置（用于图片OCR）
+    # 智谱AI GLM-4V-Flash 
     ZHIPU_API_KEY: str = ""
     ZHIPU_BASE_URL: str = "https://open.bigmodel.cn/api/paas/v4"
     

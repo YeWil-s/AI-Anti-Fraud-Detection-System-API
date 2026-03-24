@@ -44,7 +44,7 @@ class ModelService:
     
     def __init__(self):
         # --- 音频模型组件 ---
-        self.voice_session = None  # 旧版ONNX深度流模型
+        self.voice_session = None  # ONNX深度流模型
         self.gnb_model = None      # 统计流GNB
         self.nmf_model = None      # 统计流NMF
         self.svm_model = None      # 统计流SVM
