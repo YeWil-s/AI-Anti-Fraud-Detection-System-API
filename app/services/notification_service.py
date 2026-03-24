@@ -84,12 +84,13 @@ class NotificationService:
         }
         self._publish_to_redis(user_id, ws_payload)
 
-        # 4. [监护人联动] 如果检测到中高风险且确定有风险，发送应用内消息给家庭成员
-        if is_risk and risk_level in ["critical", "high", "medium"]:
+        # 4. [监护人联动] 如果检测到高风险(Level 3)或中高风险(Level 2)且确定有风险，发送应用内消息给家庭成员
+        # Level 1 (medium) 不通知家人，只在用户端提示
+        if is_risk and risk_level in ["critical", "high"]:
             await self._notify_family_in_app(db, user_id, ws_payload)
             
-        # 5. [邮件通知] 高风险时发送邮件给监护人
-        if is_risk and risk_level in ["critical", "high"]:
+        # 5. [邮件通知] 高风险(Level 3)时发送邮件给监护人
+        if is_risk and risk_level in ["critical"]:
             await self._notify_guardian_by_email(db, user_id, risk_level, details)
             
     async def _notify_family_in_app(self, db: AsyncSession, current_user_id: int, original_payload: dict):
@@ -123,18 +124,32 @@ class NotificationService:
             return
         
         # 3. 构造给监护人的特定预警 Payload
+        # 根据风险等级决定显示模式
+        risk_level = original_payload['data']['risk_level']
+        if risk_level == 'critical':
+            display_mode = 'fullscreen'  # Level 3: 全屏
+            action = 'alarm'  # 响铃 + 震动
+        elif risk_level == 'high':
+            display_mode = 'popup'  # Level 2: 弹窗
+            action = 'vibrate'  # 震动
+        else:
+            display_mode = 'toast'  # Level 1: 提示
+            action = 'none'
+        
         guardian_payload = {
             "type": "family_alert",
             "data": {
-                "title": "家人安全预警",
+                "title": "🚨 家人安全预警" if risk_level == 'critical' else "⚠️ 家人安全预警",
                 "message": f"您的家人【{victim.name or victim.username}】疑似正在遭遇诈骗。{original_payload['data']['message']}",
-                "risk_level": original_payload['data']['risk_level'],
+                "risk_level": risk_level,
                 "victim_id": current_user_id,
                 "victim_name": victim.name or victim.username,
+                "victim_phone": victim.phone,
+                "call_id": original_payload['data'].get('call_id'),
                 "family_id": victim.family_id,
                 "timestamp": original_payload['data']['timestamp'],
-                "display_mode": "popup",
-                "action": "vibrate"  # 前端可执行的动作：震动提醒
+                "display_mode": display_mode,
+                "action": action  # 前端可执行的动作：none/vibrate/alarm
             }
         }
         

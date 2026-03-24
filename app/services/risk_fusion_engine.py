@@ -316,6 +316,187 @@ class RiskFusionEngineV2:
             logger.debug("清理所有时序缓存")
 
 
+class EnvironmentAwareFusionEngine(RiskFusionEngineV2):
+    """
+    环境感知风险融合引擎
+    
+    根据通话环境（平台类型）动态调整检测策略和融合权重
+    支持：PHONE/WECHAT/QQ/VIDEO_CALL/OTHER
+    """
+    
+    # 环境类型定义
+    ENVIRONMENT_TYPES = {
+        "TEXT_CHAT": "text_chat",      # 纯文字聊天（QQ/微信文字）
+        "VOICE_CHAT": "voice_chat",    # 语音聊天（QQ/微信语音）
+        "PHONE_CALL": "phone_call",    # 电话通话
+        "VIDEO_CALL": "video_call",    # 视频通话
+        "UNKNOWN": "unknown"           # 未知环境
+    }
+    
+    # 环境自适应权重配置
+    ENVIRONMENT_WEIGHTS = {
+        # 纯文字聊天：文本权重主导
+        "text_chat": {"text": 1.0, "vision": 0.0, "audio": 0.0},
+        
+        # 语音聊天：音频+文本
+        "voice_chat": {"text": 0.6, "vision": 0.0, "audio": 0.4},
+        
+        # 电话通话：音频+文本均衡
+        "phone_call": {"text": 0.5, "vision": 0.0, "audio": 0.5},
+        
+        # 视频通话：三模态均衡
+        "video_call": {"text": 0.4, "vision": 0.3, "audio": 0.3},
+        
+        # 未知环境：使用默认权重
+        "unknown": {"text": 0.5, "vision": 0.3, "audio": 0.2}
+    }
+    
+    # 平台到环境的映射
+    PLATFORM_ENVIRONMENT_MAP = {
+        "wechat": "voice_chat",      # 微信默认识别为语音聊天
+        "qq": "voice_chat",          # QQ默认识别为语音聊天
+        "phone": "phone_call",       # 电话
+        "video_call": "video_call",  # 视频通话
+        "other": "unknown"           # 其他
+    }
+    
+    def __init__(self):
+        super().__init__()
+        self._environment_cache: Dict[str, str] = {}  # call_id -> environment_type
+    
+    def set_call_environment(self, call_id: str, platform: str, is_text_chat: bool = False):
+        """
+        设置通话环境
+        
+        Args:
+            call_id: 通话ID
+            platform: 平台类型 (wechat/qq/phone/video_call/other)
+            is_text_chat: 是否为纯文字聊天（从OCR识别判断）
+        """
+        if is_text_chat:
+            env_type = self.ENVIRONMENT_TYPES["TEXT_CHAT"]
+        else:
+            env_type = self.PLATFORM_ENVIRONMENT_MAP.get(platform.lower(), "unknown")
+        
+        self._environment_cache[call_id] = env_type
+        logger.info(f"[环境感知] 通话 {call_id} 环境设置为: {env_type} (平台: {platform}, 文字聊天: {is_text_chat})")
+    
+    def get_call_environment(self, call_id: str) -> str:
+        """获取通话环境类型"""
+        return self._environment_cache.get(call_id, "unknown")
+    
+    def _get_environment_weights(self, call_id: Optional[str]) -> Dict[str, float]:
+        """
+        根据通话环境获取权重配置
+        """
+        if not call_id or call_id not in self._environment_cache:
+            return self.ENVIRONMENT_WEIGHTS["unknown"]
+        
+        env_type = self._environment_cache[call_id]
+        return self.ENVIRONMENT_WEIGHTS.get(env_type, self.ENVIRONMENT_WEIGHTS["unknown"])
+    
+    def calculate_score(
+        self, 
+        llm_classification: dict, 
+        local_text_conf: float, 
+        audio_conf: float, 
+        video_conf: float,
+        call_id: Optional[str] = None
+    ) -> float:
+        """
+        环境感知的多模态风险融合算法
+        
+        根据通话环境动态调整权重，同时保留场景自适应和时序平滑能力
+        """
+        # 获取环境权重
+        env_weights = self._get_environment_weights(call_id)
+        
+        # 获取场景权重（从父类）
+        intent = llm_classification.get("intent", "")
+        match_script = llm_classification.get("match_script", "无")
+        scene_weights = self._get_scene_weights(intent, match_script)
+        
+        # 融合权重：环境权重作为基础，场景权重作为调整
+        # 如果环境明确指定了某个模态为0，则强制为0
+        final_weights = {}
+        for mod in ["text", "vision", "audio"]:
+            if env_weights[mod] == 0:
+                final_weights[mod] = 0.0
+            else:
+                # 环境权重和场景权重的加权平均
+                final_weights[mod] = (env_weights[mod] * 0.6) + (scene_weights[mod] * 0.4)
+        
+        # 归一化
+        total = sum(final_weights.values())
+        if total > 0:
+            final_weights = {k: v/total for k, v in final_weights.items()}
+        else:
+            final_weights = {"text": 1.0, "vision": 0.0, "audio": 0.0}
+        
+        logger.info(f"[环境感知] 通话 {call_id} 最终权重: T{final_weights['text']:.2f}/V{final_weights['vision']:.2f}/A{final_weights['audio']:.2f}")
+        
+        # 临时替换默认权重进行计算
+        original_weights = self.default_weights.copy()
+        self.default_weights = final_weights
+        
+        try:
+            # 调用父类的完整计算逻辑（包含熔断、协同、时序平滑）
+            score = super().calculate_score(
+                llm_classification=llm_classification,
+                local_text_conf=local_text_conf,
+                audio_conf=audio_conf,
+                video_conf=video_conf,
+                call_id=call_id
+            )
+        finally:
+            # 恢复默认权重
+            self.default_weights = original_weights
+        
+        return score
+    
+    def get_environment_info(self, call_id: str) -> dict:
+        """获取环境信息（用于前端展示）"""
+        env_type = self._environment_cache.get(call_id, "unknown")
+        weights = self.ENVIRONMENT_WEIGHTS.get(env_type, self.ENVIRONMENT_WEIGHTS["unknown"])
+        
+        # 映射为中文描述
+        env_descriptions = {
+            "text_chat": "文字聊天",
+            "voice_chat": "语音聊天",
+            "phone_call": "电话通话",
+            "video_call": "视频通话",
+            "unknown": "未知环境"
+        }
+        
+        # 启用的检测模态
+        active_modalities = []
+        if weights["text"] > 0:
+            active_modalities.append("text")
+        if weights["vision"] > 0:
+            active_modalities.append("vision")
+        if weights["audio"] > 0:
+            active_modalities.append("audio")
+        
+        return {
+            "environment_type": env_type,
+            "description": env_descriptions.get(env_type, "未知"),
+            "weights": weights,
+            "active_modalities": active_modalities
+        }
+    
+    def clear_environment_cache(self, call_id: Optional[str] = None):
+        """清理环境缓存"""
+        if call_id:
+            self._environment_cache.pop(call_id, None)
+            self.clear_temporal_cache(call_id)
+            logger.debug(f"[环境感知] 清理缓存: {call_id}")
+        else:
+            self._environment_cache.clear()
+            self.clear_temporal_cache()
+            logger.debug("[环境感知] 清理所有缓存")
+
+
 # 全局实例（保持向后兼容）
 fusion_engine = RiskFusionEngine()
 fusion_engine_v2 = RiskFusionEngineV2()
+environment_fusion_engine = EnvironmentAwareFusionEngine()

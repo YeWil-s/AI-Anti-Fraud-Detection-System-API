@@ -36,7 +36,7 @@ from app.models.chat_message import ChatMessage
 from app.core.storage import upload_to_minio
 from app.core.config import settings
 from app.core.logger import get_logger, bind_context
-from app.services.risk_fusion_engine import fusion_engine, fusion_engine_v2
+from app.services.risk_fusion_engine import fusion_engine, fusion_engine_v2, environment_fusion_engine
 from app.services.mdp_defense.dynamic_defense_agent import DynamicDefenseAgent
 from app.services.image_ocr_service import image_ocr_service
 from app.core.redis import get_redis
@@ -480,13 +480,39 @@ def detect_text_task(self, text: str, user_id: int, call_id: int) -> Dict:
                     text_conf = max(text_conf, 0.5)
                     logger.warning(f"视频高危标志触发，提升文本置信度至 {text_conf:.2f}")
                 
-                call_type_desc = f"视频通话场景" if is_video_call else f"纯语音通话场景"
+                # 获取环境信息
+                env_info = environment_fusion_engine.get_environment_info(str(call_id))
+                env_type = env_info.get("environment_type", "unknown")
+                
+                # 根据环境构建通话类型描述
+                env_descriptions = {
+                    "text_chat": "QQ/微信文字聊天场景",
+                    "voice_chat": "QQ/微信语音聊天场景",
+                    "phone_call": "电话通话场景",
+                    "video_call": "视频通话场景",
+                    "unknown": "视频通话场景" if is_video_call else "纯语音通话场景"
+                }
+                call_type_desc = env_descriptions.get(env_type, env_descriptions["unknown"])
+                
+                logger.info(f"[环境感知] 使用环境类型: {env_type}, 描述: {call_type_desc}")
 
                 # 提取交互轮次
                 chat_history = await memory_service.get_context(call_id)
                 msg_count = len(chat_history.split('\n')) if isinstance(chat_history, str) else 1
 
                 # 3. LLM 感知层 (只负责输出分类和意图)
+                # 根据环境获取聊天双方信息（如果是文字聊天）
+                chat_speakers = None
+                if env_type == "text_chat":
+                    # 尝试从Redis获取聊天双方信息
+                    try:
+                        r = get_redis_pool()
+                        speakers_data = r.get(f"call:{call_id}:chat_speakers")
+                        if speakers_data:
+                            chat_speakers = json.loads(speakers_data)
+                    except Exception:
+                        pass
+                
                 llm_result = await llm_service.analyze_multimodal_risk(
                     user_input=text, 
                     chat_history=chat_history,
@@ -494,16 +520,17 @@ def detect_text_task(self, text: str, user_id: int, call_id: int) -> Dict:
                     call_type=call_type_desc,
                     audio_conf=audio_conf,
                     video_conf=f"{raw_video_conf:.4f}" if is_video_call else "N/A",
-                    text_conf=text_conf  
+                    text_conf=text_conf,
+                    chat_speakers=chat_speakers
                 )
                 
-                # 4. 融合算分层 (使用增强版V2引擎)
-                fused_score = fusion_engine_v2.calculate_score(
+                # 4. 融合算分层 (使用环境感知融合引擎)
+                fused_score = environment_fusion_engine.calculate_score(
                     llm_classification=llm_result,
                     local_text_conf=text_conf,
                     audio_conf=audio_conf,
                     video_conf=raw_video_conf,
-                    call_id=call_id  # 传入call_id用于时序平滑
+                    call_id=str(call_id)  # 传入call_id用于环境感知和时序平滑
                 )
 
                 # 5. 马尔可夫决策层
@@ -709,6 +736,70 @@ def detect_image_task(self, image_base64: str, user_id: int, call_id: int) -> Di
                     if updated:
                         await db.commit()
                         logger.info(f"更新通话环境: platform={detected_platform.value}, caller={caller_number or target_name}")
+                    
+                    # ===== 环境感知：设置融合引擎环境并推送给前端 =====
+                    try:
+                        # 判断是否为纯文字聊天（从OCR结果分析）
+                        is_text_chat = False
+                        if ocr_result.get("dialogues"):
+                            # 如果有对话结构，检查是否为纯文字聊天界面
+                            dialogues = ocr_result.get("dialogues", [])
+                            # 文字聊天特征：有明确的发送者标识，消息气泡样式
+                            has_chat_structure = len(dialogues) > 0 and any(
+                                "sender" in d and "content" in d for d in dialogues
+                            )
+                            # 语音聊天特征：有通话时长、麦克风图标等
+                            has_voice_indicators = any(
+                                indicator in extracted_text for indicator in 
+                                ["通话时长", "麦克风", "扬声器", "挂断", "免提"]
+                            )
+                            is_text_chat = has_chat_structure and not has_voice_indicators
+                        
+                        # 设置环境到融合引擎
+                        environment_fusion_engine.set_call_environment(
+                            call_id=str(call_id),
+                            platform=platform_str,
+                            is_text_chat=is_text_chat
+                        )
+                        
+                        # 获取环境信息
+                        env_info = environment_fusion_engine.get_environment_info(str(call_id))
+                        
+                        # 通过WebSocket推送给前端
+                        payload = {
+                            "type": "environment_detected",
+                            "data": {
+                                "call_id": call_id,
+                                "platform": platform_str,
+                                "is_text_chat": is_text_chat,
+                                "environment_type": env_info["environment_type"],
+                                "description": env_info["description"],
+                                "active_modalities": env_info["active_modalities"],
+                                "weights": env_info["weights"]
+                            }
+                        }
+                        
+                        message_data = {
+                            "user_id": user_id,
+                            "payload": payload
+                        }
+                        
+                        r = get_redis_pool()
+                        r.publish("fraud_alerts", json.dumps(message_data, ensure_ascii=False))
+                        logger.info(f"[环境感知] 环境识别结果已推送到前端: call_id={call_id}, env={env_info['environment_type']}, is_text_chat={is_text_chat}")
+                        
+                        # 根据环境调整后续检测策略
+                        if is_text_chat:
+                            logger.info(f"[环境感知] 检测到文字聊天场景，建议前端关闭音频/视频检测，专注文本分析")
+                        elif platform_str in ["wechat", "qq"]:
+                            logger.info(f"[环境感知] 检测到{platform_str}语音聊天，启用音频+文本检测")
+                        elif platform_str == "phone":
+                            logger.info(f"[环境感知] 检测到电话通话，启用音频+文本检测")
+                        elif platform_str == "video_call":
+                            logger.info(f"[环境感知] 检测到视频通话，启用三模态检测")
+                            
+                    except Exception as env_e:
+                        logger.warning(f"[环境感知] 环境设置或推送失败: {env_e}")
                 
                 # 计算对话哈希
                 dialogue_hash = image_ocr_service.calculate_dialogue_hash(extracted_text)

@@ -19,7 +19,7 @@ from app.schemas import ResponseModel
 
 from app.services.memory_service import memory_service
 from app.services.llm_service import llm_service
-from app.services.risk_fusion_engine import fusion_engine_v2
+from app.services.risk_fusion_engine import fusion_engine_v2, environment_fusion_engine
 from app.core.logger import get_logger
 
 logger = get_logger(__name__)
@@ -734,4 +734,246 @@ async def get_evidence_detail(
         code=200,
         message="获取证据详情成功",
         data=evidence_detail
+    )
+
+
+@router.get("/{call_id}/environment", response_model=ResponseModel)
+async def get_call_environment(
+    call_id: int,
+    current_user_id: int = Depends(get_current_user_id),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    获取通话环境信息（平台类型、启用的检测模态等）
+    
+    前端可根据此信息动态调整检测任务
+    """
+    # 1. 查询通话记录
+    result = await db.execute(
+        select(CallRecord).where(
+            CallRecord.call_id == call_id,
+            CallRecord.user_id == current_user_id
+        )
+    )
+    record = result.scalar_one_or_none()
+    
+    if not record:
+        raise HTTPException(status_code=404, detail="通话记录不存在")
+    
+    # 2. 获取环境信息
+    env_info = environment_fusion_engine.get_environment_info(str(call_id))
+    
+    # 3. 补充平台信息
+    env_info["platform"] = record.platform.value if record.platform else "unknown"
+    env_info["target_name"] = record.target_name
+    env_info["caller_number"] = record.caller_number
+    
+    return ResponseModel(
+        code=200,
+        message="获取环境信息成功",
+        data=env_info
+    )
+
+
+@router.post("/{call_id}/environment", response_model=ResponseModel)
+async def set_call_environment(
+    call_id: int,
+    platform: str = Query(..., description="平台类型: wechat/qq/phone/video_call/other"),
+    is_text_chat: bool = Query(False, description="是否为纯文字聊天"),
+    current_user_id: int = Depends(get_current_user_id),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    设置通话环境（通常由后端OCR识别后自动调用，也可由前端手动设置）
+    """
+    # 1. 查询通话记录
+    result = await db.execute(
+        select(CallRecord).where(
+            CallRecord.call_id == call_id,
+            CallRecord.user_id == current_user_id
+        )
+    )
+    record = result.scalar_one_or_none()
+    
+    if not record:
+        raise HTTPException(status_code=404, detail="通话记录不存在")
+    
+    # 2. 设置环境
+    environment_fusion_engine.set_call_environment(
+        call_id=str(call_id),
+        platform=platform,
+        is_text_chat=is_text_chat
+    )
+    
+    # 3. 获取更新后的环境信息
+    env_info = environment_fusion_engine.get_environment_info(str(call_id))
+    
+    # 4. 通过WebSocket推送给前端
+    try:
+        from app.services.notification_service import notification_service
+        import json
+        
+        payload = {
+            "type": "environment_detected",
+            "data": {
+                "call_id": call_id,
+                "platform": platform,
+                "is_text_chat": is_text_chat,
+                "environment_type": env_info["environment_type"],
+                "description": env_info["description"],
+                "active_modalities": env_info["active_modalities"]
+            }
+        }
+        
+        message_data = {
+            "user_id": current_user_id,
+            "payload": payload
+        }
+        
+        notification_service.redis.publish("fraud_alerts", json.dumps(message_data))
+        logger.info(f"环境识别结果已推送到前端: call_id={call_id}, env={env_info['environment_type']}")
+    except Exception as e:
+        logger.warning(f"WebSocket推送环境信息失败: {e}")
+    
+    return ResponseModel(
+        code=200,
+        message="环境设置成功",
+        data=env_info
+    )
+
+
+class EmergencyAlertRequest(BaseModel):
+    call_id: int
+    alert_type: str = "emergency"  # emergency: 紧急报警, suspicious: 可疑行为
+    message: Optional[str] = None
+
+
+@router.post("/{call_id}/emergency-alert", response_model=ResponseModel)
+async def trigger_emergency_alert(
+    call_id: int,
+    request: EmergencyAlertRequest,
+    current_user_id: int = Depends(get_current_user_id),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    一键报警/紧急求助
+    
+    当用户遭遇高风险诈骗时，触发紧急报警：
+    1. 向家庭组所有管理员发送紧急通知（WebSocket + 邮件）
+    2. 记录报警日志
+    3. 可选：触发自动录音保存证据
+    """
+    from app.models.family_group import FamilyAdmin, FamilyGroup
+    from app.services.notification_service import notification_service
+    from app.services.email_service import email_service
+    import json
+    
+    # 1. 验证通话记录存在且属于当前用户
+    result = await db.execute(
+        select(CallRecord).where(
+            and_(
+                CallRecord.id == call_id,
+                CallRecord.user_id == current_user_id
+            )
+        )
+    )
+    call_record = result.scalar_one_or_none()
+    
+    if not call_record:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="通话记录不存在"
+        )
+    
+    # 2. 获取用户信息
+    user_result = await db.execute(
+        select(User).where(User.user_id == current_user_id)
+    )
+    user = user_result.scalar_one_or_none()
+    
+    if not user or not user.family_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="用户未加入家庭组，无法发送报警"
+        )
+    
+    # 3. 查询家庭组所有管理员
+    admins_result = await db.execute(
+        select(FamilyAdmin, User)
+        .join(User, FamilyAdmin.user_id == User.user_id)
+        .where(FamilyAdmin.family_id == user.family_id)
+    )
+    admins = admins_result.all()
+    
+    if not admins:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="家庭组没有管理员，无法发送报警"
+        )
+    
+    # 4. 构造紧急报警消息
+    timestamp = datetime.now().isoformat()
+    alert_message = request.message or f"用户 {user.name or user.username} 触发了一键报警，可能正在遭遇诈骗！"
+    
+    emergency_payload = {
+        "type": "emergency_alert",
+        "data": {
+            "title": "🚨 紧急报警",
+            "message": alert_message,
+            "victim_id": current_user_id,
+            "victim_name": user.name or user.username,
+            "victim_phone": user.phone,
+            "call_id": call_id,
+            "family_id": user.family_id,
+            "timestamp": timestamp,
+            "display_mode": "fullscreen",  # 全屏显示
+            "action": "alarm",  # 响铃 + 震动
+            "alert_type": request.alert_type
+        }
+    }
+    
+    # 5. 向所有管理员发送紧急通知
+    notified_count = 0
+    for admin_record, admin_user in admins:
+        # WebSocket 推送
+        notification_service._publish_to_redis(admin_user.user_id, emergency_payload)
+        notified_count += 1
+        logger.info(f"紧急报警已发送给管理员 {admin_user.user_id} ({admin_record.admin_role})")
+        
+        # 邮件通知
+        if admin_user.email:
+            try:
+                await email_service.send_guardian_alert(
+                    to_email=admin_user.email,
+                    victim_name=user.name or user.username,
+                    risk_level="critical",
+                    details=f"【一键报警】{alert_message}"
+                )
+            except Exception as e:
+                logger.warning(f"发送报警邮件失败: {e}")
+    
+    # 6. 记录报警日志
+    from app.models.message_log import MessageLog
+    alert_log = MessageLog(
+        user_id=current_user_id,
+        call_id=call_id,
+        msg_type="emergency_alert",
+        risk_level="critical",
+        title="一键报警",
+        content=alert_message,
+        is_read=False
+    )
+    db.add(alert_log)
+    await db.commit()
+    
+    logger.info(f"一键报警处理完成: 通知了 {notified_count} 位管理员")
+    
+    return ResponseModel(
+        code=200,
+        message=f"紧急报警已发送，已通知 {notified_count} 位家庭管理员",
+        data={
+            "alert_id": alert_log.id,
+            "notified_admins": notified_count,
+            "timestamp": timestamp
+        }
     )

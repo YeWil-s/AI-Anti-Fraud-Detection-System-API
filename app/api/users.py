@@ -4,7 +4,7 @@
 from datetime import datetime
 from app.models.call_record import CallRecord
 from app.services.llm_service import llm_service
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from typing import List

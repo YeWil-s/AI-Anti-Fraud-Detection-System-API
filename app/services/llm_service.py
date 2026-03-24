@@ -117,12 +117,112 @@ class LLMService:
                 "analysis": "大模型调用异常，降级通过", "advice": "系统繁忙"
             }
 
+    def _get_scene_specific_prompt(self, call_type: str) -> str:
+        """
+        根据通话场景获取特定的检测提示
+        
+        Args:
+            call_type: 通话类型/场景描述
+            
+        Returns:
+            场景特定的提示词
+        """
+        call_type_lower = call_type.lower()
+        
+        # 纯文字聊天场景
+        if "文字" in call_type or "文本" in call_type or "qq消息" in call_type_lower or "微信消息" in call_type_lower:
+            return """
+【文字聊天场景专项检测要点】：
+1. 聊天双方身份识别：
+   - 仔细分析对话中双方的身份标识（昵称、头像位置、消息气泡颜色）
+   - 识别哪一方是用户（被保护对象），哪一方是陌生人/可疑对象
+   - 在分析中明确指出可疑消息的发送者身份
+
+2. 文字聊天特有风险：
+   - 重点关注话术套路：杀猪盘培养感情、刷单返利诱导、冒充客服退款
+   - 识别诱导性语言："点击链接"、"下载APP"、"先垫付小额"
+   - 注意紧急性话术："限时"、"名额有限"、"马上截止"
+   - 警惕信息收集：索要身份证号、银行卡、验证码、密码
+
+3. 对话上下文分析：
+   - 分析多轮对话中的意图演变（从正常聊天转向诱导）
+   - 识别"钓鱼"过程：先建立信任，后实施诈骗
+   - 标注可疑消息的发送方和接收方
+"""
+        
+        # 语音聊天场景（QQ/微信语音）
+        elif "语音" in call_type or "语音聊天" in call_type:
+            return """
+【语音聊天场景专项检测要点】：
+1. 语音伪造识别：
+   - 结合音频置信度判断是否为AI合成语音
+   - 注意变声特征：声音不自然、背景杂音异常、语速机械
+   - 警惕"熟人"声音：可能是语音克隆技术伪造
+
+2. 语音聊天特有风险：
+   - 紧急性诱导："马上转账"、"来不及解释了"
+   - 情感操控：利用亲情、友情、爱情建立信任
+   - 信息确认：语音中索要敏感信息（验证码、密码）
+
+3. 多模态融合：
+   - 结合文字转写内容分析语音意图
+   - 音频置信度高 + 诱导性话术 = 高风险
+"""
+        
+        # 电话通话场景
+        elif "电话" in call_type or "phone" in call_type_lower:
+            return """
+【电话通话场景专项检测要点】：
+1. 来电身份识别：
+   - 注意陌生号码、境外号码、虚拟运营商号码
+   - 警惕"官方"来电：公检法、银行、客服、快递
+
+2. 电话诈骗特征：
+   - 冒充公检法："涉嫌洗钱"、"账户冻结"、"配合调查"
+   - 冒充客服："商品质量问题"、"退款"、"理赔"
+   - 冒充熟人："我是你领导"、"换号了"、"急需用钱"
+
+3. 语音伪造检测：
+   - 结合音频置信度判断声音真实性
+   - 注意机械音、回声异常、背景噪声不自然
+"""
+        
+        # 视频通话场景
+        elif "视频" in call_type or "video" in call_type_lower:
+            return """
+【视频通话场景专项检测要点】：
+1. 深度伪造识别：
+   - 结合视频置信度判断是否为AI换脸
+   - 注意面部不自然：眼神呆滞、表情僵硬、边缘模糊
+   - 唇形同步异常：说话与口型不匹配
+
+2. 视频通话特有风险：
+   - 屏幕共享诱导："指导操作"、"查看账户"
+   - 实时换脸：冒充熟人进行视频通话
+   - 环境伪造：虚假背景、预录视频
+
+3. 三模态融合：
+   - 视频异常 + 音频异常 + 诱导话术 = 极高风险
+   - 任何单一模态高度可疑都应引起重视
+"""
+        
+        # 默认场景
+        else:
+            return """
+【通用检测要点】：
+1. 综合分析多模态特征（文本、音频、视频）
+2. 识别常见诈骗剧本和话术套路
+3. 结合用户画像判断易受骗场景
+4. 注意意图的连贯性和演变过程
+"""
+
     async def analyze_multimodal_risk(self, user_input: str, chat_history: str, user_profile: str = "青壮年", 
         call_type: str = "普通通话", audio_conf: float = 0.0, 
         video_conf: str = "0.0", text_conf: float = 0.0, 
-        db = None, user_id: int = None) -> dict:
+        db = None, user_id: int = None,
+        chat_speakers: dict = None) -> dict:
         """
-        多模态融合风控分析（增强版：支持长期记忆）
+        多模态融合风控分析（增强版：支持长期记忆、场景自适应）
         
         Args:
             user_input: 用户输入文本
@@ -134,6 +234,7 @@ class LLMService:
             text_conf: 文本置信度
             db: 数据库会话
             user_id: 用户ID（用于获取长期记忆）
+            chat_speakers: 聊天双方信息 {"user": "用户昵称", "other": "对方昵称", "messages": [{"sender": "", "content": ""}]}
         """
         try:
             # 1. 获取知识库上下文 (RAG)
@@ -168,19 +269,86 @@ class LLMService:
                 except Exception as rec_e:
                     logger.warning(f"获取推荐案例失败: {rec_e}")
             
-            chain = self.prompt_template | self.llm | self.output_parser
+            # 4. 获取场景特定提示
+            scene_prompt = self._get_scene_specific_prompt(call_type)
+            
+            # 5. 构建聊天双方信息
+            speaker_info = ""
+            if chat_speakers:
+                speaker_info = f"""
+【聊天双方身份信息】：
+- 用户（被保护对象）：{chat_speakers.get('user', '未知')}
+- 对方（陌生人/可疑对象）：{chat_speakers.get('other', '未知')}
+
+【对话消息列表】（带发送者标识）：
+"""
+                for msg in chat_speakers.get('messages', []):
+                    sender = msg.get('sender', '未知')
+                    content = msg.get('content', '')
+                    speaker_info += f"[{sender}]: {content}\n"
+            
+            # 6. 构建动态提示词
+            dynamic_system_prompt = f"""你是一个专业的多模态反诈智能体助手，具备强大的意图识别与复杂逻辑推理能力。
+你的核心任务是：综合分析上下文与多模态特征，提取对方核心意图，并分类出具体的诈骗剧本。
+
+【当前用户的综合画像】：
+{user_profile}
+【当前通话场景】：
+{call_type}
+
+{scene_prompt}
+
+{speaker_info}
+
+注意：请严格根据用户的综合画像动态调整你的审查重点。以下是不同特征人群的易受骗场景：
+- 老年人：对推销特效药、高息理财、冒充公检法恐吓极度敏感。
+- 宝妈/全职：极易遇到"兼职刷单"、"买返利金"、"免费领母婴用品"诈骗。
+- 单身/离异：极易遇到"杀猪盘"（网恋诱导博彩/投资诈骗）。
+- 公司财务/出纳：极易遇到"冒充老板/公检法要求紧急对公转账"。
+- 学生/儿童：对免费领皮肤、解除防沉迷、注销校园贷、非官方低价票高度警惕。
+
+【十大典型诈骗剧本库】（请根据实际情况选择，参考以下类别）：
+1. 刷单返利诈骗 2. 虚假投资理财诈骗 3. 冒充客服诈骗 4. 冒充公检法诈骗 5. "杀猪盘"网恋诈骗
+6. 虚假贷款诈骗 7. 冒充领导熟人诈骗 8. 游戏产品虚假交易 9. 婚恋交友诈骗 10. 消除不良记录诈骗
+
+【知识库参考案例（RAG检索结果）】：
+{context}
+
+【近期对话上下文】（请结合这些历史记录来理解当前输入的真实意图）：
+{chat_history}
+
+【用户长期记忆（跨通话历史）】：
+{long_term_memory or "该用户暂无历史记忆。"}
+
+【底层AI模型多模态特征分析结果】（极其重要！）：
+- 本地文本预检(Text-ONNX)置信度：{text_conf:.4f} （0~1.0，>0.85通常代表话术高度匹配已知模板）
+- 语音伪造(Voice Clone)置信度：{audio_conf:.4f} （0~1.0，>0.8通常代表极大可能是AI合成变声）
+- 视频伪造(Deepfake)置信度：{video_conf} （0~1.0，>0.75通常代表画面经过AI换脸或唇形篡改）
+
+【多模态融合推理规则】：
+1. 意图提取与连贯性：骗子通常会将"我是领导"、"出事了"、"快打钱"分段发送。结合【最新输入】与【上下文】，准确提取对方的真实目的（intent）。
+2. 剧本匹配与交叉验证：如果文本涉及要钱/转账，且【语音/视频伪造置信度】高，必须判定 is_fraud=True，risk_level="fake"，并在 match_script 中给出对应的剧本名称。
+3. 纠正误报：如果语音置信度较高，但结合上下文完全是正常业务（intent为常规沟通，如送件），请结合常识判定为 safe，纠正底层误报。
+4. 双重印证：如果【本地文本预检置信度】极高(>0.9)，即使音视频真实，也说明内容极具煽动性，请重点提取其危险意图并倾向判定为高风险。
+5. 历史记忆参考：如果用户有多次忽略告警的记录，应提高告警强度；如果用户曾遭遇相似诈骗，应提前预警。
+6. 聊天双方识别：在文字聊天场景中，明确指出可疑消息的发送者身份（是用户发送的还是对方发送的）。
+
+请综合推理，并严格按照 JSON 格式输出最终裁定结果。
+{self.output_parser.get_format_instructions()}
+
+【极其重要】：你的输出必须且只能是一个合法的 JSON 对象。绝对不能包含任何 Markdown 语法（如 ```json ），不要包含任何解释性文本、不要有任何前言或后语。必须以大括号 {{ 开始，以大括号 }} 结束。"""
+            
+            # 创建动态提示词模板
+            from langchain.prompts import ChatPromptTemplate
+            dynamic_prompt_template = ChatPromptTemplate.from_messages([
+                ("system", dynamic_system_prompt),
+                ("human", "【当前最新输入(含语音转写)】：{user_input}")
+            ])
+            
+            chain = dynamic_prompt_template | self.llm | self.output_parser
             
             response = await chain.ainvoke({
-                "user_profile": user_profile,
-                "call_type": call_type,
-                "context": context,
-                "chat_history": chat_history,
-                "long_term_memory": long_term_memory or "该用户暂无历史记忆。",
-                "user_input": user_input,
-                "text_conf": f"{text_conf:.4f}",
-                "audio_conf": f"{audio_conf:.4f}",
-                "video_conf": video_conf,
-                "format_instructions": self.output_parser.get_format_instructions()
+                "user_input": user_input
             })
             
             # 4. 将推荐信息添加到响应中
