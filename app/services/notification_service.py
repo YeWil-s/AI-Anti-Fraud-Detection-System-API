@@ -5,13 +5,19 @@
 import json
 from datetime import datetime
 import redis
-from sqlalchemy import select
+from sqlalchemy import select, and_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.message_log import MessageLog
 from app.models.user import User
 from app.core.config import settings
 from app.core.logger import get_logger
+from app.core.defense_levels import (
+    get_display_mode,
+    should_notify_guardian,
+    should_send_email,
+    DEFENSE_LEVEL_MAP
+)
 from app.services.email_service import email_service
 
 logger = get_logger(__name__)
@@ -35,6 +41,27 @@ class NotificationService:
     ):
         """
         处理检测结果：记录日志并触发实时预警
+        
+        【重要】MessageLog 与 AIDetectionLog 职责边界：
+        
+        - AIDetectionLog：
+          * 由检测任务层 (detection_tasks.py) 直接写入
+          * 存储原始检测数据：置信度分数、模型版本、检测文本、证据快照等
+          * 用于审计、模型分析、报告生成
+          * 本服务不应写入 AIDetectionLog
+          
+        - MessageLog：
+          * 由本通知服务 (notification_service) 写入
+          * 存储用户可见的通知消息：标题、内容、风险等级、已读状态
+          * 用于前端消息列表展示、未读计数
+          * 不应包含原始模型数据（避免数据冗余）
+        
+        【幂等性保证】
+        在写入 MessageLog 前检查是否已存在相同 call_id + msg_type 的记录
+        如果已存在则跳过写入，避免 Celery 任务重试时产生重复数据
+        
+        【事务管理】
+        本方法不单独 commit，由调用方统一管理事务
         """
         timestamp = datetime.now().isoformat()
         
@@ -48,27 +75,37 @@ class NotificationService:
             title = f"{detection_type}检测通过"
             content = f"当前通话环境安全，未检测到异常{detection_type}特征。"
 
-        # 2. [存库] 记录至 MessageLog (受控于任务层的边缘触发逻辑，不会产生冗余写入)
-        new_log = MessageLog(
-            user_id=user_id,
-            call_id=call_id,
-            msg_type=msg_type,
-            risk_level=risk_level,
-            title=title,
-            content=content,
-            is_read=False
+        # 2. [幂等性检查] 避免 Celery 重试时重复写入
+        existing = await db.execute(
+            select(MessageLog).where(
+                and_(
+                    MessageLog.call_id == call_id,
+                    MessageLog.msg_type == msg_type,
+                    MessageLog.title == title  # 同一类型同一标题表示同一事件
+                )
+            )
         )
-        db.add(new_log)
-        try:
-            await db.commit()
-            logger.info(f"Log saved for User {user_id}: {title}")
-        except Exception as e:
-            logger.error(f"Failed to save message log: {e}")
-            await db.rollback()
+        if existing.scalar_one_or_none():
+            logger.info(f"Notification already exists for call_id={call_id}, msg_type={msg_type}, title={title}, skipping duplicate")
+            # 幂等性保证：已存在则跳过数据库写入，但仍进行 WebSocket 推送和监护人联动
+        else:
+            # 3. [存库] 记录至 MessageLog
+            new_log = MessageLog(
+                user_id=user_id,
+                call_id=call_id,
+                msg_type=msg_type,
+                risk_level=risk_level,
+                title=title,
+                content=content,
+                is_read=False
+            )
+            db.add(new_log)
+            # 不单独 commit，由调用方统一管理事务
+            logger.info(f"MessageLog added for User {user_id}: {title}")
 
-        # 3. [WebSocket] 发送给当前正在通话的用户
-        # 中高风险显示弹窗 (popup)，低风险仅显示通知 (toast)
-        display_mode = "popup" if risk_level in ["critical", "high", "medium"] else "toast"
+        # 4. [WebSocket] 发送给当前正在通话的用户
+        # 使用统一的防御等级映射获取显示模式
+        display_mode = get_display_mode(risk_level)
         
         ws_payload = {
             "type": msg_type,
@@ -84,13 +121,12 @@ class NotificationService:
         }
         self._publish_to_redis(user_id, ws_payload)
 
-        # 4. [监护人联动] 如果检测到高风险(Level 3)或中高风险(Level 2)且确定有风险，发送应用内消息给家庭成员
-        # Level 1 (medium) 不通知家人，只在用户端提示
-        if is_risk and risk_level in ["critical", "high"]:
+        # 5. [监护人联动] 使用统一的防御等级判断是否通知家人
+        if is_risk and should_notify_guardian(risk_level):
             await self._notify_family_in_app(db, user_id, ws_payload)
             
-        # 5. [邮件通知] 高风险(Level 3)时发送邮件给监护人
-        if is_risk and risk_level in ["critical"]:
+        # 6. [邮件通知] 使用统一的防御等级判断是否发送邮件
+        if is_risk and should_send_email(risk_level):
             await self._notify_guardian_by_email(db, user_id, risk_level, details)
             
     async def _notify_family_in_app(self, db: AsyncSession, current_user_id: int, original_payload: dict):
@@ -124,17 +160,16 @@ class NotificationService:
             return
         
         # 3. 构造给监护人的特定预警 Payload
-        # 根据风险等级决定显示模式
+        # 使用统一的防御等级映射获取显示模式和动作
         risk_level = original_payload['data']['risk_level']
-        if risk_level == 'critical':
-            display_mode = 'fullscreen'  # Level 3: 全屏
-            action = 'alarm'  # 响铃 + 震动
-        elif risk_level == 'high':
-            display_mode = 'popup'  # Level 2: 弹窗
-            action = 'vibrate'  # 震动
-        else:
-            display_mode = 'toast'  # Level 1: 提示
-            action = 'none'
+        display_mode = get_display_mode(risk_level)
+        
+        # 根据风险等级设置动作
+        action_map = {
+            'critical': 'alarm',   # 响铃 + 震动
+            'high': 'vibrate',     # 震动
+        }
+        action = action_map.get(risk_level, 'none')
         
         guardian_payload = {
             "type": "family_alert",
@@ -167,49 +202,15 @@ class NotificationService:
     ):
         """
         通过邮件向监护人发送预警
-        """
-        from app.models.family_group import FamilyAdmin
         
-        try:
-            # 1. 查询受害者信息
-            result = await db.execute(select(User).where(User.user_id == current_user_id))
-            victim = result.scalar_one_or_none()
-            
-            if not victim or not victim.family_id:
-                return
-
-            # 2. 查询该家庭组有邮箱的管理员
-            admins_result = await db.execute(
-                select(FamilyAdmin, User)
-                .join(User, FamilyAdmin.user_id == User.user_id)
-                .where(
-                    and_(
-                        FamilyAdmin.family_id == victim.family_id,
-                        User.email.isnot(None)
-                    )
-                )
-            )
-            admins = admins_result.all()
-            
-            if not admins:
-                logger.info(f"User {current_user_id} 的家庭组没有配置邮箱的管理员")
-                return
-            
-            # 3. 向每个管理员发送邮件
-            victim_name = victim.name or victim.username
-            
-            for admin_record, admin_user in admins:
-                if admin_user.email:
-                    await email_service.send_guardian_alert(
-                        to_email=admin_user.email,
-                        victim_name=victim_name,
-                        risk_level=risk_level,
-                        details=details
-                    )
-                    logger.info(f"Sent email alert for User {current_user_id} to Admin {admin_user.user_id} (role={admin_record.admin_role})")
-                    
-        except Exception as e:
-            logger.error(f"Failed to send guardian email: {e}")
+        已统一委托给 email_service.send_guardian_alert_by_family 处理
+        """
+        await email_service.send_guardian_alert_by_family(
+            db=db,
+            user_id=current_user_id,
+            risk_level=risk_level,
+            details=details
+        )
 
     def _publish_to_redis(self, user_id: int, payload: dict):
         """

@@ -153,3 +153,47 @@ body { margin: 0; font-family: 'PingFang SC', sans-serif; background: #f3f4f6; }
     color: #6b7280;
     font-size: 14px;
 }
+
+/* ==================== 响应式设计 ==================== */
+
+/* 平板适配 */
+@media (max-width: 1024px) {
+    .el-aside.sidebar {
+        width: 200px !important;
+    }
+    .stat-row .el-col {
+        flex: 0 0 50%;
+        max-width: 50%;
+    }
+}
+
+/* 手机适配 */
+@media (max-width: 768px) {
+    .el-aside.sidebar {
+        display: none; /* 或改为抽屉式 */
+    }
+    .el-main {
+        margin-left: 0;
+        padding: 10px;
+    }
+    .stat-row .el-col {
+        flex: 0 0 100%;
+        max-width: 100%;
+    }
+    .page-card {
+        padding: 15px;
+    }
+    /* 图表容器单列显示 */
+    .el-row[style*="gap"] {
+        flex-direction: column;
+    }
+    /* 表格横向滚动 */
+    .el-table {
+        overflow-x: auto;
+    }
+    /* 对话框全屏 */
+    .el-dialog {
+        width: 95% !important;
+        margin: 5vh auto !important;
+    }
+}

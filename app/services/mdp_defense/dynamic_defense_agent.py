@@ -1,9 +1,9 @@
 from typing import Optional
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.user import User
 from app.services.email_service import email_service
+from app.core.defense_levels import get_risk_level, DEFENSE_LEVEL_MAP
 from .mdp_env import UserVulnerability, RiskLevel, InteractionDepth, DefenseAction
 import json
 import os
@@ -73,6 +73,8 @@ class DynamicDefenseAgent:
         """
         向家庭组管理员发送邮件预警
         
+        已统一委托给 email_service.send_guardian_alert_by_family 处理
+        
         Args:
             db: 数据库会话
             user_id: 当前用户ID（受害者）
@@ -82,42 +84,12 @@ class DynamicDefenseAgent:
         Returns:
             bool: 是否成功发送邮件
         """
-        # 1. 查询受害者信息
-        result = await db.execute(select(User).where(User.user_id == user_id))
-        victim = result.scalar_one_or_none()
-        
-        if not victim or not victim.family_id:
-            return False
-        
-        # 2. 查询家庭组管理员（is_admin=True 且同一家庭组）
-        guardian_result = await db.execute(
-            select(User).where(
-                User.family_id == victim.family_id,
-                User.is_admin == True,
-                User.user_id != user_id,
-                User.email.isnot(None)  # 必须有邮箱
-            )
+        success_count = await email_service.send_guardian_alert_by_family(
+            db=db,
+            user_id=user_id,
+            risk_level=risk_level,
+            details=details
         )
-        guardians = guardian_result.scalars().all()
-        
-        if not guardians:
-            return False
-        
-        # 3. 向每个管理员发送邮件
-        victim_name = victim.name or victim.username
-        success_count = 0
-        
-        for guardian in guardians:
-            if guardian.email:
-                sent = await email_service.send_guardian_alert(
-                    to_email=guardian.email,
-                    victim_name=victim_name,
-                    risk_level=risk_level,
-                    details=details
-                )
-                if sent:
-                    success_count += 1
-        
         return success_count > 0
 
     def get_defense_action(
@@ -208,11 +180,14 @@ class DynamicDefenseAgent:
         action = self.get_best_action(vuln, risk, depth)
         
         # 5. 当防御等级为 LEVEL_3（强制阻断）时，发送邮件通知监护人
+        # 使用统一的防御等级映射获取 risk_level
+        mapped_risk_level = get_risk_level(action.value)
+        
         if action == DefenseAction.LEVEL_3:
             await self.notify_guardian_by_email(
                 db=db,
                 user_id=user_id,
-                risk_level=risk.name.lower(),
+                risk_level=mapped_risk_level,
                 details=details
             )
         

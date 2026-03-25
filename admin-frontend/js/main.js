@@ -22,6 +22,18 @@ const router = VueRouter.createRouter({
     routes,
 });
 
+// 路由权限守卫
+router.beforeEach((to, from, next) => {
+    const token = localStorage.getItem('admin_token');
+    // 如果访问的不是登录页，且没有 token，则可以提示或跳转
+    // 由于是管理后台，简单检查 token 存在性即可
+    if (!token && to.path !== '/login') {
+        // 如果没有登录页路由，则只记录警告，不阻止导航
+        console.warn('未检测到管理员认证信息');
+    }
+    next();
+});
+
 const app = Vue.createApp({
     data() {
         return { activePath: '/', currentRouteName: '仪表盘' }

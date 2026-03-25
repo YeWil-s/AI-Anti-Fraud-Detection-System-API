@@ -197,4 +197,42 @@ class RealtimeRecommendationResponse(BaseModel):
     slogans: List[SloganRecommendation]
     similarity_analysis: str
     alert_message: str
-    matched_fraud_types: List[str]  
+    matched_fraud_types: List[str]
+
+
+# ========== 消息日志相关 ==========
+class MessageLogResponse(BaseModel):
+    """消息日志响应模型"""
+    id: int
+    user_id: int
+    call_id: Optional[int] = None
+    msg_type: str
+    risk_level: str
+    title: str
+    content: str
+    is_read: bool
+    created_at: datetime
+    model_config = ConfigDict(from_attributes=True)
+
+
+# ========== 对话消息相关 ==========
+class ChatMessageResponse(BaseModel):
+    """对话消息响应模型"""
+    message_id: int
+    call_id: int
+    sequence: int
+    speaker: str
+    content: str
+    timestamp: Optional[datetime] = None
+    created_at: datetime
+    model_config = ConfigDict(from_attributes=True)
+
+
+# ========== 家庭组相关 ==========
+class FamilyGroupResponse(BaseModel):
+    """家庭组响应模型"""
+    id: int
+    group_name: str
+    admin_id: int
+    created_at: datetime
+    model_config = ConfigDict(from_attributes=True)  

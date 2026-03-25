@@ -51,6 +51,14 @@ async def is_primary_admin(db: AsyncSession, user_id: int, family_id: int) -> bo
     return result.scalar_one_or_none() is not None
 
 
+async def is_user_admin_anywhere(db: AsyncSession, user_id: int) -> bool:
+    """检查用户是否仍然是任意家庭组的管理员"""
+    result = await db.execute(
+        select(FamilyAdmin).where(FamilyAdmin.user_id == user_id).limit(1)
+    )
+    return result.scalar_one_or_none() is not None
+
+
 # =======================
 # 1. 创建家庭组
 # =======================
@@ -410,7 +418,8 @@ async def set_member_admin_role(
         # 取消管理员
         if existing_record:
             await db.delete(existing_record)
-            target_user.is_admin = False
+            # 检查用户是否还是其他家庭组的管理员
+            target_user.is_admin = await is_user_admin_anywhere(db, user_id)
             await db.commit()
         return ResponseModel(code=200, message=f"已取消 {target_user.username} 的管理员权限")
     
@@ -497,7 +506,6 @@ async def remove_family_member(
     
     # 6. 执行移除
     target_user.family_id = None
-    target_user.is_admin = False
     
     # 删除管理员记录（如果有）
     if target_role:
@@ -506,6 +514,9 @@ async def remove_family_member(
                 and_(FamilyAdmin.user_id == user_id, FamilyAdmin.family_id == family_id)
             )
         )
+    
+    # 检查用户是否还是其他家庭组的管理员，再决定 is_admin
+    target_user.is_admin = await is_user_admin_anywhere(db, user_id)
     
     await db.commit()
     logger.info(f"管理员 {current_user_id} 移除成员 {user_id}")
@@ -563,7 +574,8 @@ async def leave_family_group(
         )
         
         current_user.family_id = None
-        current_user.is_admin = False
+        # 检查用户是否还是其他家庭组的管理员
+        current_user.is_admin = await is_user_admin_anywhere(db, current_user_id)
         
         msg = "家庭组已解散"
         
@@ -572,7 +584,6 @@ async def leave_family_group(
         # 普通成员或副管理员退出
         # ==========================================
         current_user.family_id = None
-        current_user.is_admin = False
         
         # 删除管理员记录（如果有）
         if user_role:
@@ -584,6 +595,9 @@ async def leave_family_group(
                     )
                 )
             )
+        
+        # 检查用户是否还是其他家庭组的管理员
+        current_user.is_admin = await is_user_admin_anywhere(db, current_user_id)
         
         msg = "已退出家庭组"
     

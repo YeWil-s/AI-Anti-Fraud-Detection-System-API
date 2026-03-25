@@ -103,7 +103,7 @@ export default {
                             <div style="color:#64748b; margin-bottom:8px; font-size: 13px;">文本分析</div>
                             <div style="background: #fff; padding: 10px; border-radius: 4px; font-size: 13px;">
                                 <div>文本长度: {{ result.text_length }} 字符</div>
-                                <div>关键词密度: {{ ((result.hit_keywords.length / result.text_length) * 100).toFixed(2) }}%</div>
+                                <div>关键词密度: {{ (result.hit_keywords.reduce((sum, k) => sum + k.length, 0) / result.text_length * 100).toFixed(2) }}%</div>
                             </div>
                         </div>
                     </div>

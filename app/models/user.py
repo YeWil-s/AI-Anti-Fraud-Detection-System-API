@@ -17,7 +17,7 @@ class User(Base):
     username = Column(String(50), unique=True, index=True, nullable=False, comment="用户名")
     name = Column(String(50), nullable=True, comment="用户姓名")
     password_hash = Column(String(255), nullable=False, comment="密码哈希")
-    family_id = Column(Integer, ForeignKey("family_groups.id"), nullable=True, index=True, comment="所属家庭组ID（普通成员只能有一个）")
+    family_id = Column(Integer, ForeignKey("family_groups.id", ondelete="SET NULL"), nullable=True, index=True, comment="所属家庭组ID（普通成员只能有一个）")
     role_type = Column(String(20), default="青壮年", index=True, comment="角色类型(如老人、儿童、学生、青壮年)")
     gender = Column(String(10), nullable=True, comment="性别(男/女/未知)")
     profession = Column(String(50), nullable=True, comment="职业")

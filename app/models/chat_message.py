@@ -16,9 +16,12 @@ class ChatMessage(Base):
     sequence = Column(Integer, nullable=False, comment="消息序号")
     speaker = Column(String(20), nullable=False, comment="说话人: user/other/system")
     content = Column(Text, nullable=False, comment="消息内容")
-    timestamp = Column(DateTime(timezone=True), server_default=func.now(), 
-                       comment="消息时间")
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    # 消息实际发送/发生时间（由客户端或任务系统提供）
+    timestamp = Column(DateTime(timezone=True), nullable=True, 
+                       comment="消息实际发送/发生时间（由客户端或任务系统提供）")
+    # 数据库入库时间（系统自动生成）
+    created_at = Column(DateTime(timezone=True), server_default=func.now(),
+                        comment="数据库入库时间（系统自动生成）")
     
     def __repr__(self):
         return f"<ChatMessage(msg_id={self.message_id}, call_id={self.call_id}, seq={self.sequence})>"

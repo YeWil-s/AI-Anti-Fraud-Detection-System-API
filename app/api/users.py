@@ -500,39 +500,44 @@ async def get_user_guardian(
     db: AsyncSession = Depends(get_db)
 ):
     """
-    通过查询家庭组，动态获取监护人的手机号和信息
+    通过查询家庭组管理员表，动态获取监护人的手机号和信息
     """
+    from app.models.family_group import FamilyAdmin
+    
     # 1. 查询当前用户的 family_id
     result = await db.execute(select(User).where(User.user_id == current_user_id))
     user = result.scalar_one_or_none()
     
     if not user or not user.family_id:
         return ResponseModel(code=200, message="未绑定家庭组", data={"guardian": None})
-        
-    # 2. 在同一家庭组中，查找 is_admin=True 的用户（即监护人）
-    guardian_result = await db.execute(
-        select(User).where(
-            User.family_id == user.family_id,
-            User.is_admin == True,
-            User.user_id != current_user_id  # 排除自己
+    
+    # 2. 查询 FamilyAdmin 表获取该家庭组的所有管理员（排除自己）
+    guardians_result = await db.execute(
+        select(FamilyAdmin, User)
+        .join(User, FamilyAdmin.user_id == User.user_id)
+        .where(
+            FamilyAdmin.family_id == user.family_id,
+            FamilyAdmin.user_id != current_user_id  # 排除自己
         )
     )
-    guardians = guardian_result.scalars().all()
+    guardians = guardians_result.all()
     
     if not guardians:
-         return ResponseModel(code=200, message="家庭组内未设置监护人", data={"guardian": None})
-         
+        return ResponseModel(code=200, message="家庭组内未设置监护人", data={"guardian": None})
+    
     # 3. 返回监护人信息 (如果有多个监护人，这里返回列表)
     guardian_data = [
         {
-            "user_id": g.user_id, 
-            "name": g.name or g.username, 
-            "phone": g.phone
-        } for g in guardians
+            "user_id": admin_user.user_id,
+            "name": admin_user.name or admin_user.username,
+            "phone": admin_user.phone,
+            "admin_role": admin_record.admin_role
+        }
+        for admin_record, admin_user in guardians
     ]
     
     return ResponseModel(
-        code=200, 
-        message="获取监护人成功", 
+        code=200,
+        message="获取监护人成功",
         data={"guardians": guardian_data}
     )

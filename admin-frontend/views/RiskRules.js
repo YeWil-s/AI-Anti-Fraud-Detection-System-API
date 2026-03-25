@@ -38,7 +38,7 @@ export default {
                     placeholder="搜索关键词" 
                     style="width: 300px;"
                     clearable
-                    @input="handleSearch">
+                    @input="debouncedSearch">
                     <template #prefix>
                         <i class="ri-search-line"></i>
                     </template>
@@ -57,11 +57,32 @@ export default {
             </div>
             
             <el-table :data="filteredData" v-loading="loading" stripe border>
+                <template #empty>
+                    <el-empty description="暂无匹配的规则" :image-size="100" />
+                </template>
                 <el-table-column type="index" label="#" width="60" align="center"></el-table-column>
                 <el-table-column prop="rule_id" label="ID" width="80" align="center"></el-table-column>
                 <el-table-column prop="keyword" label="敏感词" min-width="150">
                      <template #default="{row}">
                         <el-tag effect="dark" size="large" style="font-size: 14px;">{{ row.keyword }}</el-tag>
+                    </template>
+                </el-table-column>
+                <el-table-column label="启用状态" width="100" align="center">
+                    <template #default="{row}">
+                        <el-switch
+                            v-model="row.is_enabled"
+                            @change="handleToggleRule(row)"
+                            inline-prompt
+                            active-text="启用"
+                            inactive-text="禁用"
+                            :loading="row._toggling"
+                        />
+                    </template>
+                </el-table-column>
+                <el-table-column prop="hit_count" label="命中次数" width="100" align="center">
+                    <template #default="{row}">
+                        <el-tag type="info" v-if="row.hit_count !== undefined">{{ row.hit_count }}</el-tag>
+                        <span v-else style="color: #999;">--</span>
                     </template>
                 </el-table-column>
                 <el-table-column prop="risk_level" label="风险等级" width="180" align="center">
@@ -93,9 +114,6 @@ export default {
                     </template>
                 </el-table-column>
             </el-table>
-
-            <!-- 空状态 -->
-            <el-empty v-if="!loading && filteredData.length === 0" description="暂无匹配的规则"></el-empty>
 
             <!-- 新增规则对话框 -->
             <el-dialog v-model="dialogVisible" title="添加新规则" width="550px">
@@ -140,6 +158,12 @@ export default {
                             {{ currentRule.action=='block'?'阻断':'告警' }}
                         </el-tag>
                     </el-descriptions-item>
+                    <el-descriptions-item label="命中次数">{{ currentRule.hit_count !== undefined ? currentRule.hit_count : '--' }}</el-descriptions-item>
+                    <el-descriptions-item label="启用状态">
+                        <el-tag :type="currentRule.is_enabled !== false ? 'success' : 'info'">
+                            {{ currentRule.is_enabled !== false ? '已启用' : '已禁用' }}
+                        </el-tag>
+                    </el-descriptions-item>
                     <el-descriptions-item label="描述">{{ currentRule.description || '无' }}</el-descriptions-item>
                     <el-descriptions-item label="创建时间">{{ formatTime(currentRule.created_at) }}</el-descriptions-item>
                     <el-descriptions-item label="更新时间">{{ formatTime(currentRule.updated_at) }}</el-descriptions-item>
@@ -159,7 +183,8 @@ export default {
             filterAction: '',
             filterLevel: '',
             form: { keyword: '', risk_level: 3, action: 'alert', description: '' },
-            charts: {}
+            charts: {},
+            searchTimer: null
         }
     },
     computed: {
@@ -182,7 +207,13 @@ export default {
         async loadData() {
             this.loading = true;
             try {
-                this.tableData = await api.getRules();
+                const data = await api.getRules();
+                // 为每条规则初始化 is_enabled 字段（如果后端没有提供，默认为 true）
+                this.tableData = data.map(rule => ({
+                    ...rule,
+                    is_enabled: rule.is_enabled !== undefined ? rule.is_enabled : true,
+                    _toggling: false
+                }));
                 this.filteredData = this.tableData;
                 this.$nextTick(() => this.initCharts());
             } finally {
@@ -237,6 +268,14 @@ export default {
         handleResize() {
             Object.values(this.charts).forEach(c => c && c.resize());
         },
+        debouncedSearch() {
+            if (this.searchTimer) {
+                clearTimeout(this.searchTimer);
+            }
+            this.searchTimer = setTimeout(() => {
+                this.handleSearch();
+            }, 300);
+        },
         handleSearch() {
             this.filteredData = this.tableData.filter(row => {
                 const matchKeyword = !this.searchKeyword || 
@@ -273,6 +312,26 @@ export default {
         viewDetail(row) {
             this.currentRule = row;
             this.detailVisible = true;
+        },
+        async handleToggleRule(row) {
+            row._toggling = true;
+            try {
+                // 尝试调用后端API更新规则状态
+                if (typeof api.updateRuleStatus === 'function') {
+                    await api.updateRuleStatus(row.rule_id, row.is_enabled);
+                    ElementPlus.ElMessage.success(row.is_enabled ? '规则已启用' : '规则已禁用');
+                } else {
+                    // 后端API不支持时，仅前端状态变更
+                    ElementPlus.ElMessage.info(row.is_enabled ? '规则已启用（仅前端状态）' : '规则已禁用（仅前端状态）');
+                }
+            } catch (error) {
+                // 失败时回滚状态
+                row.is_enabled = !row.is_enabled;
+                console.error('切换规则状态失败:', error);
+                ElementPlus.ElMessage.error('操作失败');
+            } finally {
+                row._toggling = false;
+            }
         },
         formatTime(time) {
             if (!time) return '-';

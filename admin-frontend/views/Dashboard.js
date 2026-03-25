@@ -11,8 +11,11 @@ export default {
                         <div class="stat-info">
                             <div class="num">{{ stats.total_users || 0 }}</div>
                             <div class="label">注册用户总数</div>
-                            <div class="trend" v-if="stats.new_users_today">
-                                <el-tag size="small" type="success">+{{ stats.new_users_today }} 今日</el-tag>
+                            <div class="trend">
+                                <el-tag size="small" type="success">+{{ stats.new_users_today || 0 }} 今日</el-tag>
+                                <span style="margin-left: 8px; font-size: 12px;" :style="{color: (stats.users_growth_rate || 0) >= 0 ? '#10b981' : '#dc2626'}">
+                                    {{ formatGrowthRate(stats.users_growth_rate) }}
+                                </span>
                             </div>
                         </div>
                     </div>
@@ -23,8 +26,11 @@ export default {
                         <div class="stat-info">
                             <div class="num">{{ stats.total_calls || 0 }}</div>
                             <div class="label">累计通话检测</div>
-                            <div class="trend" v-if="stats.detections_today">
-                                <el-tag size="small" type="info">{{ stats.detections_today }} 今日</el-tag>
+                            <div class="trend">
+                                <el-tag size="small" type="info">{{ stats.detections_today || 0 }} 今日</el-tag>
+                                <span style="margin-left: 8px; font-size: 12px;" :style="{color: (stats.calls_growth_rate || 0) >= 0 ? '#10b981' : '#dc2626'}">
+                                    {{ formatGrowthRate(stats.calls_growth_rate) }}
+                                </span>
                             </div>
                         </div>
                     </div>
@@ -35,8 +41,11 @@ export default {
                         <div class="stat-info">
                             <div class="num">{{ stats.fraud_blocked || 0 }}</div>
                             <div class="label">拦截诈骗次数</div>
-                            <div class="trend" v-if="stats.blocked_today">
-                                <el-tag size="small" type="danger">{{ stats.blocked_today }} 今日</el-tag>
+                            <div class="trend">
+                                <el-tag size="small" type="danger">{{ stats.blocked_today || 0 }} 今日</el-tag>
+                                <span style="margin-left: 8px; font-size: 12px;" :style="{color: (stats.blocked_growth_rate || 0) >= 0 ? '#10b981' : '#dc2626'}">
+                                    {{ formatGrowthRate(stats.blocked_growth_rate) }}
+                                </span>
                             </div>
                         </div>
                     </div>
@@ -115,13 +124,23 @@ export default {
                                 <el-radio-button :label="30">近30天</el-radio-button>
                             </el-radio-group>
                         </div>
-                        <div id="chartTrend" style="width:100%; height:350px;"></div>
+                        <div v-if="chartErrors.trend" style="width:100%; height:350px; display:flex; align-items:center; justify-content:center;">
+                            <el-empty description="数据加载失败" :image-size="80">
+                                <el-button size="small" @click="loadTrendData">重新加载</el-button>
+                            </el-empty>
+                        </div>
+                        <div v-else id="chartTrend" style="width:100%; height:350px;"></div>
                     </div>
                 </el-col>
                 <el-col :span="8">
                     <div class="page-card">
                         <div class="page-title">诈骗类型分布</div>
-                        <div id="chartFraudType" style="width:100%; height:350px;"></div>
+                        <div v-if="chartErrors.fraudType" style="width:100%; height:350px; display:flex; align-items:center; justify-content:center;">
+                            <el-empty description="数据加载失败" :image-size="80">
+                                <el-button size="small" @click="loadFraudTypeData">重新加载</el-button>
+                            </el-empty>
+                        </div>
+                        <div v-else id="chartFraudType" style="width:100%; height:350px;"></div>
                     </div>
                 </el-col>
             </el-row>
@@ -131,7 +150,12 @@ export default {
                 <el-col :span="12">
                     <div class="page-card" style="padding-bottom: 10px;">
                         <div class="page-title">24小时检测分布</div>
-                        <div id="chartHourly" style="width:100%; height:260px;"></div>
+                        <div v-if="chartErrors.hourly" style="width:100%; height:260px; display:flex; align-items:center; justify-content:center;">
+                            <el-empty description="数据加载失败" :image-size="60">
+                                <el-button size="small" @click="loadHourlyData">重新加载</el-button>
+                            </el-empty>
+                        </div>
+                        <div v-else id="chartHourly" style="width:100%; height:260px;"></div>
                     </div>
                 </el-col>
                 <el-col :span="12">
@@ -151,6 +175,9 @@ export default {
                             显示最近20条AI检测记录，包含风险评分和检测类型
                         </div>
                         <el-table :data="recentDetections" stripe style="margin-top: 15px; width: 100%;" :header-cell-style="{background:'#f8fafc', color:'#475569', fontWeight:'600'}">
+                            <template #empty>
+                                <el-empty description="暂无检测记录" :image-size="80" />
+                            </template>
                             <el-table-column prop="log_id" label="ID" width="80" align="center"></el-table-column>
                             <el-table-column prop="call_id" label="通话ID" width="100" align="center"></el-table-column>
                             <el-table-column prop="caller_number" label="来电号码" width="150" align="center"></el-table-column>
@@ -192,7 +219,12 @@ export default {
             hourlyData: { hours: [], counts: [] },
             recentDetections: [],
             systemHealth: {},
-            charts: {}
+            charts: {},
+            chartErrors: {
+                trend: false,
+                fraudType: false,
+                hourly: false
+            }
         }
     },
     async mounted() {
@@ -232,16 +264,67 @@ export default {
             this.stats = await api.getStats();
         },
         async loadTrendData() {
-            this.trendData = await api.getTrendStats(this.trendDays);
-            this.updateTrendChart();
+            try {
+                this.chartErrors.trend = false;
+                const data = await api.getTrendStats(this.trendDays);
+                // 数据有效性检查
+                if (!Array.isArray(data)) {
+                    console.warn('趋势数据格式无效: 期望数组');
+                    this.trendData = [];
+                } else {
+                    // 检查数组元素是否有必要字段
+                    this.trendData = data.filter(item => 
+                        item && typeof item.date !== 'undefined'
+                    );
+                }
+                this.updateTrendChart();
+            } catch (e) {
+                console.error('加载趋势数据失败:', e);
+                this.chartErrors.trend = true;
+                this.trendData = [];
+            }
         },
         async loadFraudTypeData() {
-            this.fraudTypeData = await api.getFraudTypeStats();
-            this.updateFraudTypeChart();
+            try {
+                this.chartErrors.fraudType = false;
+                const data = await api.getFraudTypeStats();
+                // 数据有效性检查
+                if (!Array.isArray(data)) {
+                    console.warn('诈骗类型数据格式无效: 期望数组');
+                    this.fraudTypeData = [];
+                } else {
+                    // 检查数组元素是否有必要字段
+                    this.fraudTypeData = data.filter(item => 
+                        item && item.type && typeof item.value === 'number'
+                    );
+                }
+                this.updateFraudTypeChart();
+            } catch (e) {
+                console.error('加载诈骗类型数据失败:', e);
+                this.chartErrors.fraudType = true;
+                this.fraudTypeData = [];
+            }
         },
         async loadHourlyData() {
-            this.hourlyData = await api.getHourlyStats();
-            this.updateHourlyChart();
+            try {
+                this.chartErrors.hourly = false;
+                const data = await api.getHourlyStats();
+                // 数据有效性检查
+                if (!data || typeof data !== 'object') {
+                    console.warn('小时数据格式无效');
+                    this.hourlyData = { hours: [], counts: [] };
+                } else {
+                    this.hourlyData = {
+                        hours: Array.isArray(data.hours) ? data.hours : [],
+                        counts: Array.isArray(data.counts) ? data.counts : []
+                    };
+                }
+                this.updateHourlyChart();
+            } catch (e) {
+                console.error('加载小时数据失败:', e);
+                this.chartErrors.hourly = true;
+                this.hourlyData = { hours: [], counts: [] };
+            }
         },
         async loadRecentDetections() {
             this.recentDetections = await api.getRecentDetections(10);
@@ -299,12 +382,29 @@ export default {
             setTimeout(() => this.charts.trend?.resize(), 100);
         },
         updateTrendChart() {
-            if (!this.charts.trend || !this.trendData.length) return;
+            if (!this.charts.trend) return;
             
-            const dates = this.trendData.map(d => d.date);
-            const detections = this.trendData.map(d => d.detections);
-            const blocked = this.trendData.map(d => d.blocked);
-            const newUsers = this.trendData.map(d => d.new_users);
+            // 数据有效性检查
+            if (!Array.isArray(this.trendData) || this.trendData.length === 0) {
+                // 显示空状态
+                this.charts.trend.setOption({
+                    title: {
+                        text: '暂无数据',
+                        left: 'center',
+                        top: 'center',
+                        textStyle: { color: '#999', fontSize: 14 }
+                    },
+                    xAxis: { show: false },
+                    yAxis: { show: false },
+                    series: []
+                });
+                return;
+            }
+            
+            const dates = this.trendData.map(d => d.date || '');
+            const detections = this.trendData.map(d => d.detections || 0);
+            const blocked = this.trendData.map(d => d.blocked || 0);
+            const newUsers = this.trendData.map(d => d.new_users || 0);
             
             this.charts.trend.setOption({
                 tooltip: { trigger: 'axis' },
@@ -512,6 +612,11 @@ export default {
         formatTime(time) {
             if (!time) return '-';
             return new Date(time).toLocaleString();
+        },
+        formatGrowthRate(rate) {
+            if (rate === undefined || rate === null) return '--';
+            const prefix = rate >= 0 ? '+' : '';
+            return `${prefix}${rate.toFixed(1)}%`;
         }
     }
 }

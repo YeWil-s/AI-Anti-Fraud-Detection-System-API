@@ -239,6 +239,25 @@ export default {
                     </el-table>
                 </div>
             </el-dialog>
+
+            <!-- 添加成员对话框 -->
+            <el-dialog v-model="showAddMemberDialog" title="添加成员" width="450px">
+                <el-form :model="addMemberForm" label-width="80px">
+                    <el-form-item label="用户ID">
+                        <el-input v-model="addMemberForm.userId" placeholder="请输入要添加的用户ID" type="number" />
+                    </el-form-item>
+                    <el-alert
+                        title="提示：请输入已注册用户的ID，用户将被添加到当前家庭组"
+                        type="info"
+                        :closable="false"
+                        style="margin-top: 10px;"
+                    />
+                </el-form>
+                <template #footer>
+                    <el-button @click="showAddMemberDialog = false">取消</el-button>
+                    <el-button type="primary" @click="doAddMember" :loading="addingMember">确认添加</el-button>
+                </template>
+            </el-dialog>
         </div>
     `,
     data() {
@@ -253,8 +272,10 @@ export default {
             detailVisible: false,
             membersVisible: false,
             showAddMemberDialog: false,
+            addingMember: false,
             currentFamily: null,
-            createForm: { name: '' }
+            createForm: { name: '' },
+            addMemberForm: { userId: '' }
         };
     },
     mounted() {
@@ -382,14 +403,34 @@ export default {
                     '警告', 
                     { type: 'warning' }
                 );
-                // 调用删除API（需要后端实现）
-                // await api.deleteFamilyGroup(family.id);
+                await api.deleteFamilyGroup(family.id);
                 ElementPlus.ElMessage.success('删除成功');
                 this.loadFamilies();
             } catch (error) {
                 if (error !== 'cancel') {
                     console.error('删除失败:', error);
+                    ElementPlus.ElMessage.error('删除失败');
                 }
+            }
+        },
+        async doAddMember() {
+            if (!this.addMemberForm.userId) {
+                ElementPlus.ElMessage.warning('请输入用户ID');
+                return;
+            }
+            this.addingMember = true;
+            try {
+                await api.addFamilyMember(this.currentFamily.id, this.addMemberForm.userId);
+                ElementPlus.ElMessage.success('成员添加成功');
+                this.showAddMemberDialog = false;
+                this.addMemberForm.userId = '';
+                // 刷新成员列表
+                this.manageMembers(this.currentFamily);
+            } catch (error) {
+                console.error('添加成员失败:', error);
+                ElementPlus.ElMessage.error('添加失败，请检查用户ID是否正确');
+            } finally {
+                this.addingMember = false;
             }
         },
         getRoleType(role) {

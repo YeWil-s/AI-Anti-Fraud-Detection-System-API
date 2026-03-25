@@ -25,7 +25,7 @@ class LongTermMemoryService:
         content: str,
         importance: int = 3,
         source_call_id: Optional[int] = None
-    ) -> UserMemory:
+    ) -> Optional[UserMemory]:
         """
         添加新的长期记忆
         

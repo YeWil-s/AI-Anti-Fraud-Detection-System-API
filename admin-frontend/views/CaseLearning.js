@@ -489,6 +489,12 @@ export default {
         handleFileChange(file) {
             if (!file) return;
             
+            // 文件大小检查（5MB限制）
+            if (file.raw && file.raw.size > 5 * 1024 * 1024) {
+                ElementPlus.ElMessage.error('文件大小不能超过5MB');
+                return;
+            }
+            
             const reader = new FileReader();
             const fileName = file.name.toLowerCase();
             

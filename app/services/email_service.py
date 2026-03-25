@@ -6,7 +6,10 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.utils import formataddr
 import aiosmtplib
-from typing import Optional
+from typing import Optional, Dict, Any
+
+from sqlalchemy import select, and_
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.core.logger import get_logger
@@ -65,17 +68,29 @@ class EmailService:
             
             # 连接到 SMTP 服务器并发送
             # 根据端口选择连接方式：465端口使用SSL，587端口使用STARTTLS
-            use_ssl = (self.smtp_port == 465)
-            
-            await aiosmtplib.send(
-                message,
-                hostname=self.smtp_host,
-                port=self.smtp_port,
-                username=self.smtp_user,
-                password=self.smtp_password,
-                use_tls=use_ssl,           # 465端口使用SSL
-                start_tls=not use_ssl,     # 587端口使用STARTTLS
-            )
+            # aiosmtplib 参数说明：
+            #   use_tls=True: 直接SSL连接（465端口）
+            #   start_tls=True: 升级到TLS连接（587端口）
+            if self.smtp_port == 465:
+                # 465端口使用直接SSL连接
+                await aiosmtplib.send(
+                    message,
+                    hostname=self.smtp_host,
+                    port=self.smtp_port,
+                    username=self.smtp_user,
+                    password=self.smtp_password,
+                    use_tls=True,
+                )
+            else:
+                # 587或其他端口使用STARTTLS
+                await aiosmtplib.send(
+                    message,
+                    hostname=self.smtp_host,
+                    port=self.smtp_port,
+                    username=self.smtp_user,
+                    password=self.smtp_password,
+                    start_tls=self.smtp_tls,  # 根据配置决定是否启用STARTTLS
+                )
             
             logger.info(f"邮件发送成功: {to_email}, 主题: {subject}")
             return True
@@ -190,6 +205,92 @@ class EmailService:
         """
         
         return await self.send_email(to_email, subject, body, html_body)
+
+    async def send_guardian_alert_by_family(
+        self,
+        db: AsyncSession,
+        user_id: int,
+        risk_level: str,
+        call_info: Optional[Dict[str, Any]] = None,
+        details: str = ""
+    ) -> int:
+        """
+        【统一邮件通知接口】向用户所属家庭组的所有管理员发送预警邮件
+        
+        完整流程：
+        1. 查询用户信息及所属 family_id
+        2. 查询 FamilyAdmin 表找到该家庭的所有管理员
+        3. 查询每个管理员的邮箱地址
+        4. 向有邮箱的管理员发送告警邮件
+        
+        Args:
+            db: 数据库会话
+            user_id: 当前用户ID（潜在受害者）
+            risk_level: 风险等级 (critical/high/medium/low)
+            call_info: 通话相关信息字典，可包含 call_id, caller_number 等
+            details: 风险详情描述
+            
+        Returns:
+            int: 成功发送邮件的数量
+        """
+        # 延迟导入避免循环依赖
+        from app.models.user import User
+        from app.models.family_group import FamilyAdmin
+        
+        try:
+            # 1. 查询受害者信息
+            result = await db.execute(select(User).where(User.user_id == user_id))
+            victim = result.scalar_one_or_none()
+            
+            if not victim:
+                logger.info(f"用户 {user_id} 不存在，跳过邮件通知")
+                return 0
+                
+            if not victim.family_id:
+                logger.info(f"用户 {user_id} 未加入家庭组，跳过邮件通知")
+                return 0
+
+            # 2. 查询该家庭组有邮箱的管理员（排除受害者本人）
+            admins_result = await db.execute(
+                select(FamilyAdmin, User)
+                .join(User, FamilyAdmin.user_id == User.user_id)
+                .where(
+                    and_(
+                        FamilyAdmin.family_id == victim.family_id,
+                        User.email.isnot(None)
+                    )
+                )
+            )
+            admins = admins_result.all()
+            
+            if not admins:
+                logger.info(f"用户 {user_id} 的家庭组没有配置邮箱的管理员")
+                return 0
+            
+            # 3. 向每个管理员发送邮件
+            victim_name = victim.name or victim.username
+            success_count = 0
+            
+            for admin_record, admin_user in admins:
+                if admin_user.email:
+                    sent = await self.send_guardian_alert(
+                        to_email=admin_user.email,
+                        victim_name=victim_name,
+                        risk_level=risk_level,
+                        details=details
+                    )
+                    if sent:
+                        success_count += 1
+                        logger.info(
+                            f"已向管理员 {admin_user.user_id} (role={admin_record.admin_role}) "
+                            f"发送邮件预警，受害者: {user_id}"
+                        )
+                        
+            return success_count
+            
+        except Exception as e:
+            logger.error(f"发送家庭组邮件预警失败: {e}")
+            return 0
 
 
 # 全局单例

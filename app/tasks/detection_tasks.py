@@ -30,6 +30,7 @@ from app.services.video_processor import VideoProcessor
 from app.services.security_service import security_service
 from app.services.notification_service import notification_service
 from app.db.database import AsyncSessionLocal
+from app.db.transaction import TransactionContext
 from app.models.ai_detection_log import AIDetectionLog
 from app.models.chat_message import ChatMessage
 
@@ -84,9 +85,16 @@ async def save_raw_data(data: bytes, user_id: int, call_id: int, data_type: str,
     except Exception as e:
         logger.warning(f"Failed to collect training data: {e}")
 
-async def ensure_call_record_exists(db, call_id: int, user_id: int) -> Optional[CallRecord]:
+async def ensure_call_record_exists(db, call_id: int, user_id: int, auto_commit: bool = True) -> Optional[CallRecord]:
     """
     确保 CallRecord 存在，并返回通话记录对象
+    
+    Args:
+        db: 数据库会话
+        call_id: 通话ID
+        user_id: 用户ID
+        auto_commit: 是否自动提交事务，默认True。
+                     在使用统一事务管理器时应设为False
     """
     try:
         result = await db.execute(select(CallRecord).where(CallRecord.call_id == call_id))
@@ -105,7 +113,8 @@ async def ensure_call_record_exists(db, call_id: int, user_id: int) -> Optional[
             duration=0
         )
         db.add(new_record)
-        await db.commit()
+        if auto_commit:
+            await db.commit()
         return new_record
     except Exception as e:
         logger.error(f"Failed to ensure call record: {e}")
@@ -400,14 +409,23 @@ def detect_video_task(self, frame_data: list, user_id: int, call_id: int) -> Dic
 # 核心中枢：多模态融合与 MDP 决策
 @celery_app.task(name="detect_text", bind=True)
 def detect_text_task(self, text: str, user_id: int, call_id: int) -> Dict:
-    """文本触发器 & 大模型多模态融合决策司令部"""
+    """文本触发器 & 大模型多模态融合决策司令部
+    
+    事务管理优化：
+    - 所有数据库操作（AIDetectionLog、ChatMessage、CallRecord）在同一事务中
+    - 外部服务调用（Redis发布、邮件发送）在事务commit后执行
+    - 外部服务失败仅记录日志，不影响数据库数据一致性
+    """
     bind_context(user_id=user_id, call_id=call_id)
     logger.info(f"Task started: MDP Fusion Command Center (Len: {len(text)})")
 
     async def _process():
-        async with AsyncSessionLocal() as db:
+        # 使用事务上下文管理器，支持 commit 后回调
+        tx_ctx = TransactionContext()
+        
+        async with tx_ctx.begin() as db:
             try:
-                record = await ensure_call_record_exists(db, call_id, user_id)
+                record = await ensure_call_record_exists(db, call_id, user_id, auto_commit=False)
                 
                 if len(text.strip()) < 2:
                     return {"status": "skipped", "reason": "text too short"}
@@ -427,10 +445,13 @@ def detect_text_task(self, text: str, user_id: int, call_id: int) -> Dict:
                     logger.warning(f"触发规则拦截: {rule_hit['keyword']}")
                     risk_level_code = rule_hit.get('risk_level', 1)
                     if risk_level_code >= 4:
-                        publish_control_command(user_id, {
-                            "type": "control", "action": "upgrade_level", "target_level": 3,
-                            "config": {"ui_message": f"触发高危防骗规则: {rule_hit['keyword']}", "block_call": True}
-                        })
+                        # 注册为 commit 后执行（外部服务）
+                        tx_ctx.add_post_commit_task(
+                            publish_control_command, user_id, {
+                                "type": "control", "action": "upgrade_level", "target_level": 3,
+                                "config": {"ui_message": f"触发高危防骗规则: {rule_hit['keyword']}", "block_call": True}
+                            }
+                        )
                         force_llm = True
 
                 try:
@@ -558,10 +579,15 @@ def detect_text_task(self, text: str, user_id: int, call_id: int) -> Dict:
                     model_version=f"fusion-mdp-v1-{text_result.get('model_type', 'unknown')}"
                 )
                 db.add(ai_log)
-                await db.commit()
                 
-                # 同时保存到对话历史表
-                await _save_chat_message(db, call_id, msg_count, "other", text)
+                # 同时保存到对话历史表（在同一事务中，不单独 commit）
+                msg = ChatMessage(
+                    call_id=call_id,
+                    sequence=msg_count,
+                    speaker="other",
+                    content=text[:1000] if len(text) > 1000 else text
+                )
+                db.add(msg)
 
                 # 6. 转化与执行 MDP 的拦截指令
                 alert_level = 'safe'
@@ -577,6 +603,7 @@ def detect_text_task(self, text: str, user_id: int, call_id: int) -> Dict:
                     ui_message = f"【极度高危】系统已阻断。防骗建议：{llm_result.get('advice', '请立刻停止操作！')}"
                     
                     # 触发联动闭环 - 发送 WebSocket 和邮件通知给监护人
+                    # 使用事务内的 session 写入 MessageLog
                     await notification_service.handle_detection_result(
                         db=db, user_id=user_id, call_id=call_id,
                         detection_type="MDP三级防御-强制阻断", is_risk=True, 
@@ -591,7 +618,7 @@ def detect_text_task(self, text: str, user_id: int, call_id: int) -> Dict:
                     record_verdict = DetectionResult.SUSPICIOUS
                     ui_message = f"【风险提示】行为可疑。防骗建议：{llm_result.get('advice', '请仔细核实对方身份！')}"
                 
-                # 通知前端展示并在记录中更新
+                # 通知前端展示并在记录中更新（MessageLog 写入在事务内）
                 await notification_service.handle_detection_result(
                     db=db, user_id=user_id, call_id=call_id,
                     detection_type="MDP动态决策", is_risk=(action_level > 0), 
@@ -613,9 +640,9 @@ def detect_text_task(self, text: str, user_id: int, call_id: int) -> Dict:
                         record.detected_result = DetectionResult.FAKE
                     elif record_verdict == DetectionResult.SUSPICIOUS and current_verdict == DetectionResult.SAFE:
                         record.detected_result = DetectionResult.SUSPICIOUS
-                    await db.commit()
+                    # 不再单独 commit，统一在事务结束时 commit
 
-                # 将指令通过 WebSocket 路由给前端
+                # 将 WebSocket 控制指令注册为 commit 后执行（外部服务）
                 if target_level > 1:
                     payload_control = {
                         "type": "control", "action": "upgrade_level", "target_level": target_level,
@@ -626,13 +653,20 @@ def detect_text_task(self, text: str, user_id: int, call_id: int) -> Dict:
                             "block_call": (target_level == 3)
                         }
                     }
-                    publish_control_command(user_id, payload_control)
+                    tx_ctx.add_post_commit_task(publish_control_command, user_id, payload_control)
 
-                return {"status": "success", "fused_score": fused_score, "action_level": action_level}
+                # 保存返回结果供后续使用
+                result_data = {"status": "success", "fused_score": fused_score, "action_level": action_level}
                 
             except Exception as e:
                 logger.error(f"MDP Fusion Command Center failed: {e}", exc_info=True)
                 return {"status": "error", "message": str(e), "call_id": call_id}
+        
+        # 事务已成功 commit，执行外部服务调用（Redis 发布、WebSocket 推送等）
+        # 这些操作失败不会回滚数据库
+        await tx_ctx.execute_post_commit_tasks()
+        
+        return result_data
 
     try:
         return async_to_sync(_process)()

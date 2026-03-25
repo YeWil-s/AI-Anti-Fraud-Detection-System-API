@@ -68,17 +68,19 @@ export default {
     // =======================
     getUsers: () => api.get('/admin/users'),
     getUser: (id) => api.get(`/admin/users/${id}`),
+    createUser: (data) => api.post('/admin/users', data),
     updateUser: (id, data) => api.put(`/admin/users/${id}`, data),
     updateUserStatus: (id, isActive) => api.patch(`/admin/users/${id}/status`, { is_active: isActive }),
     deleteUser: (id) => api.delete(`/admin/users/${id}`),
     getUserCallStats: (id) => api.get(`/admin/users/${id}/call-stats`),
-    getFamilyGroups: () => api.get('/admin/family-groups'),
     
     // =======================
     // 管理端家庭组接口
     // =======================
     getFamilyGroups: () => api.get('/admin/family-groups'),
     getFamilyGroupMembers: (familyId) => api.get(`/admin/family-groups/${familyId}/members`),
+    deleteFamilyGroup: (familyId) => api.delete(`/admin/family-groups/${familyId}`),
+    addFamilyMember: (familyId, userId) => api.post(`/admin/family-groups/${familyId}/members`, { user_id: userId }),
     getFamilyStats: () => api.get('/admin/family-stats'),
     
     // =======================

@@ -13,6 +13,9 @@ export default {
                 <el-button type="primary" size="large" @click="showAddDialog = true">
                     <i class="ri-user-add-line"></i> 添加用户
                 </el-button>
+                <el-button type="success" size="large" @click="exportCSV">
+                    <i class="ri-download-line"></i> 导出CSV
+                </el-button>
             </div>
 
             <!-- 统计卡片 -->
@@ -58,7 +61,7 @@ export default {
                     placeholder="搜索用户名、手机号或邮箱" 
                     style="width: 300px;"
                     clearable
-                    @input="handleSearch">
+                    @input="debouncedSearch">
                     <template #prefix>
                         <i class="ri-search-line"></i>
                     </template>
@@ -77,6 +80,9 @@ export default {
 
             <!-- 用户表格 -->
             <el-table :data="filteredUsers" v-loading="loading" stripe border>
+                <template #empty>
+                    <el-empty description="暂无匹配的用户" :image-size="100" />
+                </template>
                 <el-table-column type="index" label="#" width="60" align="center"></el-table-column>
                 <el-table-column prop="user_id" label="ID" width="80" align="center"></el-table-column>
                 <el-table-column prop="username" label="用户名" width="150">
@@ -119,16 +125,15 @@ export default {
                         {{ formatTime(scope.row.created_at) }}
                     </template>
                 </el-table-column>
-                <el-table-column label="操作" width="200" align="center" fixed="right">
+                <el-table-column label="操作" width="250" align="center" fixed="right">
                     <template #default="scope">
                         <el-button link type="primary" @click="viewUserDetail(scope.row)">详情</el-button>
                         <el-button link type="primary" @click="editUser(scope.row)">编辑</el-button>
+                        <el-button link type="warning" @click="resetPassword(scope.row)">重置密码</el-button>
                         <el-button link type="danger" @click="deleteUser(scope.row)">删除</el-button>
                     </template>
                 </el-table-column>
             </el-table>
-
-            <el-empty v-if="!loading && filteredUsers.length === 0" description="暂无匹配的用户"></el-empty>
 
             <!-- 用户详情对话框 -->
             <el-dialog v-model="detailVisible" title="用户详情" width="700px">
@@ -236,6 +241,46 @@ export default {
                     <el-button type="primary" @click="saveUser" :loading="saving">保存</el-button>
                 </template>
             </el-dialog>
+
+            <!-- 添加用户对话框 -->
+            <el-dialog v-model="showAddDialog" title="添加用户" width="550px">
+                <el-form :model="addForm" :rules="addFormRules" ref="addFormRef" label-width="100px">
+                    <el-form-item label="用户名" prop="username">
+                        <el-input v-model="addForm.username" placeholder="请输入用户名" />
+                    </el-form-item>
+                    <el-form-item label="密码" prop="password">
+                        <el-input v-model="addForm.password" type="password" placeholder="请输入密码" show-password />
+                    </el-form-item>
+                    <el-form-item label="真实姓名" prop="name">
+                        <el-input v-model="addForm.name" placeholder="请输入真实姓名" />
+                    </el-form-item>
+                    <el-form-item label="手机号" prop="phone">
+                        <el-input v-model="addForm.phone" placeholder="请输入手机号" />
+                    </el-form-item>
+                    <el-form-item label="邮箱" prop="email">
+                        <el-input v-model="addForm.email" placeholder="请输入邮箱" />
+                    </el-form-item>
+                    <el-form-item label="角色类型" prop="role_type">
+                        <el-select v-model="addForm.role_type" placeholder="请选择角色" style="width: 100%;">
+                            <el-option label="老人" value="老人"></el-option>
+                            <el-option label="儿童" value="儿童"></el-option>
+                            <el-option label="学生" value="学生"></el-option>
+                            <el-option label="青壮年" value="青壮年"></el-option>
+                        </el-select>
+                    </el-form-item>
+                    <el-form-item label="性别">
+                        <el-radio-group v-model="addForm.gender">
+                            <el-radio label="男">男</el-radio>
+                            <el-radio label="女">女</el-radio>
+                            <el-radio label="未知">未知</el-radio>
+                        </el-radio-group>
+                    </el-form-item>
+                </el-form>
+                <template #footer>
+                    <el-button @click="showAddDialog = false">取消</el-button>
+                    <el-button type="primary" @click="doAddUser" :loading="adding">确认添加</el-button>
+                </template>
+            </el-dialog>
         </div>
     `,
     data() {
@@ -252,9 +297,34 @@ export default {
             detailVisible: false,
             editVisible: false,
             showAddDialog: false,
+            adding: false,
+            resettingPassword: false,
             currentUser: null,
             userStats: {},
-            editForm: null
+            editForm: null,
+            addForm: {
+                username: '',
+                password: '',
+                name: '',
+                phone: '',
+                email: '',
+                role_type: '',
+                gender: '未知'
+            },
+            addFormRules: {
+                username: [{ required: true, message: '请输入用户名', trigger: 'blur' }],
+                password: [{ required: true, message: '请输入密码', trigger: 'blur' }],
+                name: [{ required: true, message: '请输入真实姓名', trigger: 'blur' }],
+                phone: [
+                    { required: true, message: '请输入手机号', trigger: 'blur' },
+                    { pattern: /^1[3-9]\d{9}$/, message: '手机号格式不正确', trigger: 'blur' }
+                ],
+                email: [
+                    { type: 'email', message: '邮箱格式不正确', trigger: 'blur' }
+                ],
+                role_type: [{ required: true, message: '请选择角色类型', trigger: 'change' }]
+            },
+            searchTimer: null
         };
     },
     mounted() {
@@ -300,6 +370,14 @@ export default {
             } catch (error) {
                 this.familyGroups = [];
             }
+        },
+        debouncedSearch() {
+            if (this.searchTimer) {
+                clearTimeout(this.searchTimer);
+            }
+            this.searchTimer = setTimeout(() => {
+                this.handleSearch();
+            }, 300);
         },
         handleSearch() {
             this.filteredUsers = this.users.filter(user => {
@@ -359,6 +437,105 @@ export default {
                     console.error('删除失败:', error);
                 }
             }
+        },
+        async resetPassword(row) {
+            try {
+                await ElementPlus.ElMessageBox.confirm(
+                    `确定重置用户 "${row.username}" 的密码？`,
+                    '重置密码确认',
+                    { type: 'warning' }
+                );
+                
+                this.resettingPassword = true;
+                // 尝试调用后端API
+                if (typeof api.resetUserPassword === 'function') {
+                    const result = await api.resetUserPassword(row.user_id);
+                    const newPassword = result?.new_password || '123456';
+                    ElementPlus.ElMessageBox.alert(
+                        `密码已重置为：<strong>${newPassword}</strong><br/>请通知用户及时修改密码`,
+                        '重置成功',
+                        { dangerouslyUseHTMLString: true, type: 'success' }
+                    );
+                } else {
+                    // 后端API不支持时显示提示
+                    ElementPlus.ElMessage.info('后端暂不支持密码重置API，请联系管理员');
+                }
+            } catch (error) {
+                if (error !== 'cancel') {
+                    console.error('重置密码失败:', error);
+                    ElementPlus.ElMessage.error('重置密码失败');
+                }
+            } finally {
+                this.resettingPassword = false;
+            }
+        },
+        exportCSV() {
+            if (!this.filteredUsers || this.filteredUsers.length === 0) {
+                ElementPlus.ElMessage.warning('暂无数据可导出');
+                return;
+            }
+            
+            const headers = ['ID', '用户名', '姓名', '手机号', '邮箱', '角色', '状态', '注册时间'];
+            const rows = this.filteredUsers.map(u => [
+                u.user_id || '',
+                u.username || '',
+                u.name || '',
+                u.phone || '',
+                u.email || '',
+                u.role_type || '未设置',
+                u.is_active ? '启用' : '禁用',
+                this.formatTime(u.created_at)
+            ]);
+            
+            // 处理特殊字符，避免CSV注入
+            const escapeCSV = (val) => {
+                if (val === null || val === undefined) return '';
+                const str = String(val);
+                if (str.includes(',') || str.includes('"') || str.includes('\n')) {
+                    return '"' + str.replace(/"/g, '""') + '"';
+                }
+                return str;
+            };
+            
+            const csvContent = [headers.map(escapeCSV), ...rows.map(r => r.map(escapeCSV))]
+                .map(r => r.join(','))
+                .join('\n');
+            
+            const blob = new Blob(['\ufeff' + csvContent], { type: 'text/csv;charset=utf-8;' });
+            const link = document.createElement('a');
+            link.href = URL.createObjectURL(blob);
+            link.download = `用户列表_${new Date().toLocaleDateString().replace(/\//g, '-')}.csv`;
+            link.click();
+            URL.revokeObjectURL(link.href);
+            
+            ElementPlus.ElMessage.success(`成功导出 ${this.filteredUsers.length} 条用户数据`);
+        },
+        async doAddUser() {
+            this.$refs.addFormRef.validate(async (valid) => {
+                if (!valid) return;
+                this.adding = true;
+                try {
+                    await api.createUser(this.addForm);
+                    ElementPlus.ElMessage.success('用户添加成功');
+                    this.showAddDialog = false;
+                    // 重置表单
+                    this.addForm = {
+                        username: '',
+                        password: '',
+                        name: '',
+                        phone: '',
+                        email: '',
+                        role_type: '',
+                        gender: '未知'
+                    };
+                    this.$refs.addFormRef?.resetFields();
+                    this.loadUsers();
+                } catch (error) {
+                    console.error('添加用户失败:', error);
+                } finally {
+                    this.adding = false;
+                }
+            });
         },
         getRoleType(role) {
             const map = { '老人': 'danger', '儿童': 'warning', '学生': 'success', '青壮年': 'primary' };

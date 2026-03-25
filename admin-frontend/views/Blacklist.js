@@ -38,13 +38,13 @@ export default {
             </el-row>
 
             <!-- 搜索和操作栏 -->
-            <div style="margin-bottom: 20px; display: flex; gap: 10px;">
+            <div style="margin-bottom: 20px; display: flex; gap: 10px; flex-wrap: wrap;">
                 <el-input 
                     v-model="searchNumber" 
                     placeholder="搜索电话号码" 
                     style="width: 300px;"
                     clearable
-                    @input="handleSearch">
+                    @input="debouncedSearch">
                     <template #prefix>
                         <i class="ri-search-line"></i>
                     </template>
@@ -59,16 +59,28 @@ export default {
                     <el-option label="4级-高" :value="4"></el-option>
                     <el-option label="3级-中" :value="3"></el-option>
                 </el-select>
+                <el-button 
+                    type="danger" 
+                    plain 
+                    :disabled="selectedRows.length === 0"
+                    @click="batchRemove"
+                    :loading="batchRemoving">
+                    <i class="ri-delete-bin-line"></i> 批量移出 ({{ selectedRows.length }})
+                </el-button>
             </div>
             
-            <el-table :data="filteredData" v-loading="loading" stripe border>
+            <el-table :data="filteredData" v-loading="loading" stripe border @selection-change="handleSelectionChange" ref="blacklistTable">
+                <template #empty>
+                    <el-empty description="暂无匹配的黑名单记录" :image-size="100" />
+                </template>
+                <el-table-column type="selection" width="55" />
                 <el-table-column type="index" label="#" width="60" align="center"></el-table-column>
                 <el-table-column prop="id" label="ID" width="80" align="center"></el-table-column>
                 <el-table-column prop="number" label="电话号码" width="180" align="center">
                      <template #default="{row}">
                         <div style="display: flex; align-items: center; justify-content: center; gap: 8px;">
                             <i class="ri-phone-lock-line" style="color: #dc2626;"></i>
-                            <b style="color:#dc2626; font-size: 16px;">{{ row.number }}</b>
+                            <b style="color:#dc2626; font-size: 16px;">{{ maskPhone(row.number) }}</b>
                         </div>
                     </template>
                 </el-table-column>
@@ -109,8 +121,6 @@ export default {
                 </el-table-column>
             </el-table>
 
-            <el-empty v-if="!loading && filteredData.length === 0" description="暂无匹配的黑名单记录"></el-empty>
-
             <!-- 拉黑对话框 -->
             <el-dialog v-model="dialogVisible" title="手动拉黑号码" width="500px">
                 <el-alert
@@ -121,8 +131,8 @@ export default {
                     :closable="false"
                     style="margin-bottom: 20px;"
                 />
-                <el-form :model="form" label-width="100px">
-                    <el-form-item label="电话号码" required>
+                <el-form :model="form" :rules="formRules" ref="blacklistForm" label-width="100px">
+                    <el-form-item label="电话号码" prop="number" required>
                         <el-input v-model="form.number" placeholder="请输入完整电话号码">
                             <template #prefix>
                                 <i class="ri-phone-line"></i>
@@ -138,7 +148,7 @@ export default {
                 </el-form>
                 <template #footer>
                     <el-button @click="dialogVisible = false">取消</el-button>
-                    <el-button type="danger" @click="doAdd" :disabled="!form.number">确认拉黑</el-button>
+                    <el-button type="danger" @click="doAdd" :loading="adding">确认拉黑</el-button>
                 </template>
             </el-dialog>
 
@@ -175,7 +185,17 @@ export default {
             searchNumber: '',
             filterSource: '',
             filterRisk: '',
-            form: { number: '', description: '', risk_level: 5, source: 'manual_admin' }
+            form: { number: '', description: '', risk_level: 5, source: 'manual_admin' },
+            formRules: {
+                number: [
+                    { required: true, message: '请输入电话号码', trigger: 'blur' },
+                    { pattern: /^1[3-9]\d{9}$/, message: '请输入正确的手机号格式', trigger: 'blur' }
+                ]
+            },
+            selectedRows: [],
+            batchRemoving: false,
+            adding: false,
+            searchTimer: null
         }
     },
     computed: {
@@ -198,6 +218,47 @@ export default {
     },
     mounted() { this.loadData(); },
     methods: {
+        handleSelectionChange(selection) {
+            this.selectedRows = selection;
+        },
+        async batchRemove() {
+            if (this.selectedRows.length === 0) return;
+            
+            try {
+                await ElementPlus.ElMessageBox.confirm(
+                    `确定将选中的 ${this.selectedRows.length} 个号码移出黑名单？`,
+                    '批量移出确认',
+                    { type: 'warning' }
+                );
+                
+                this.batchRemoving = true;
+                const promises = this.selectedRows.map(row => api.delBlacklist(row.id));
+                await Promise.all(promises);
+                
+                ElementPlus.ElMessage.success(`成功移出 ${this.selectedRows.length} 个号码`);
+                this.selectedRows = [];
+                this.loadData();
+            } catch (error) {
+                if (error !== 'cancel') {
+                    console.error('批量移出失败:', error);
+                    ElementPlus.ElMessage.error('批量移出失败');
+                }
+            } finally {
+                this.batchRemoving = false;
+            }
+        },
+        maskPhone(phone) {
+            if (!phone || phone.length < 7) return phone;
+            return phone.substring(0, 3) + '****' + phone.substring(phone.length - 4);
+        },
+        debouncedSearch() {
+            if (this.searchTimer) {
+                clearTimeout(this.searchTimer);
+            }
+            this.searchTimer = setTimeout(() => {
+                this.handleSearch();
+            }, 300);
+        },
         async loadData() {
             this.loading = true;
             try {
@@ -217,15 +278,23 @@ export default {
             });
         },
         async doAdd() {
-            try {
-                await api.addBlacklist(this.form);
-                this.dialogVisible = false;
-                this.form = { number: '', description: '', risk_level: 5, source: 'manual_admin' };
-                this.loadData();
-                ElementPlus.ElMessage.success('号码已拉黑');
-            } catch (error) {
-                console.error('拉黑失败:', error);
-            }
+            this.$refs.blacklistForm.validate(async (valid) => {
+                if (!valid) return;
+                
+                this.adding = true;
+                try {
+                    await api.addBlacklist(this.form);
+                    this.dialogVisible = false;
+                    this.form = { number: '', description: '', risk_level: 5, source: 'manual_admin' };
+                    this.$refs.blacklistForm?.resetFields();
+                    this.loadData();
+                    ElementPlus.ElMessage.success('号码已拉黑');
+                } catch (error) {
+                    console.error('拉黑失败:', error);
+                } finally {
+                    this.adding = false;
+                }
+            });
         },
         async doDelete(row) {
             try {
