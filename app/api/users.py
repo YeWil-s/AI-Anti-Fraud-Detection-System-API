@@ -17,7 +17,7 @@ from app.schemas import (
     UserLogin,
     UserResponse,
     TokenResponse,
-    PhoneRequest,
+    SendCodeRequest,
     ResponseModel,
     UserUpdateProfile
 )
@@ -31,84 +31,79 @@ logger = get_logger(__name__)
 router = APIRouter(prefix="/api/users", tags=["用户管理"])
 
 @router.post("/send-code", response_model=ResponseModel)
-async def send_verification_code(request: PhoneRequest):
-    """发送验证码（优先邮箱， fallback 到短信）"""
-    # 检查是否提供了邮箱
-    email = getattr(request, 'email', None)
-    phone = request.phone
+async def send_verification_code(request: SendCodeRequest):
+    """发送邮箱验证码（注册时使用）"""
+    email = request.email
     
-    # 如果提供了邮箱，优先使用邮箱验证码
-    if email:
-        # 验证邮箱格式（简单验证）
-        if '@' not in email or '.' not in email:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="邮箱格式不正确"
-            )
-        
-        # 发送邮箱验证码
-        success = await send_email_code(email)
-        if not success:
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="邮箱验证码发送失败，请检查邮箱配置"
-            )
-        
-        logger.info(f"Email verification code sent to {email}")
-        return ResponseModel(
-            code=200,
-            message="验证码已发送至邮箱",
-            data={"email": email}
-        )
-    
-    # 否则使用短信验证码
-    # 验证手机号格式
-    if len(phone) != 11 or not phone.isdigit():
-        logger.debug(f"Invalid phone format: {phone}")
+    # 验证邮箱格式
+    if not email or '@' not in email or '.' not in email:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="手机号格式不正确"
+            detail="邮箱格式不正确"
         )
     
-    # 发送验证码
-    success = await send_sms_code(phone)
+    # 发送邮箱验证码
+    success = await send_email_code(email)
     if not success:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="验证码发送失败"
+            detail="邮箱验证码发送失败，请检查邮箱配置"
         )
     
-    logger.info(f"SMS verification code sent to {phone}")
+    logger.info(f"Email verification code sent to {email}")
     return ResponseModel(
         code=200,
-        message="验证码已发送至手机",
-        data={"phone": phone}
+        message="验证码已发送至邮箱",
+        data={"email": email}
+    )
+
+
+@router.post("/send-login-code", response_model=ResponseModel)
+async def send_login_verification_code(request: SendCodeRequest):
+    """发送登录验证码（邮箱验证码登录时使用）"""
+    email = request.email
+    
+    # 验证邮箱格式
+    if not email or '@' not in email or '.' not in email:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="邮箱格式不正确"
+        )
+    
+    # 发送邮箱验证码
+    success = await send_email_code(email)
+    if not success:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="邮箱验证码发送失败，请检查邮箱配置"
+        )
+    
+    logger.info(f"Login email verification code sent to {email}")
+    return ResponseModel(
+        code=200,
+        message="登录验证码已发送至邮箱",
+        data={"email": email}
     )
 
 @router.post("/register",
             response_model=ResponseModel, 
             status_code=status.HTTP_201_CREATED)
 async def register(user_data: UserCreate, db: AsyncSession = Depends(get_db)):
-    """用户注册（支持邮箱或手机验证码）"""
-    # 判断使用邮箱验证码还是短信验证码
-    email = getattr(user_data, 'email', None)
+    """用户注册（强制使用邮箱验证码）"""
+    # 验证邮箱必填
+    if not user_data.email:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="邮箱为必填项"
+        )
     
-    if email:
-        # 使用邮箱验证码验证
-        if not verify_email_code(email, user_data.sms_code):
-            logger.warning(f"Registration failed: Invalid email code for {email}")
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="验证码错误或已过期"
-            )
-    else:
-        # 使用短信验证码验证
-        if not verify_sms_code(user_data.phone, user_data.sms_code):
-            logger.warning(f"Registration failed: Invalid SMS code for {user_data.phone}")
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="验证码错误或已过期"
-            )
+    # 使用邮箱验证码验证
+    if not verify_email_code(user_data.email, user_data.email_code):
+        logger.warning(f"Registration failed: Invalid email code for {user_data.email}")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="验证码错误或已过期"
+        )
     
     # 检查手机号是否已存在
     result = await db.execute(select(User).where(User.phone == user_data.phone))
@@ -119,6 +114,17 @@ async def register(user_data: UserCreate, db: AsyncSession = Depends(get_db)):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="该手机号已注册"
+        )
+    
+    # 检查邮箱是否已存在
+    result = await db.execute(select(User).where(User.email == user_data.email))
+    existing_email = result.scalar_one_or_none()
+    
+    if existing_email:
+        logger.warning(f"Registration failed: Email {user_data.email} already exists")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="该邮箱已注册"
         )
     
     # 检查用户名是否已存在
@@ -168,21 +174,60 @@ async def register(user_data: UserCreate, db: AsyncSession = Depends(get_db)):
 
 @router.post("/login", response_model=TokenResponse)
 async def login(login_data: UserLogin, db: AsyncSession = Depends(get_db)):
-    """用户登录"""
+    """
+    用户登录 - 支持多种登录方式：
+    1. 邮箱 + 密码
+    2. 邮箱 + 验证码
+    3. 手机号 + 密码
+    """
+    user = None
+    login_method = ""
     
-    # 查询用户
-    result = await db.execute(select(User).where(User.phone == login_data.phone))
-    user = result.scalar_one_or_none()
+    # 方式1: 邮箱 + 验证码
+    if login_data.email and login_data.email_code and not login_data.password:
+        # 先验证邮箱验证码
+        if not verify_email_code(login_data.email, login_data.email_code):
+            logger.warning(f"Login failed: Invalid email code for {login_data.email}")
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="验证码错误或已过期"
+            )
+        # 验证码通过，查询用户
+        result = await db.execute(select(User).where(User.email == login_data.email))
+        user = result.scalar_one_or_none()
+        login_method = "email_code"
     
-    if not user or not verify_password(login_data.password, user.password_hash):  # type: ignore[arg-type]
-        #  安全日志：记录登录失败尝试
-        logger.warning(f"Login failed for phone: {login_data.phone} (Invalid credentials)")
+    # 方式2: 邮箱 + 密码
+    elif login_data.email and login_data.password and not login_data.email_code:
+        result = await db.execute(select(User).where(User.email == login_data.email))
+        user = result.scalar_one_or_none()
+        if user and not verify_password(login_data.password, user.password_hash):
+            user = None
+        login_method = "email_password"
+    
+    # 方式3: 手机号 + 密码
+    elif login_data.phone and login_data.password:
+        result = await db.execute(select(User).where(User.phone == login_data.phone))
+        user = result.scalar_one_or_none()
+        if user and not verify_password(login_data.password, user.password_hash):
+            user = None
+        login_method = "phone_password"
+    
+    else:
         raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="手机号或密码错误"
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="登录参数不正确，请提供：邮箱+密码、邮箱+验证码 或 手机号+密码"
         )
     
-    if not user.is_active:  # type: ignore[truthy-bool]
+    # 验证用户是否存在
+    if not user:
+        logger.warning(f"Login failed: User not found or invalid credentials")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="账号或密码错误"
+        )
+    
+    if not user.is_active:
         logger.warning(f"Login blocked for disabled user: {user.user_id}")
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -190,7 +235,7 @@ async def login(login_data: UserLogin, db: AsyncSession = Depends(get_db)):
         )
     
     bind_context(user_id=user.user_id)
-    logger.info(f"User logged in successfully: {user.username} (ID: {user.user_id})")
+    logger.info(f"User logged in successfully: {user.username} (ID: {user.user_id}, method={login_method})")
     
     # 生成JWT令牌
     access_token = create_access_token(data={"sub": str(user.user_id), "phone": user.phone})

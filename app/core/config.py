@@ -67,11 +67,13 @@ class Settings(BaseSettings):
     COLLECT_TRAINING_DATA: bool = True
     
     # AASIST 模型配置（与训练时保持一致）
+    # 注意：pool_ratios 和 temperatures 需要与模型训练配置匹配
+    # SpeechFake微调模型使用4个元素: [0.5, 0.7, 0.5, 0.5] 和 [2.0, 2.0, 100.0, 100.0]
     AASIST_CONFIG: dict = {
         "filts": [70, [1, 32], [32, 32], [32, 64], [64, 64]],  # 第一个元素是初始通道数
         "gat_dims": [64, 32],
-        "pool_ratios": [0.5, 0.7, 0.5],
-        "temperatures": [2.0, 2.0, 100.0],
+        "pool_ratios": [0.5, 0.7, 0.5, 0.5],  # 4个元素，与SpeechFake训练配置一致
+        "temperatures": [2.0, 2.0, 100.0, 100.0],  # 4个元素，与SpeechFake训练配置一致
         "first_conv": 128,  # 与AASIST.conf保持一致
         "nb_samp": 64600,   # 音频采样点数（约4秒@16kHz）
     }

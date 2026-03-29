@@ -98,6 +98,7 @@ class ModelService:
         if aasist_path.exists():
             try:
                 import torch
+                from collections import OrderedDict
                 
                 # 添加 AASIST 源码路径
                 aasist_code_path = str(Path(settings.AASIST_CODE_PATH))
@@ -109,25 +110,36 @@ class ModelService:
                 # 加载checkpoint
                 checkpoint = torch.load(aasist_path, map_location='cpu', weights_only=False)
                 
-                # 使用配置文件中的参数（优先）或checkpoint中的配置
-                if hasattr(settings, 'AASIST_CONFIG') and settings.AASIST_CONFIG:
-                    self.aasist_config = settings.AASIST_CONFIG
-                    logger.info(f"使用配置文件中的AASIST参数: first_conv={self.aasist_config.get('first_conv')}")
+                # 判断checkpoint格式：完整checkpoint或纯state_dict
+                if isinstance(checkpoint, OrderedDict) or isinstance(checkpoint, dict) and 'model_state_dict' not in checkpoint:
+                    # 纯state_dict格式（如SpeechFake训练的新模型）
+                    logger.info("检测到纯state_dict格式模型，使用配置文件中参数初始化")
+                    state_dict = checkpoint if isinstance(checkpoint, OrderedDict) else checkpoint
+                    self.aasist_config = settings.AASIST_CONFIG if hasattr(settings, 'AASIST_CONFIG') else self._get_default_aasist_config()
+                    self.aasist_model = AASISTModel(self.aasist_config)
+                    self.aasist_model.load_state_dict(state_dict)
+                    self.aasist_eer = None
+                    best_acc = 'N/A'
+                    model_source = "speechfake_finetuned"
                 else:
-                    self.aasist_config = checkpoint.get('config', self._get_default_aasist_config())
-                    logger.info(f"使用checkpoint中的AASIST参数")
+                    # 完整checkpoint格式（包含model_state_dict, config, best_eer等）
+                    logger.info("检测到完整checkpoint格式模型")
+                    if hasattr(settings, 'AASIST_CONFIG') and settings.AASIST_CONFIG:
+                        self.aasist_config = settings.AASIST_CONFIG
+                        logger.info(f"使用配置文件中的AASIST参数: first_conv={self.aasist_config.get('first_conv')}")
+                    else:
+                        self.aasist_config = checkpoint.get('config', self._get_default_aasist_config())
+                        logger.info(f"使用checkpoint中的AASIST参数")
+                    
+                    self.aasist_model = AASISTModel(self.aasist_config)
+                    self.aasist_model.load_state_dict(checkpoint['model_state_dict'])
+                    self.aasist_eer = checkpoint.get('best_eer', None)
+                    best_acc = checkpoint.get('best_acc', 'N/A')
+                    model_source = "aasist_finetuned"
                 
-                # 初始化模型
-                self.aasist_model = AASISTModel(self.aasist_config)
-                self.aasist_model.load_state_dict(checkpoint['model_state_dict'])
                 self.aasist_model.eval()
-                
-                # 记录模型指标
-                self.aasist_eer = checkpoint.get('best_eer', None)
-                best_acc = checkpoint.get('best_acc', 'N/A')
-                
-                self.audio_model_type = "aasist_finetuned"
-                logger.info(f"✅ AASIST微调模型加载成功 (Acc: {best_acc}%, EER: {self.aasist_eer})")
+                self.audio_model_type = model_source
+                logger.info(f"✅ AASIST模型加载成功 [{model_source}] (Acc: {best_acc}, EER: {self.aasist_eer})")
                 return
                 
             except Exception as e:
@@ -142,8 +154,8 @@ class ModelService:
         return {
             "filts": [70, [1, 32], [32, 32], [32, 64], [64, 64]],  # 第一个元素是初始通道数
             "gat_dims": [64, 32],
-            "pool_ratios": [0.5, 0.7, 0.5],
-            "temperatures": [2.0, 2.0, 100.0],
+            "pool_ratios": [0.5, 0.7, 0.5, 0.5],  # 4个元素，与SpeechFake训练配置一致
+            "temperatures": [2.0, 2.0, 100.0, 100.0],  # 4个元素，与SpeechFake训练配置一致
             "first_conv": 128,
             "nb_samp": 64600,
         }
@@ -545,8 +557,20 @@ class ModelService:
             # 2. 推理
             with torch.no_grad():
                 _, outputs = self.aasist_model(waveform, Freq_aug=False)
-                probs = torch.softmax(outputs, dim=1)
-                score = float(probs[0][1])  # Index 1 是 Fake
+                # AASIST模型输出: Index 0 = 伪造(spoof), Index 1 = 真人(bonafide)
+                # 注意: 标准AASIST评估中，分数越高表示越可能是真人
+                # 因此使用 bona_logit 作为分数（或 -spoof_logit）
+                spoof_logit = float(outputs[0][0])
+                bona_logit = float(outputs[0][1])
+                
+                # 使用 bona_logit 作为分数（越高越可能是真人）
+                # 转换为伪造置信度: 1 - sigmoid(bona_logit)
+                import math
+                bona_prob = 1 / (1 + math.exp(-bona_logit))
+                score = 1 - bona_prob  # 伪造置信度 = 1 - 真人概率
+                
+                # 保留原始logits用于调试
+                raw_score = bona_logit
             
             # 3. 结果判定
             threshold = settings.VOICE_DETECTION_THRESHOLD

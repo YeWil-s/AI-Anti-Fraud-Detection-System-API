@@ -20,19 +20,22 @@ class UserBase(BaseModel):
 class UserCreate(UserBase):
     """用户创建模型"""
     password: str = Field(..., min_length=6, max_length=20, description="密码")
-    sms_code: str = Field(..., min_length=4, max_length=6, description="验证码")
-    email: Optional[str] = Field(None, description="邮箱（用于接收验证码）")
+    email_code: str = Field(..., min_length=4, max_length=6, description="邮箱验证码")
+    email: str = Field(..., description="邮箱（必填，用于接收验证码）")
 
 
-class PhoneRequest(BaseModel):
-    phone: str = Field(..., min_length=11, max_length=11, description="手机号")
-    email: Optional[str] = Field(None, description="邮箱（如果提供则发送邮箱验证码）")
+class SendCodeRequest(BaseModel):
+    """发送验证码请求模型"""
+    email: str = Field(..., description="邮箱（必填，用于接收验证码）")
 
 
 class UserLogin(BaseModel):
-    """用户登录模型"""
-    phone: str = Field(..., min_length=11, max_length=11, description="手机号")
-    password: str = Field(..., min_length=6, max_length=20, description="密码")
+    """用户登录模型 - 支持多种方式"""
+    # 支持邮箱+密码、邮箱+验证码、手机号+密码
+    email: Optional[str] = Field(None, description="邮箱（邮箱登录时使用）")
+    phone: Optional[str] = Field(None, min_length=11, max_length=11, description="手机号（手机号登录时使用）")
+    password: Optional[str] = Field(None, min_length=6, max_length=20, description="密码（密码登录时使用）")
+    email_code: Optional[str] = Field(None, min_length=4, max_length=6, description="邮箱验证码（验证码登录时使用）")
 
 
 class UserUpdateProfile(BaseModel):

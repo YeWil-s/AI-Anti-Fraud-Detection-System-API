@@ -70,45 +70,51 @@ async def create_family_group(
 ):
     """创建家庭组：自动将创建者设为主管理员
     
-    支持一个用户作为管理员管理多个家庭组，但作为普通成员只能属于一个家庭组
+    说明：
+    - 管理员是家庭组的管理者，负责接收成员的被诈骗通知
+    - 管理员本身不是家庭组的普通成员，不享受该家庭组的保护
+    - 用户要么作为普通成员加入家庭组（有family_id），要么作为管理员创建家庭组（无family_id）
+    - 一个用户可以是多个家庭组的管理员
     """
-    # 1. 检查用户是否已有家庭组（普通成员只能有一个）
+    # 1. 检查用户信息
     result = await db.execute(select(User).where(User.user_id == current_user_id))
     user = result.scalar_one_or_none()
     
+    # 2. 检查用户是否已有家庭组（作为普通成员）
+    # 管理员不是普通成员，所以如果已有family_id，不能再创建家庭组
     if user and user.family_id:
-        # 检查用户是否以管理员身份在该家庭组
-        admin_result = await db.execute(
-            select(FamilyAdmin).where(
-                and_(
-                    FamilyAdmin.user_id == current_user_id, 
-                    FamilyAdmin.family_id == user.family_id
-                )
+        return ResponseModel(
+            code=400, 
+            message="您已作为普通成员加入一个家庭组，请先退出后再创建家庭组"
+        )
+    
+    # 3. 检查用户是否已有待审批的申请
+    pending_apps = await db.execute(
+        select(FamilyApplication).where(
+            and_(
+                FamilyApplication.user_id == current_user_id,
+                FamilyApplication.status == ApplicationStatus.PENDING
             )
         )
-        is_admin_in_current_family = admin_result.scalar_one_or_none() is not None
-        
-        # 如果不是管理员（只是普通成员），则不允许创建新家庭组
-        if not is_admin_in_current_family:
-            return ResponseModel(code=400, message="您已作为普通成员加入一个家庭组，请先退出")
-        
-        # 如果是管理员，允许创建新的家庭组（成为多家庭组管理员）
-        logger.info(f"用户 {current_user_id} 已是家庭组 {user.family_id} 的管理员，允许创建新家庭组")
+    )
+    if pending_apps.scalar_one_or_none():
+        return ResponseModel(
+            code=400, 
+            message="您有正在审批中的家庭组申请，请先取消申请或等待审批完成后再创建家庭组"
+        )
     
-    # 2. 创建群组 
+    # 4. 创建群组 
     new_family = FamilyGroup(group_name=name, admin_id=current_user_id) 
     db.add(new_family)
     await db.commit()
     await db.refresh(new_family)
 
-    # 3. 将创建者绑定到新组，并在family_admins表设为主管理员
+    # 5. 将创建者设为家庭组主管理员
     if user:
-        # 如果用户还没有family_id（或者已经是其他家庭组的管理员），则更新为新的家庭组
-        # 注意：这里会改变用户的"当前活跃家庭组"，但保留其在其他家庭组的管理员身份
-        user.family_id = new_family.id
+        # 在FamilyAdmin表中添加管理员记录
+        # 管理员不是普通成员，所以不修改family_id
         user.is_admin = True
         
-        # 添加到family_admins表
         admin_record = FamilyAdmin(
             user_id=current_user_id,
             family_id=new_family.id,
@@ -169,7 +175,7 @@ async def apply_join_family(
 
 
 # =======================
-# 3. 获取待审批列表
+# 3. 获取待审批列表（管理员端）
 # =======================
 @router.get("/applications", response_model=ResponseModel)
 async def get_applications(
@@ -216,6 +222,71 @@ async def get_applications(
 
 
 # =======================
+# 3.1 获取我的申请列表（普通用户端）
+# =======================
+@router.get("/my-applications", response_model=ResponseModel)
+async def get_my_applications(
+    current_user_id: int = Depends(get_current_user_id), 
+    db: AsyncSession = Depends(get_db)
+):
+    """【用户端】获取我提交的家庭组申请列表"""
+    # 查询当前用户提交的所有申请
+    apps_result = await db.execute(
+        select(FamilyApplication, FamilyGroup)
+        .join(FamilyGroup, FamilyApplication.family_id == FamilyGroup.id)
+        .where(FamilyApplication.user_id == current_user_id)
+        .order_by(FamilyApplication.created_at.desc())
+    )
+    
+    data = []
+    for app, family in apps_result.all():
+        data.append({
+            "application_id": app.id,
+            "family_id": family.id,
+            "family_name": family.group_name,
+            "status": app.status.value,
+            "apply_time": app.created_at.strftime("%Y-%m-%d %H:%M:%S") if app.created_at else None
+        })
+        
+    return ResponseModel(code=200, message="获取成功", data={"items": data})
+
+
+# =======================
+# 3.2 取消/删除我的申请
+# =======================
+@router.delete("/applications/{app_id}", response_model=ResponseModel)
+async def cancel_my_application(
+    app_id: int,
+    current_user_id: int = Depends(get_current_user_id), 
+    db: AsyncSession = Depends(get_db)
+):
+    """【用户端】取消/删除我提交的申请（仅限pending状态的申请）"""
+    # 1. 查询申请记录
+    app_result = await db.execute(
+        select(FamilyApplication).where(FamilyApplication.id == app_id)
+    )
+    application = app_result.scalar_one_or_none()
+    
+    if not application:
+        return ResponseModel(code=404, message="申请不存在")
+    
+    # 2. 验证是否是当前用户提交的申请
+    if application.user_id != current_user_id:
+        return ResponseModel(code=403, message="无权操作此申请")
+    
+    # 3. 只能取消pending状态的申请
+    if application.status != ApplicationStatus.PENDING:
+        return ResponseModel(code=400, message="只能取消待审批的申请")
+    
+    # 4. 删除申请记录
+    await db.delete(application)
+    await db.commit()
+    
+    logger.info(f"用户 {current_user_id} 取消了申请 {app_id}")
+    return ResponseModel(code=200, message="申请已取消")
+
+
+# =======================
 # 4. 审批申请
 # =======================
 @router.put("/applications/{app_id}", response_model=ResponseModel)
@@ -246,12 +317,31 @@ async def review_application(
 
     # 3. 执行审批
     if is_approve:
-        application.status = ApplicationStatus.APPROVED
-        # 将该成员的 family_id 更新
+        # 3.1 检查申请人是否已经有家庭组
         user_result = await db.execute(select(User).where(User.user_id == application.user_id))
         user = user_result.scalar_one_or_none()
-        if user:
-            user.family_id = application.family_id
+        
+        if not user:
+            return ResponseModel(code=404, message="申请人不存在")
+        
+        if user.family_id is not None:
+            # 申请人已经有家庭组了，不能批准
+            application.status = ApplicationStatus.REJECTED
+            await db.commit()
+            logger.info(f"管理员 {current_user_id} 尝试批准申请 {app_id}，但申请人已有家庭组，自动拒绝")
+            return ResponseModel(
+                code=400, 
+                message="该用户已加入其他家庭组，无法批准此申请",
+                data={
+                    "auto_rejected": True,
+                    "reason": "user_already_in_family",
+                    "current_family_id": user.family_id
+                }
+            )
+        
+        # 3.2 批准申请
+        application.status = ApplicationStatus.APPROVED
+        user.family_id = application.family_id
         msg = "已同意"
     else:
         application.status = ApplicationStatus.REJECTED

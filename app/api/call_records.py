@@ -31,11 +31,55 @@ async def get_my_call_records(
     page: int = Query(1, ge=1, description="页码"),
     page_size: int = Query(20, ge=1, le=100, description="每页数量"),
     result_filter: Optional[DetectionResult] = Query(None, description="按检测结果过滤"),
+    user_id: Optional[int] = Query(None, description="要查询的用户ID（可选，管理员可查询家庭成员）"),
     current_user_id: int = Depends(get_current_user_id),
     db: AsyncSession = Depends(get_db)
 ):
-    """获取当前用户的通话记录"""
-    query = select(CallRecord).where(CallRecord.user_id == current_user_id)
+    """
+    获取通话记录
+    
+    - 如果不传user_id：返回当前用户的通话记录
+    - 如果传user_id：验证权限后返回指定用户的通话记录（管理员可查看同家庭组成员）
+    """
+    from app.models.family_group import FamilyAdmin
+    
+    # 确定要查询的目标用户ID
+    target_user_id = user_id if user_id is not None else current_user_id
+    
+    # 如果查询的是其他用户的记录，需要验证权限
+    if target_user_id != current_user_id:
+        # 1. 获取当前用户和目标用户的信息
+        current_user_result = await db.execute(
+            select(User).where(User.user_id == current_user_id)
+        )
+        current_user = current_user_result.scalar_one_or_none()
+        
+        target_user_result = await db.execute(
+            select(User).where(User.user_id == target_user_id)
+        )
+        target_user = target_user_result.scalar_one_or_none()
+        
+        if not target_user:
+            raise HTTPException(status_code=404, detail="目标用户不存在")
+        
+        # 2. 验证是否在同一家庭组
+        if not current_user or not current_user.family_id or current_user.family_id != target_user.family_id:
+            raise HTTPException(status_code=403, detail="无权查看该用户的通话记录")
+        
+        # 3. 验证当前用户是否是该家庭组的管理员
+        admin_result = await db.execute(
+            select(FamilyAdmin).where(
+                and_(
+                    FamilyAdmin.user_id == current_user_id,
+                    FamilyAdmin.family_id == current_user.family_id
+                )
+            )
+        )
+        if not admin_result.scalar_one_or_none():
+            raise HTTPException(status_code=403, detail="只有管理员可以查看家庭成员的通话记录")
+    
+    # 查询通话记录
+    query = select(CallRecord).where(CallRecord.user_id == target_user_id)
     
     if result_filter:
         query = query.where(CallRecord.detected_result == result_filter)
@@ -48,7 +92,7 @@ async def get_my_call_records(
     
     # 统计总数
     count_result = await db.execute(
-        select(func.count()).select_from(CallRecord).where(CallRecord.user_id == current_user_id)
+        select(func.count()).select_from(CallRecord).where(CallRecord.user_id == target_user_id)
     )
     total = count_result.scalar() or 0
     
