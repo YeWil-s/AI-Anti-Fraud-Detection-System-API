@@ -69,7 +69,7 @@ class VectorDBService:
 
     def add_data(self, collection_name: str, documents: list[str], metadatas: list[dict], ids: list[str]):
         """通用数据入库方法"""
-        collection = self.cases_collection if collection_name == "anti_fraud_cases" else self.laws_collection
+        collection = self._get_collection(collection_name)
         collection.upsert(documents=documents, metadatas=metadatas, ids=ids)
         logger.info(f"Successfully upserted {len(ids)} items into {collection_name}.")
 
@@ -113,10 +113,13 @@ class VectorDBService:
             for i in range(len(results['documents'][0])):
                 distance = results['distances'][0][i] if 'distances' in results and results['distances'] else None
                 similarity = 1 - distance if distance is not None else None
+                # 将 metadata 转换为标准 dict，避免 ChromaDB 内部类型问题
+                raw_metadata = results['metadatas'][0][i]
+                metadata = dict(raw_metadata) if raw_metadata else {}
                 formatted_results.append({
                     "id": results['ids'][0][i],
                     "content": results['documents'][0][i],
-                    "metadata": results['metadatas'][0][i],
+                    "metadata": metadata,
                     "distance": distance,
                     "similarity": round(similarity, 4) if similarity else None
                 })
@@ -141,10 +144,13 @@ class VectorDBService:
         formatted_results = []
         if results and results.get('documents'):
             for i in range(len(results['documents'])):
+                # 将 metadata 转换为标准 dict，避免 ChromaDB 内部类型问题
+                raw_metadata = results['metadatas'][i]
+                metadata = dict(raw_metadata) if raw_metadata else {}
                 formatted_results.append({
                     "id": results['ids'][i],
                     "content": results['documents'][i],
-                    "metadata": results['metadatas'][i]
+                    "metadata": metadata
                 })
         return formatted_results
 

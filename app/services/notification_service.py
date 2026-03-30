@@ -4,6 +4,8 @@
 """
 import json
 from datetime import datetime
+from typing import Optional
+
 import redis
 from sqlalchemy import select, and_
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -38,7 +40,7 @@ class NotificationService:
         confidence: float,
         risk_level: str = "low",
         details: str = ""
-    ):
+    ) -> Optional[MessageLog]:
         """
         处理检测结果：记录日志并触发实时预警
         
@@ -85,9 +87,11 @@ class NotificationService:
                 )
             )
         )
-        if existing.scalar_one_or_none():
+        existing_log = existing.scalar_one_or_none()
+        if existing_log:
             logger.info(f"Notification already exists for call_id={call_id}, msg_type={msg_type}, title={title}, skipping duplicate")
             # 幂等性保证：已存在则跳过数据库写入，但仍进行 WebSocket 推送和监护人联动
+            result_log = existing_log
         else:
             # 3. [存库] 记录至 MessageLog
             new_log = MessageLog(
@@ -102,6 +106,7 @@ class NotificationService:
             db.add(new_log)
             # 不单独 commit，由调用方统一管理事务
             logger.info(f"MessageLog added for User {user_id}: {title}")
+            result_log = new_log
 
         # 4. [WebSocket] 发送给当前正在通话的用户
         # 使用统一的防御等级映射获取显示模式
@@ -128,6 +133,8 @@ class NotificationService:
         # 6. [邮件通知] 使用统一的防御等级判断是否发送邮件
         if is_risk and should_send_email(risk_level):
             await self._notify_guardian_by_email(db, user_id, risk_level, details)
+
+        return result_log
             
     async def _notify_family_in_app(self, db: AsyncSession, current_user_id: int, original_payload: dict):
         """

@@ -203,6 +203,20 @@ class RealtimeRecommendationResponse(BaseModel):
     matched_fraud_types: List[str]
 
 
+class ProfileRecommendationEnvelope(BaseModel):
+    """基于画像推荐的接口响应"""
+    code: int = 200
+    message: str = "Success"
+    data: Optional[ProfileRecommendationResponse] = None
+
+
+class RealtimeRecommendationEnvelope(BaseModel):
+    """实时推荐的接口响应"""
+    code: int = 200
+    message: str = "Success"
+    data: Optional[RealtimeRecommendationResponse] = None
+
+
 # ========== 消息日志相关 ==========
 class MessageLogResponse(BaseModel):
     """消息日志响应模型"""

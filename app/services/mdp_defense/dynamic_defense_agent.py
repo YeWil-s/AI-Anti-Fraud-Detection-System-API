@@ -1,195 +1,170 @@
-from typing import Optional
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.defense_levels import get_risk_level
 from app.models.user import User
 from app.services.email_service import email_service
-from app.core.defense_levels import get_risk_level, DEFENSE_LEVEL_MAP
-from .mdp_env import UserVulnerability, RiskLevel, InteractionDepth, DefenseAction
-import json
-import os
 
-def calculate_vulnerability(user: User) -> UserVulnerability:
-    """
-    将现有的用户画像维度（角色、职业、婚姻等）映射为易感度等级。
-    这里契合了大赛背景中提到的不同人群被骗倾向：
-    老年人/儿童/学生 -> 容易受骗；稳定职业且已婚 -> 防范较强
-    """
-    # 1. 安全获取字段（防止数据库中存在 None 导致 .lower() 报错）
-    profession = (getattr(user, 'profession', '') or '').lower()
-    role_type = getattr(user, 'role_type', '') or ''
-    marital_status = getattr(user, 'marital_status', '') or ''
-    
-    # 2. 判断高危群体：结合 role_type (老人/儿童/学生) 和 profession (退休/无业)
-    high_risk_roles = ['老人', '儿童', '学生']
-    high_risk_occupations = ['学生', '退休', '无业']
-    
-    # 如果角色属于高危，或者职业属于高危，直接判定为高易感度
-    if any(role in role_type for role in high_risk_roles) or \
-       any(job in profession for job in high_risk_occupations):
-        return UserVulnerability.HIGH
-        
-    # 3. 判断低危群体：防范意识较强的职业 + 相对稳定的生活状态(已婚)
-    low_risk_occupations = ['程序员', '教师', '公务员', '医生', 'it', 'teacher']
-    if any(job in profession for job in low_risk_occupations) and marital_status == '已婚':
-        return UserVulnerability.LOW
-        
-    # 4. 其他普通情况默认为中易感度
-    return UserVulnerability.MEDIUM
+from .mdp_types import DefenseAction, MDPObservation, PolicyDecision, RiskLevel, RuleHitLevel
+from .policy_repository import PolicyRepository
+from .state_builder import state_builder
+
 
 class DynamicDefenseAgent:
-    def __init__(self, q_table_path="app/services/mdp_defense/q_table_policy.json"):
-        """初始化 Agent，加载训练好的策略表"""
-        self.q_table = {}
-        if os.path.exists(q_table_path):
-            with open(q_table_path, 'r', encoding='utf-8') as f:
-                self.q_table = json.load(f)
-        else:
-            print(f"Warning: Q-Table 文件未找到: {q_table_path}")
+    def __init__(self, q_table_path: str = "app/services/mdp_defense/q_table_policy.json"):
+        self.policy_repository = PolicyRepository(q_table_path)
+        self.policy, self.policy_version = self.policy_repository.load_policy()
 
-    def get_best_action(self, vuln: UserVulnerability, risk: RiskLevel, depth: InteractionDepth) -> DefenseAction:
-        """根据当前状态查询最佳防御动作"""
-        # 使用枚举名作为 key，与 q_table_policy.json 格式保持一致
-        state_key = f"{vuln.name}_{risk.name}_{depth.name}"
-        
-        if state_key in self.q_table:
-            action_value = self.q_table[state_key]
-            return DefenseAction(action_value)
-            
-        # 如果没查到，根据风险等级返回默认防御级别
-        if risk == RiskLevel.HIGH:
-            return DefenseAction.LEVEL_3
-        elif risk == RiskLevel.MEDIUM:
-            return DefenseAction.LEVEL_2
-        else:
-            return DefenseAction.LEVEL_1
+    def reload_policy(self):
+        self.policy, self.policy_version = self.policy_repository.load_policy()
+
+    def select_action(self, user: User | None, observation: MDPObservation) -> PolicyDecision:
+        state = state_builder.build_state(user, observation)
+
+        if state.policy_key() in self.policy:
+            return PolicyDecision(
+                state=state,
+                action=DefenseAction(self.policy[state.policy_key()]),
+                policy_version=self.policy_version,
+                reason_codes=["policy_exact_match"],
+                fallback_used=False,
+            )
+
+        if state.legacy_policy_key() in self.policy:
+            return PolicyDecision(
+                state=state,
+                action=DefenseAction(self.policy[state.legacy_policy_key()]),
+                policy_version=self.policy_version,
+                reason_codes=["legacy_policy_match"],
+                fallback_used=False,
+            )
+
+        return self._fallback_decision(state)
+
+    def _fallback_decision(self, state) -> PolicyDecision:
+        reason_codes = ["fallback_rule_based"]
+
+        if state.rule_hit_level in [RuleHitLevel.HIGH, RuleHitLevel.CRITICAL]:
+            return PolicyDecision(
+                state=state,
+                action=DefenseAction.LEVEL_3,
+                policy_version="fallback-rule-v1",
+                reason_codes=reason_codes + ["high_rule_hit"],
+                fallback_used=True,
+            )
+
+        if state.risk_level == RiskLevel.HIGH:
+            return PolicyDecision(
+                state=state,
+                action=DefenseAction.LEVEL_3,
+                policy_version="fallback-rule-v1",
+                reason_codes=reason_codes + ["high_risk_bucket"],
+                fallback_used=True,
+            )
+
+        if state.risk_level == RiskLevel.MEDIUM:
+            if (
+                state.rule_hit_level == RuleHitLevel.MEDIUM
+                or state.audio_risk_flag
+                or state.video_risk_flag
+                or state.interaction_depth.value == "DEEP"
+            ):
+                return PolicyDecision(
+                    state=state,
+                    action=DefenseAction.LEVEL_2,
+                    policy_version="fallback-rule-v1",
+                    reason_codes=reason_codes + ["medium_risk_with_signal"],
+                    fallback_used=True,
+                )
+
+            return PolicyDecision(
+                state=state,
+                action=DefenseAction.LEVEL_2,
+                policy_version="fallback-rule-v1",
+                reason_codes=reason_codes + ["medium_risk_default"],
+                fallback_used=True,
+            )
+
+        return PolicyDecision(
+            state=state,
+            action=DefenseAction.LEVEL_1,
+            policy_version="fallback-rule-v1",
+            reason_codes=reason_codes + ["low_risk_default"],
+            fallback_used=True,
+        )
 
     async def notify_guardian_by_email(
         self,
         db: AsyncSession,
         user_id: int,
         risk_level: str,
-        details: str = ""
+        details: str = "",
     ) -> bool:
-        """
-        向家庭组管理员发送邮件预警
-        
-        已统一委托给 email_service.send_guardian_alert_by_family 处理
-        
-        Args:
-            db: 数据库会话
-            user_id: 当前用户ID（受害者）
-            risk_level: 风险等级
-            details: 风险详情
-            
-        Returns:
-            bool: 是否成功发送邮件
-        """
         success_count = await email_service.send_guardian_alert_by_family(
             db=db,
             user_id=user_id,
             risk_level=risk_level,
-            details=details
+            details=details,
         )
         return success_count > 0
 
     def get_defense_action(
         self,
-        user: User,
+        user: User | None,
         current_risk_score: float,
-        message_count: int
-    ) -> int:
-        """
-        根据用户画像、风险分数和交互轮次获取防御动作等级
-        
-        Args:
-            user: 用户对象
-            current_risk_score: 当前风险分数 (0-100)
-            message_count: 交互轮次
-            
-        Returns:
-            int: 防御动作等级 (0=LEVEL_1, 1=LEVEL_2, 2=LEVEL_3)
-        """
-        # 1. 计算用户易感度
-        vuln = calculate_vulnerability(user)
-        
-        # 2. 根据风险分数确定风险等级
-        if current_risk_score >= 80:
-            risk = RiskLevel.HIGH
-        elif current_risk_score >= 40:
-            risk = RiskLevel.MEDIUM
-        else:
-            risk = RiskLevel.LOW
-        
-        # 3. 根据交互轮次确定交互深度
-        if message_count > 10:
-            depth = InteractionDepth.DEEP
-        elif message_count > 3:
-            depth = InteractionDepth.MEDIUM
-        else:
-            depth = InteractionDepth.SHALLOW
-        
-        # 4. 查询最佳防御动作
-        action = self.get_best_action(vuln, risk, depth)
-        
-        # 返回动作等级 (0, 1, 2)
-        return action.value
+        message_count: int,
+        environment_type: str = "unknown",
+        audio_risk_flag: bool = False,
+        video_risk_flag: bool = False,
+        rule_hit_level: int = 0,
+        text_conf: float = 0.0,
+        audio_conf: float = 0.0,
+        video_conf: float = 0.0,
+    ) -> PolicyDecision:
+        observation = MDPObservation(
+            user_id=getattr(user, "user_id", 0) or 0,
+            call_id=0,
+            risk_score=current_risk_score,
+            message_count=message_count,
+            environment_type=environment_type,
+            audio_risk_flag=audio_risk_flag,
+            video_risk_flag=video_risk_flag,
+            rule_hit_level=rule_hit_level,
+            text_conf=text_conf,
+            audio_conf=audio_conf,
+            video_conf=video_conf,
+        )
+        return self.select_action(user, observation)
 
     async def get_defense_action_with_notification(
         self,
         db: AsyncSession,
         user_id: int,
-        user: User,
+        user: User | None,
         current_risk_score: float,
         message_count: int,
-        details: str = ""
-    ) -> int:
-        """
-        获取防御动作，并在需要时发送邮件通知
-        
-        Args:
-            db: 数据库会话
-            user_id: 当前用户ID
-            user: 用户对象
-            current_risk_score: 当前风险分数 (0-100)
-            message_count: 交互轮次
-            details: 风险详情
-            
-        Returns:
-            int: 防御动作等级 (0=LEVEL_1, 1=LEVEL_2, 2=LEVEL_3)
-        """
-        # 1. 计算用户易感度
-        vuln = calculate_vulnerability(user)
-        
-        # 2. 根据风险分数确定风险等级
-        if current_risk_score >= 80:
-            risk = RiskLevel.HIGH
-        elif current_risk_score >= 40:
-            risk = RiskLevel.MEDIUM
-        else:
-            risk = RiskLevel.LOW
-        
-        # 3. 根据交互轮次确定交互深度
-        if message_count > 10:
-            depth = InteractionDepth.DEEP
-        elif message_count > 3:
-            depth = InteractionDepth.MEDIUM
-        else:
-            depth = InteractionDepth.SHALLOW
-        
-        # 4. 查询最佳防御动作
-        action = self.get_best_action(vuln, risk, depth)
-        
-        # 5. 当防御等级为 LEVEL_3（强制阻断）时，发送邮件通知监护人
-        # 使用统一的防御等级映射获取 risk_level
-        mapped_risk_level = get_risk_level(action.value)
-        
-        if action == DefenseAction.LEVEL_3:
+        details: str = "",
+        environment_type: str = "unknown",
+        audio_risk_flag: bool = False,
+        video_risk_flag: bool = False,
+        rule_hit_level: int = 0,
+    ) -> PolicyDecision:
+        decision = self.get_defense_action(
+            user=user,
+            current_risk_score=current_risk_score,
+            message_count=message_count,
+            environment_type=environment_type,
+            audio_risk_flag=audio_risk_flag,
+            video_risk_flag=video_risk_flag,
+            rule_hit_level=rule_hit_level,
+        )
+
+        if decision.action == DefenseAction.LEVEL_3:
+            mapped_risk_level = get_risk_level(decision.action.value)
             await self.notify_guardian_by_email(
                 db=db,
                 user_id=user_id,
                 risk_level=mapped_risk_level,
-                details=details
+                details=details,
             )
-        
-        # 返回动作等级 (0, 1, 2)
-        return action.value
+
+        return decision

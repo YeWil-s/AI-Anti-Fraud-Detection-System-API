@@ -828,6 +828,7 @@ class ModelService:
         try:
             # 延迟导入避免循环依赖
             from app.services.llm_service import LLMService
+            from langchain_core.messages import SystemMessage, HumanMessage
             
             llm_service = LLMService()
             
@@ -853,9 +854,10 @@ class ModelService:
 - 正常社交、工作沟通 → 安全"""
 
             # 调用 LLM
-            response = await llm_service.llm.ainvoke([
-                ("system", "你是一个专业的反诈文本分析专家，只输出JSON格式结果。"),
-                ("human", prompt)
+            llm = llm_service._create_llm()
+            response = await llm.ainvoke([
+                SystemMessage(content="你是一个专业的反诈文本分析专家，只输出JSON格式结果。"),
+                HumanMessage(content=prompt),
             ])
             
             # 解析 JSON

@@ -33,12 +33,15 @@ from app.db.database import AsyncSessionLocal
 from app.db.transaction import TransactionContext
 from app.models.ai_detection_log import AIDetectionLog
 from app.models.chat_message import ChatMessage
+from app.models.mdp_decision_event import MDPDecisionEvent
 
 from app.core.storage import upload_to_minio
 from app.core.config import settings
 from app.core.logger import get_logger, bind_context
 from app.services.risk_fusion_engine import fusion_engine, fusion_engine_v2, environment_fusion_engine
 from app.services.mdp_defense.dynamic_defense_agent import DynamicDefenseAgent
+from app.services.mdp_defense.mdp_types import DefenseAction, MDPObservation, MDPState
+from app.services.mdp_defense.reward_builder import reward_builder
 from app.services.image_ocr_service import image_ocr_service
 from app.core.redis import get_redis
 
@@ -58,18 +61,194 @@ def get_redis_pool():
         _redis_pool = redis.from_url(settings.REDIS_URL, decode_responses=True)
     return _redis_pool
 
-def publish_realtime_score(user_id: int, detection_type: str, is_risk: bool, confidence: float):
-    """专门向前端 WebSocket 实时推送分数"""
+
+def _json_dumps(data) -> str:
+    return json.dumps(data or {}, ensure_ascii=False)
+
+
+def _published_defense_redis_key(call_id: int) -> str:
+    return f"mdp:published_defense:{call_id}"
+
+
+def _get_published_defense_level(call_id: int) -> int:
+    """本通通话最近一次下发给前端的系统防御等级 1/2/3；无记录时视为 1（隐式监测）。"""
     try:
+        r = get_redis_pool()
+        v = r.get(_published_defense_redis_key(call_id))
+        if v is None:
+            return 1
+        return int(v)
+    except Exception:
+        return 1
+
+
+def _set_published_defense_level(call_id: int, level: int) -> None:
+    try:
+        r = get_redis_pool()
+        r.setex(_published_defense_redis_key(call_id), 172800, str(level))
+    except Exception as e:
+        logger.debug(f"记录已下发防御等级失败 call_id={call_id}: {e}")
+
+
+def _defense_control_config(target_level: int, ui_message: str) -> dict:
+    """与 upgrade_level 分支一致，用于升级与降级（含 target_level=1）。"""
+    if target_level <= 1:
+        return {
+            "video_fps": 5.0,
+            "ui_message": ui_message,
+            "warning_mode": "inline",
+            "block_call": False,
+        }
+    if target_level == 2:
+        return {
+            "video_fps": 15.0,
+            "ui_message": ui_message,
+            "warning_mode": "modal",
+            "block_call": False,
+        }
+    return {
+        "video_fps": 30.0,
+        "ui_message": ui_message,
+        "warning_mode": "fullscreen",
+        "block_call": True,
+    }
+
+
+async def _finalize_previous_mdp_event(
+    db,
+    call_id: int,
+    next_state: MDPState,
+):
+    """用当前状态回填上一条尚未完成的 MDP 决策事件。"""
+    result = await db.execute(
+        select(MDPDecisionEvent)
+        .where(
+            MDPDecisionEvent.call_id == call_id,
+            MDPDecisionEvent.label_status == "open",
+        )
+        .order_by(MDPDecisionEvent.step_index.desc(), MDPDecisionEvent.event_id.desc())
+        .limit(1)
+    )
+    previous_event = result.scalar_one_or_none()
+    if not previous_event:
+        return
+
+    previous_state = MDPState.from_dict(json.loads(previous_event.state_json))
+    action = DefenseAction(previous_event.action_level)
+    previous_event.next_state_key = next_state.policy_key()
+    previous_event.next_state_json = _json_dumps(next_state.to_dict())
+    previous_event.reward = reward_builder.calculate_step_reward(
+        current_state=previous_state,
+        action=action,
+        next_state=next_state,
+    )
+    previous_event.reward_source = "transition"
+    previous_event.label_status = "resolved"
+
+
+async def _finalize_open_mdp_events(
+    db,
+    call_id: int,
+    final_result: DetectionResult | str,
+):
+    """在通话结束时为尚未闭合的 MDP 决策事件补充终局奖励。"""
+    result = await db.execute(
+        select(MDPDecisionEvent).where(
+            MDPDecisionEvent.call_id == call_id,
+            MDPDecisionEvent.label_status.in_(["open", "resolved"]),
+        )
+    )
+    events = result.scalars().all()
+    for event in events:
+        action = DefenseAction(event.action_level)
+        final_reward = reward_builder.calculate_final_outcome_reward(action, final_result)
+        event.reward = round((event.reward or 0.0) + final_reward, 2)
+        event.reward_source = "final"
+        event.label_status = "finalized"
+
+
+async def _create_mdp_decision_event(
+    db,
+    *,
+    call_id: int,
+    user_id: int,
+    step_index: int,
+    trigger_type: str,
+    decision,
+    observation: MDPObservation,
+    llm_result: dict,
+    rule_hit: dict,
+    defense_payload: dict,
+    ai_detection_log_id: int | None,
+    message_log_id: int | None,
+):
+    event = MDPDecisionEvent(
+        call_id=call_id,
+        user_id=user_id,
+        step_index=step_index,
+        trigger_type=trigger_type,
+        state_key=decision.state.policy_key(),
+        state_json=_json_dumps(decision.state.to_dict()),
+        fused_score=observation.risk_score,
+        text_conf=observation.text_conf,
+        audio_conf=observation.audio_conf,
+        video_conf=observation.video_conf,
+        llm_result_json=_json_dumps(llm_result),
+        rule_hit_json=_json_dumps(rule_hit),
+        action_level=decision.action.value,
+        defense_payload_json=_json_dumps(defense_payload),
+        policy_version=decision.policy_version,
+        reason_codes_json=_json_dumps(decision.reason_codes),
+        fallback_used=decision.fallback_used,
+        ai_detection_log_id=ai_detection_log_id,
+        message_log_id=message_log_id,
+        label_status="open",
+    )
+    db.add(event)
+    return event
+
+def publish_realtime_score(user_id: int, call_id: int, detection_type: str, is_risk: bool, confidence: float):
+    """向前端 WebSocket 实时推送综合检测分数
+    
+    从 Redis 读取各模态最新置信度，组合成前端期望的 detection_result 格式推送。
+    """
+    try:
+        r = get_redis_pool()
+        audio_conf = float(r.get(f"call:{call_id}:latest_audio_conf") or 0)
+        video_conf = float(r.get(f"call:{call_id}:latest_video_conf") or 0)
+        text_conf = float(r.get(f"call:{call_id}:latest_text_conf") or 0)
+
+        if detection_type == "audio":
+            audio_conf = confidence
+        elif detection_type == "video":
+            video_conf = confidence
+        elif detection_type == "text":
+            text_conf = confidence
+
+        overall = max(audio_conf, video_conf, text_conf) * 100
+
+        # 产品策略：音频/视频高风险仅用于“提高检测等级”，不直接弹窗打扰用户；
+        # 只有文本/LLM 融合阶段给出高风险结论后，前端再展示风险弹窗。
+        if detection_type in ("audio", "video"):
+            is_fraud = False
+        else:
+            is_fraud = is_risk or (overall >= 60)
+
         payload = {
             "type": "detection_result",
-            "detection_type": detection_type,
-            "is_risk": is_risk,
-            "confidence": confidence,
-            "message": "安全" if not is_risk else "检测到风险"
+            "data": {
+                "overall_score": round(overall, 1),
+                "voice_confidence": round(audio_conf, 4),
+                "video_confidence": round(video_conf, 4),
+                "text_confidence": round(text_conf, 4),
+                "is_fraud": is_fraud,
+                "advice": "" if not is_fraud else "检测到风险，请提高警惕",
+                "keywords": [],
+            }
         }
         message_data = {"user_id": user_id, "payload": payload}
         notification_service.redis.publish("fraud_alerts", json.dumps(message_data))
+        logger.info(f"Realtime score pushed: user={user_id}, type={detection_type}, audio={audio_conf:.2f}, video={video_conf:.2f}, text={text_conf:.2f}")
     except Exception as e:
         logger.error(f"Failed to publish real-time score: {e}")
 
@@ -274,6 +453,7 @@ def detect_audio_task(self, audio_base64: str, user_id: int, call_id: int) -> Di
                         } 
                     }
                     publish_control_command(user_id, payload_control)
+                    _set_published_defense_level(call_id, 2)
                     
                     # 记录到Redis，供文本检测融合时参考
                     r = get_redis_pool()
@@ -281,6 +461,7 @@ def detect_audio_task(self, audio_base64: str, user_id: int, call_id: int) -> Di
                     
                     logger.warning(f"音频检测到高危特征，已提升防御等级，等待文本融合判断 | 置信度: {confidence:.2f}")
                 
+                publish_realtime_score(user_id, call_id, "audio", is_fake, confidence)
                 return {"status": "success", "result": result}
             except Exception as e:
                 logger.error(f"Audio task failed: {e}", exc_info=True)
@@ -390,12 +571,14 @@ def detect_video_task(self, frame_data: list, user_id: int, call_id: int) -> Dic
                         } 
                     }
                     publish_control_command(user_id, payload_control)
+                    _set_published_defense_level(call_id, 2)
                     
                     # 记录到Redis，供文本检测融合时参考
                     r.setex(f"call:{call_id}:video_high_risk_flag", 300, "1")
                     
                     logger.warning(f"视频检测到高危特征，已提升防御等级，等待文本融合判断 | 置信度: {raw_conf:.2f}")
                     
+                publish_realtime_score(user_id, call_id, "video", curr_state == "ALARM", raw_conf)
                 return {"status": "success", "result": raw_result, "debounce": debounce_data}
             except Exception as e:
                 logger.error(f"Video task failed: {e}", exc_info=True)
@@ -432,6 +615,24 @@ def detect_text_task(self, text: str, user_id: int, call_id: int) -> Dict:
                     
                 await memory_service.add_message(call_id, text)
 
+                # 每次收到前端文本都持久化到 chat_messages，避免被后续分支提前 return 跳过
+                seq_result = await db.execute(
+                    select(ChatMessage.sequence)
+                    .where(ChatMessage.call_id == call_id)
+                    .order_by(ChatMessage.sequence.desc(), ChatMessage.message_id.desc())
+                    .limit(1)
+                )
+                last_seq = seq_result.scalar_one_or_none() or 0
+                current_sequence = last_seq + 1
+                msg = ChatMessage(
+                    call_id=call_id,
+                    sequence=current_sequence,
+                    speaker="other",
+                    content=text[:1000] if len(text) > 1000 else text
+                )
+                db.add(msg)
+                await db.flush()
+
                 now = datetime.now()
                 call_start_time = record.start_time if record and hasattr(record, 'start_time') and record.start_time else now
                 time_offset = int((now - call_start_time).total_seconds())
@@ -445,13 +646,25 @@ def detect_text_task(self, text: str, user_id: int, call_id: int) -> Dict:
                     logger.warning(f"触发规则拦截: {rule_hit['keyword']}")
                     risk_level_code = rule_hit.get('risk_level', 1)
                     if risk_level_code >= 4:
-                        # 注册为 commit 后执行（外部服务）
-                        tx_ctx.add_post_commit_task(
-                            publish_control_command, user_id, {
-                                "type": "control", "action": "upgrade_level", "target_level": 3,
-                                "config": {"ui_message": f"触发高危防骗规则: {rule_hit['keyword']}", "block_call": True}
-                            }
-                        )
+                        uid, cid = user_id, call_id
+                        kw = rule_hit["keyword"]
+
+                        def _post_rule_upgrade():
+                            publish_control_command(
+                                uid,
+                                {
+                                    "type": "control",
+                                    "action": "upgrade_level",
+                                    "target_level": 3,
+                                    "config": {
+                                        "ui_message": f"触发高危防骗规则: {kw}",
+                                        "block_call": True,
+                                    },
+                                },
+                            )
+                            _set_published_defense_level(cid, 3)
+
+                        tx_ctx.add_post_commit_task(_post_rule_upgrade)
                         force_llm = True
 
                 try:
@@ -461,7 +674,30 @@ def detect_text_task(self, text: str, user_id: int, call_id: int) -> Dict:
                     if force_llm:
                         text_conf = max(text_conf, 0.95) 
                     elif text_conf < 0.3:
-                        logger.info("ONNX 判定为安全闲聊，跳过重量级决策")
+                        # 低风险快速返回前，同步更新实时文本置信度，避免前端长期显示 0%
+                        r_fast = get_redis_pool()
+                        r_fast.setex(f"call:{call_id}:latest_text_conf", 3600, str(text_conf))
+
+                        # A 方案：即使 ONNX 判定低风险，也记录一次模型检测日志
+                        detected_text = text[:500] if len(text) > 500 else text
+                        sensitive_keywords = await _extract_sensitive_keywords(text)
+                        ai_log = AIDetectionLog(
+                            call_id=call_id,
+                            detection_type="text",
+                            text_confidence=text_conf,
+                            overall_score=round(text_conf * 100.0, 2),
+                            detected_text=detected_text,
+                            detected_keywords=sensitive_keywords,
+                            match_script=None,
+                            intent="onnx_safe_skip",
+                            time_offset=time_offset,
+                            model_version=f"onnx-{text_result.get('model_type', 'unknown')}"
+                        )
+                        db.add(ai_log)
+                        await db.flush()
+                        # 推送一次实时融合分数（由 publish_realtime_score 读取 Redis 黑板值）
+                        publish_realtime_score(user_id, call_id, "text", False, text_conf)
+                        logger.info("ONNX 判定为安全闲聊，已记录检测日志并跳过重量级决策")
                         return {"status": "success", "result": {"is_fraud": False, "risk_level": "safe", "source": "onnx"}}
                 except Exception as e:
                     logger.error(f"ONNX 文本快筛异常: {e}")
@@ -554,13 +790,29 @@ def detect_text_task(self, text: str, user_id: int, call_id: int) -> Dict:
                     call_id=str(call_id)  # 传入call_id用于环境感知和时序平滑
                 )
 
+                # 存储文本置信度供其他模态读取
+                r.setex(f"call:{call_id}:latest_text_conf", 3600, str(text_conf))
+
                 # 5. 马尔可夫决策层
                 # 根据画像、计算的科学分数、交互轮次获取 O(1) 查表动作
-                action_level = mdp_agent.get_defense_action(
-                    user=user, 
-                    current_risk_score=fused_score, 
-                    message_count=msg_count
+                mdp_observation = MDPObservation(
+                    user_id=user_id,
+                    call_id=call_id,
+                    risk_score=fused_score,
+                    message_count=msg_count,
+                    environment_type=env_type,
+                    audio_risk_flag=audio_high_risk,
+                    video_risk_flag=video_high_risk,
+                    rule_hit_level=rule_hit.get("risk_level", 0) if rule_hit else 0,
+                    text_conf=text_conf,
+                    audio_conf=audio_conf,
+                    video_conf=raw_video_conf,
+                    llm_result=llm_result,
+                    rule_hit=rule_hit or {},
                 )
+                decision = mdp_agent.select_action(user, mdp_observation)
+                action_level = decision.action.value
+                await _finalize_previous_mdp_event(db, call_id, decision.state)
 
                 # 将日志数据落盘
                 # 提取敏感关键词（从检测文本中）
@@ -569,6 +821,7 @@ def detect_text_task(self, text: str, user_id: int, call_id: int) -> Dict:
                 
                 ai_log = AIDetectionLog(
                     call_id=call_id,
+                    detection_type="text",
                     text_confidence=fused_score / 100.0, # 兼容老数据库格式 
                     overall_score=fused_score,           # 得出的分数
                     detected_text=detected_text,         # 检测到的完整文本
@@ -579,20 +832,20 @@ def detect_text_task(self, text: str, user_id: int, call_id: int) -> Dict:
                     model_version=f"fusion-mdp-v1-{text_result.get('model_type', 'unknown')}"
                 )
                 db.add(ai_log)
-                
-                # 同时保存到对话历史表（在同一事务中，不单独 commit）
-                msg = ChatMessage(
-                    call_id=call_id,
-                    sequence=msg_count,
-                    speaker="other",
-                    content=text[:1000] if len(text) > 1000 else text
-                )
-                db.add(msg)
+                await db.flush()
 
                 # 6. 转化与执行 MDP 的拦截指令
                 alert_level = 'safe'
                 record_verdict = DetectionResult.SAFE
                 ui_message = "请注意保护个人隐私。"
+                defense_payload = {
+                    "target_level": action_level + 1,
+                    "ui_message": ui_message,
+                    "warning_mode": "inline",
+                    "block_call": False,
+                }
+                critical_message_log = None
+                decision_message_log = None
                 
                 target_level = action_level + 1 # Action(0,1,2) 对应 System Level(1,2,3)
 
@@ -604,7 +857,7 @@ def detect_text_task(self, text: str, user_id: int, call_id: int) -> Dict:
                     
                     # 触发联动闭环 - 发送 WebSocket 和邮件通知给监护人
                     # 使用事务内的 session 写入 MessageLog
-                    await notification_service.handle_detection_result(
+                    critical_message_log = await notification_service.handle_detection_result(
                         db=db, user_id=user_id, call_id=call_id,
                         detection_type="MDP三级防御-强制阻断", is_risk=True, 
                         confidence=fused_score / 100.0,
@@ -619,7 +872,7 @@ def detect_text_task(self, text: str, user_id: int, call_id: int) -> Dict:
                     ui_message = f"【风险提示】行为可疑。防骗建议：{llm_result.get('advice', '请仔细核实对方身份！')}"
                 
                 # 通知前端展示并在记录中更新（MessageLog 写入在事务内）
-                await notification_service.handle_detection_result(
+                decision_message_log = await notification_service.handle_detection_result(
                     db=db, user_id=user_id, call_id=call_id,
                     detection_type="MDP动态决策", is_risk=(action_level > 0), 
                     confidence=fused_score / 100.0,
@@ -642,21 +895,76 @@ def detect_text_task(self, text: str, user_id: int, call_id: int) -> Dict:
                         record.detected_result = DetectionResult.SUSPICIOUS
                     # 不再单独 commit，统一在事务结束时 commit
 
-                # 将 WebSocket 控制指令注册为 commit 后执行（外部服务）
-                if target_level > 1:
+                # 将 WebSocket 控制指令注册为 commit 后执行（升级与自动降级：仅在实际等级变化时下发）
+                prev_published = _get_published_defense_level(call_id)
+                if target_level != prev_published:
+                    cfg = _defense_control_config(target_level, ui_message)
                     payload_control = {
-                        "type": "control", "action": "upgrade_level", "target_level": target_level,
-                        "config": {
-                            "video_fps": 15.0 if target_level == 2 else 30.0,
-                            "ui_message": ui_message,
-                            "warning_mode": "modal" if target_level == 2 else "fullscreen",
-                            "block_call": (target_level == 3)
+                        "type": "control",
+                        "action": "upgrade_level",
+                        "target_level": target_level,
+                        "config": cfg,
+                    }
+                    defense_payload = payload_control
+
+                    def _publish_and_remember(uid: int, pl: dict, cid: int, lvl: int):
+                        publish_control_command(uid, pl)
+                        _set_published_defense_level(cid, lvl)
+
+                    tx_ctx.add_post_commit_task(_publish_and_remember, user_id, payload_control, call_id, target_level)
+
+                # 注册 commit 后推送综合检测结果给前端
+                _uid, _cid, _tc, _ac, _vc, _fs, _af = (
+                    user_id, call_id, text_conf, audio_conf, raw_video_conf, fused_score, action_level
+                )
+                _kw = sensitive_keywords.split(",") if sensitive_keywords else []
+                _adv = llm_result.get('advice', '') if action_level > 0 else ''
+
+                def _push_detection_result():
+                    det_payload = {
+                        "type": "detection_result",
+                        "data": {
+                            "overall_score": round(_fs, 1),
+                            "voice_confidence": round(_ac, 4),
+                            "video_confidence": round(_vc, 4),
+                            "text_confidence": round(_tc, 4),
+                            "is_fraud": _af > 0,
+                            "advice": _adv,
+                            "keywords": _kw,
                         }
                     }
-                    tx_ctx.add_post_commit_task(publish_control_command, user_id, payload_control)
+                    msg = {"user_id": _uid, "payload": det_payload}
+                    notification_service.redis.publish("fraud_alerts", json.dumps(msg, ensure_ascii=False))
+
+                tx_ctx.add_post_commit_task(_push_detection_result)
+
+                await db.flush()
+                primary_message_log = decision_message_log or critical_message_log
+                await _create_mdp_decision_event(
+                    db,
+                    call_id=call_id,
+                    user_id=user_id,
+                    step_index=msg_count,
+                    trigger_type="text",
+                    decision=decision,
+                    observation=mdp_observation,
+                    llm_result=llm_result,
+                    rule_hit=rule_hit or {},
+                    defense_payload=defense_payload,
+                    ai_detection_log_id=ai_log.log_id,
+                    message_log_id=primary_message_log.id if primary_message_log else None,
+                )
 
                 # 保存返回结果供后续使用
-                result_data = {"status": "success", "fused_score": fused_score, "action_level": action_level}
+                result_data = {
+                    "status": "success",
+                    "fused_score": fused_score,
+                    "action_level": action_level,
+                    "policy_version": decision.policy_version,
+                    "reason_codes": decision.reason_codes,
+                    "fallback_used": decision.fallback_used,
+                    "state_key": decision.state.policy_key(),
+                }
                 
             except Exception as e:
                 logger.error(f"MDP Fusion Command Center failed: {e}", exc_info=True)
@@ -930,19 +1238,47 @@ def detect_image_task(self, image_base64: str, user_id: int, call_id: int) -> Di
         return {"status": "error", "message": str(e)}
 
 
+async def _get_chat_history_from_db(db, call_id: int) -> str:
+    """当 Redis 短期记忆不可用时，从持久化消息表回退读取对话历史。"""
+    result = await db.execute(
+        select(ChatMessage)
+        .where(ChatMessage.call_id == call_id)
+        .order_by(ChatMessage.sequence.asc(), ChatMessage.message_id.asc())
+    )
+    messages = result.scalars().all()
+    if not messages:
+        return ""
+
+    history_lines = []
+    for index, msg in enumerate(messages, start=1):
+        speaker = (msg.speaker or "unknown").strip()
+        content = (msg.content or "").strip()
+        if not content:
+            continue
+        history_lines.append(f"{index}. [{speaker}] {content}")
+
+    return "\n".join(history_lines)
+
+
 @celery_app.task(name="generate_post_call_summary")
 def generate_post_call_summary_task(call_id: int, user_id: int):
     """通话结束后，由 Celery 去读取自身内存中的对话并呼叫 LLM 进行复盘"""
     async def _process():
-        chat_history = await memory_service.get_context(call_id)
-        
-        if not chat_history or chat_history == "暂无历史上下文。" or len(chat_history) == 0:
-            await memory_service.clear_context(call_id)
-            return {"status": "skipped", "reason": "No conversation history"}
-            
         try:
-            summary_result = await llm_service.generate_final_summary(chat_history)
             async with AsyncSessionLocal() as db:
+                chat_history = await memory_service.get_context(call_id)
+
+                # Redis 上下文为空或读取失败时，回退到数据库中的持久化对话。
+                if not chat_history or chat_history in ["暂无历史上下文。", "获取上下文失败。"]:
+                    chat_history = await _get_chat_history_from_db(db, call_id)
+                    if chat_history:
+                        logger.info(f"通话 {call_id} 使用数据库对话历史生成总结")
+
+                if not chat_history:
+                    await memory_service.clear_context(call_id)
+                    return {"status": "skipped", "reason": "No conversation history"}
+
+                summary_result = await llm_service.generate_final_summary(chat_history)
                 result = await db.execute(select(CallRecord).where(CallRecord.call_id == call_id))
                 record = result.scalar_one_or_none()
                 
@@ -958,6 +1294,8 @@ def generate_post_call_summary_task(call_id: int, user_id: int):
                         record_verdict = DetectionResult.SUSPICIOUS
 
                     record.detected_result = record_verdict
+                    await db.commit()
+                    await _finalize_open_mdp_events(db, call_id, record.detected_result)
                     await db.commit()
                     
                     # 提取并保存长期记忆
@@ -983,7 +1321,7 @@ def generate_post_call_summary_task(call_id: int, user_id: int):
         except Exception as e:
             return {"status": "error", "message": str(e)}
         finally:
-            memory_service.clear_context(call_id)
+            await memory_service.clear_context(call_id)
 
     try:
         return async_to_sync(_process)()

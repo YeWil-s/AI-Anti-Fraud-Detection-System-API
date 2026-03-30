@@ -1,13 +1,13 @@
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy.orm import Session
+from sqlalchemy.ext.asyncio import AsyncSession
 from typing import List
 
 from app.db.database import get_db
 from app.services.education_service import EducationService
 from app.schemas import (
     CaseMatchRequest, LearningRecordRequest, KnowledgeItemResponse,
-    RealtimeRecommendRequest, ProfileRecommendationResponse, RealtimeRecommendationResponse,
-    ResponseModel
+    RealtimeRecommendRequest,
+    ProfileRecommendationEnvelope, RealtimeRecommendationEnvelope, ResponseModel
 )
 
 router = APIRouter(
@@ -16,7 +16,7 @@ router = APIRouter(
 )
 
 @router.get("/recommendations/{user_id}", response_model=List[KnowledgeItemResponse])
-async def get_recommendations(user_id: int, limit: int = 5, db: Session = Depends(get_db)):
+async def get_recommendations(user_id: int, limit: int = 5, db: AsyncSession = Depends(get_db)):
     """
     获取用户的个性化反诈学习推荐
     """
@@ -28,7 +28,7 @@ async def get_recommendations(user_id: int, limit: int = 5, db: Session = Depend
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.post("/match_cases")
-async def match_similar_cases(request: CaseMatchRequest, db: Session = Depends(get_db)):
+async def match_similar_cases(request: CaseMatchRequest, db: AsyncSession = Depends(get_db)):
     """
     根据当前的通话内容，匹配相似诈骗案例和相关法律法规
     """
@@ -40,13 +40,13 @@ async def match_similar_cases(request: CaseMatchRequest, db: Session = Depends(g
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.post("/record/{user_id}")
-async def record_learning(user_id: int, request: LearningRecordRequest, db: Session = Depends(get_db)):
+async def record_learning(user_id: int, request: LearningRecordRequest, db: AsyncSession = Depends(get_db)):
     """
     记录或更新用户的学习进度
     """
     service = EducationService(db)
     try:
-        record = service.record_user_learning(user_id, request.item_id, request.is_completed)
+        record = await service.record_user_learning(user_id, request.item_id, request.is_completed)
         return {"status": "success", "message": "学习记录已更新"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -54,8 +54,8 @@ async def record_learning(user_id: int, request: LearningRecordRequest, db: Sess
 
 # ================= 新增推荐 API =================
 
-@router.get("/recommendations/profile/{user_id}", response_model=ResponseModel)
-async def get_profile_recommendations(user_id: int, limit: int = 5, db: Session = Depends(get_db)):
+@router.get("/recommendations/profile/{user_id}", response_model=ProfileRecommendationEnvelope)
+async def get_profile_recommendations(user_id: int, limit: int = 5, db: AsyncSession = Depends(get_db)):
     """
     基于用户画像的个性化推荐
     
@@ -78,8 +78,8 @@ async def get_profile_recommendations(user_id: int, limit: int = 5, db: Session 
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.post("/recommendations/realtime", response_model=ResponseModel)
-async def get_realtime_recommendations(request: RealtimeRecommendRequest, db: Session = Depends(get_db)):
+@router.post("/recommendations/realtime", response_model=RealtimeRecommendationEnvelope)
+async def get_realtime_recommendations(request: RealtimeRecommendRequest, db: AsyncSession = Depends(get_db)):
     """
     基于实时对话内容的推荐
     
@@ -108,7 +108,7 @@ async def get_library_recommendations(
     user_id: int, 
     fraud_type: str = None,
     limit: int = 5, 
-    db: Session = Depends(get_db)
+    db: AsyncSession = Depends(get_db)
 ):
     """
     从案例库和法律库中推荐内容

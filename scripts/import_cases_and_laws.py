@@ -21,7 +21,19 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 # Mock掉不需要的模块
 sys.modules['chromadb.telemetry.posthog'] = MagicMock()
 sys.modules['posthog'] = MagicMock()
-sys.modules['fastapi'] = MagicMock()
+
+# Mock fastapi 及其子模块，确保 ChromaDB 能正常导入
+import types
+fastapi_module = types.ModuleType('fastapi')
+fastapi_module.__spec__ = types.SimpleNamespace(name='fastapi')
+fastapi_responses = types.ModuleType('fastapi.responses')
+fastapi_responses.JSONResponse = MagicMock
+fastapi_module.responses = fastapi_responses
+# Mock WebSocket
+fastapi_module.WebSocket = MagicMock
+fastapi_module.WebSocketDisconnect = MagicMock
+sys.modules['fastapi'] = fastapi_module
+sys.modules['fastapi.responses'] = fastapi_responses
 sys.modules['fastapi.websockets'] = MagicMock()
 sys.modules['aiosmtplib'] = MagicMock()
 
@@ -113,45 +125,55 @@ async def import_case_library(file_path: str):
         cases = json.load(f)
     
     imported_count = 0
+    documents = []
+    metadatas = []
+    ids = []
     
     for case in cases:
         try:
             # 提取字段
             title = case.get("title", "")
             content = case.get("content", "")
-            fraud_type = normalize_fraud_type(case.get("fraud_type", ""))
+            # 保留原始中文诈骗类型，用于匹配
+            fraud_type = case.get("fraud_type", "").strip() or "其他"
             target_groups = normalize_target_groups(case.get("target_group", ""))
             risk_level = parse_risk_level(case.get("risk_level", ""))
             
             if not content:
                 continue
             
-            # 构建元数据
+            # 构建元数据（ChromaDB 只支持 str, int, float, bool 类型）
             metadata = {
                 "title": title,
                 "fraud_type": fraud_type,
-                "target_groups": target_groups,
-                "risk_level": risk_level,
+                "target_groups": ",".join(target_groups) if target_groups else "",
+                "risk_level": str(risk_level),
                 "source": "case_library",
                 "imported_at": datetime.now().isoformat()
             }
             
-            # 添加到向量数据库
-            await vector_db.add_case(
-                case_id=f"case_{imported_count}_{datetime.now().timestamp()}",
-                content=content,
-                fraud_type=fraud_type,
-                metadata=metadata
-            )
+            # 收集数据用于批量插入
+            documents.append(content)
+            metadatas.append(metadata)
+            ids.append(f"case_{imported_count}_{int(datetime.now().timestamp())}")
             
             imported_count += 1
             
             if imported_count % 10 == 0:
-                logger.info(f"已导入 {imported_count} 个案例")
+                logger.info(f"已收集 {imported_count} 个案例")
                 
         except Exception as e:
-            logger.error(f"导入案例失败: {e}")
+            logger.error(f"收集案例失败: {e}")
             continue
+    
+    # 批量添加到向量数据库
+    if documents:
+        vector_db.add_data(
+            collection_name="anti_fraud_cases",
+            documents=documents,
+            metadatas=metadatas,
+            ids=ids
+        )
     
     logger.info(f"案例库导入完成，共导入 {imported_count} 个案例")
     return imported_count
@@ -165,13 +187,17 @@ async def import_law_library(file_path: str):
         laws = json.load(f)
     
     imported_count = 0
+    documents = []
+    metadatas = []
+    ids = []
     
     for law in laws:
         try:
             # 提取字段
             title = law.get("title", "")
             content = law.get("content", "")
-            fraud_type = normalize_fraud_type(law.get("fraud_type", ""))
+            # 保留原始中文诈骗类型，用于匹配
+            fraud_type = law.get("fraud_type", "").strip() or "其他"
             
             if not content:
                 continue
@@ -185,19 +211,25 @@ async def import_law_library(file_path: str):
                 "imported_at": datetime.now().isoformat()
             }
             
-            # 添加到向量数据库（作为案例存储，但标记为法律条文）
-            await vector_db.add_case(
-                case_id=f"law_{imported_count}_{datetime.now().timestamp()}",
-                content=f"{title}\n\n{content}",
-                fraud_type=fraud_type,
-                metadata=metadata
-            )
+            # 收集数据用于批量插入
+            documents.append(f"{title}\n\n{content}")
+            metadatas.append(metadata)
+            ids.append(f"law_{imported_count}_{int(datetime.now().timestamp())}")
             
             imported_count += 1
             
         except Exception as e:
-            logger.error(f"导入法律条文失败: {e}")
+            logger.error(f"收集法律条文失败: {e}")
             continue
+    
+    # 批量添加到向量数据库（使用 anti_fraud_laws 集合）
+    if documents:
+        vector_db.add_data(
+            collection_name="anti_fraud_laws",
+            documents=documents,
+            metadatas=metadatas,
+            ids=ids
+        )
     
     logger.info(f"法律库导入完成，共导入 {imported_count} 条法律")
     return imported_count

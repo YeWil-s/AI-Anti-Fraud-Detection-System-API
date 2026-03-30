@@ -32,12 +32,6 @@ class RiskAssessmentOutput(BaseModel):
 
 class LLMService:
     def __init__(self):
-        self.llm = ChatOpenAI(
-            model=settings.LLM_MODEL_NAME, 
-            temperature=0.1, 
-            api_key=settings.LLM_API_KEY,
-            base_url=settings.LLM_BASE_URL
-        )
         self.output_parser = JsonOutputParser(pydantic_object=RiskAssessmentOutput)
         self.prompt_template = ChatPromptTemplate.from_messages([
             ("system", """你是一个专业的多模态反诈智能体助手，具备强大的意图识别与复杂逻辑推理能力。
@@ -87,12 +81,36 @@ class LLMService:
             ("human", "【当前最新输入(含语音转写)】：{user_input}")
         ])
 
+    def _create_llm(self) -> ChatOpenAI:
+        """
+        为每次调用创建独立 LLM 客户端，避免 Celery 线程池下复用异步客户端导致
+        `Event loop is closed`。
+        """
+        return ChatOpenAI(
+            model=settings.LLM_MODEL_NAME,
+            temperature=0.1,
+            api_key=settings.LLM_API_KEY,
+            base_url=settings.LLM_BASE_URL
+        )
+
+    def _parse_json_response(self, content: str) -> dict:
+        """清理并解析模型返回的 JSON 内容。"""
+        cleaned = content.strip()
+        if cleaned.startswith("```json"):
+            cleaned = cleaned[7:]
+        if cleaned.startswith("```"):
+            cleaned = cleaned[3:]
+        if cleaned.endswith("```"):
+            cleaned = cleaned[:-3]
+        return self.output_parser.parse(cleaned.strip())
+
 
     async def analyze_text_risk(self, user_input: str, chat_history: str, user_profile: str = "青壮年") -> dict:
         """带记忆池文本风控分析"""
         try:
             context = await asyncio.to_thread(vector_db.get_context_for_llm, query=user_input, n_results=2)
-            chain = self.prompt_template | self.llm | self.output_parser
+            llm = self._create_llm()
+            chain = self.prompt_template | llm | self.output_parser
             
             response = await chain.ainvoke({
                 "user_profile": user_profile,
@@ -262,8 +280,8 @@ class LLMService:
                     if recommendations.get("cases"):
                         rec_context = "\n\n【系统推荐的相似案例】:\n"
                         for i, case in enumerate(recommendations["cases"][:2], 1):
-                            rec_context += f"案例{i}: {case.get('metadata', {}).get('title', '')}\n"
-                            rec_context += f"类型: {case.get('metadata', {}).get('fraud_type', '')}\n"
+                            rec_context += f"案例{i}: {case.get('title', '')}\n"
+                            rec_context += f"类型: {case.get('fraud_type', '')}\n"
                             rec_context += f"内容: {case.get('content', '')[:200]}...\n\n"
                         context += rec_context
                 except Exception as rec_e:
@@ -333,23 +351,29 @@ class LLMService:
 5. 历史记忆参考：如果用户有多次忽略告警的记录，应提高告警强度；如果用户曾遭遇相似诈骗，应提前预警。
 6. 聊天双方识别：在文字聊天场景中，明确指出可疑消息的发送者身份（是用户发送的还是对方发送的）。
 
-请综合推理，并严格按照 JSON 格式输出最终裁定结果。
-{self.output_parser.get_format_instructions()}
+请综合推理，并严格按照以下 JSON 结构输出最终裁定结果：
+{{
+  "is_fraud": true,
+  "risk_level": "safe|suspicious|fake",
+  "match_script": "匹配的诈骗剧本，没有则填 无",
+  "fraud_type": "诈骗类型，没有则填 其他",
+  "intent": "核心意图识别",
+  "analysis": "逻辑分析过程",
+  "advice": "给用户的防骗建议"
+}}
 
-【极其重要】：你的输出必须且只能是一个合法的 JSON 对象。绝对不能包含任何 Markdown 语法（如 ```json ），不要包含任何解释性文本、不要有任何前言或后语。必须以大括号 {{ 开始，以大括号 }} 结束。"""
-            
-            # 创建动态提示词模板
-            from langchain.prompts import ChatPromptTemplate
-            dynamic_prompt_template = ChatPromptTemplate.from_messages([
-                ("system", dynamic_system_prompt),
-                ("human", "【当前最新输入(含语音转写)】：{user_input}")
-            ])
-            
-            chain = dynamic_prompt_template | self.llm | self.output_parser
-            
-            response = await chain.ainvoke({
-                "user_input": user_input
-            })
+【极其重要】：
+1. 你的输出必须且只能是一个合法 JSON 对象。
+2. 不要包含 Markdown 代码块，不要附加解释性文本。
+3. `risk_level` 只能取 `safe`、`suspicious`、`fake` 三个值之一。"""
+
+            llm = self._create_llm()
+            messages = [
+                SystemMessage(content=dynamic_system_prompt),
+                HumanMessage(content=f"【当前最新输入(含语音转写)】：{user_input}")
+            ]
+            raw_response = await llm.ainvoke(messages)
+            response = self._parse_json_response(raw_response.content)
             
             # 4. 将推荐信息添加到响应中
             if recommendations:
@@ -464,8 +488,9 @@ class LLMService:
                 SystemMessage(content=system_prompt),
                 HumanMessage(content=user_content)
             ]
-            
-            response = await self.llm.ainvoke(messages)
+
+            llm = self._create_llm()
+            response = await llm.ainvoke(messages)
             return response.content
             
         except Exception as e:
@@ -554,9 +579,10 @@ class LLMService:
                 SystemMessage(content=system_prompt),
                 HumanMessage(content=user_content)
             ]
-            
+
+            llm = self._create_llm()
             # 使用 astream 方法进行流式输出
-            async for chunk in self.llm.astream(messages):
+            async for chunk in llm.astream(messages):
                 if chunk.content:
                     yield chunk.content
                     
@@ -595,18 +621,9 @@ class LLMService:
 
         try:
             # 3. 直接调用 LLM 并尝试解析返回结果
-            response = await self.llm.ainvoke(messages)
-            
-            # 清理可能携带的 Markdown 格式符
-            content = response.content.strip()
-            if content.startswith("```json"):
-                content = content[7:]
-            if content.startswith("```"):
-                content = content[3:]
-            if content.endswith("```"):
-                content = content[:-3]
-                
-            result = json.loads(content.strip())
+            llm = self._create_llm()
+            response = await llm.ainvoke(messages)
+            result = self._parse_json_response(response.content)
             return result
             
         except Exception as e:

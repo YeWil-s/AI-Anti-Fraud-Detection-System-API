@@ -392,7 +392,7 @@ async def _persist_chat_history(db: AsyncSession, call_id: int):
         # 从Redis获取对话历史
         chat_history = await memory_service.get_context(call_id)
         
-        if not chat_history or chat_history == "暂无历史上下文。":
+        if not chat_history or chat_history in ["暂无历史上下文。", "获取上下文失败。"]:
             logger.info(f"通话 {call_id} 没有对话历史需要持久化")
             return
         

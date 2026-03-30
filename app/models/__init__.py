@@ -12,6 +12,7 @@ from .message_log import MessageLog
 from app.models.education import KnowledgeItem, UserLearningRecord
 from .admin import Admin, AdminLog, SystemMonitor
 from .chat_message import ChatMessage
+from .mdp_decision_event import MDPDecisionEvent
 
 __all__ = [
     "User",
@@ -33,4 +34,5 @@ __all__ = [
     "AdminLog",
     "SystemMonitor",
     "ChatMessage",
+    "MDPDecisionEvent",
 ]

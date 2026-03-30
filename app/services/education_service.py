@@ -1,6 +1,5 @@
-from sqlalchemy.orm import Session
-from sqlalchemy import desc
-from sqlalchemy.future import select
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import desc, select
 from typing import List, Dict, Any
 import asyncio
 
@@ -37,24 +36,76 @@ FRAUD_TYPES = [
 ]
 
 class EducationService:
-    def __init__(self, db: Session):
+    def __init__(self, db: AsyncSession):
         self.db = db
         # 引入向量数据库单例
         self.vector_db = vector_db 
+
+    def _safe_metadata(self, item: Dict[str, Any]) -> Dict[str, Any]:
+        """统一将向量库返回的 metadata 转成普通 dict。"""
+        raw_metadata = item.get("metadata") or {}
+        return dict(raw_metadata) if isinstance(raw_metadata, dict) else {}
+
+    def _format_case_item(self, item: Dict[str, Any], default_fraud_type: str = "") -> Dict[str, Any]:
+        metadata = self._safe_metadata(item)
+        fraud_type = item.get("fraud_type") or metadata.get("fraud_type") or default_fraud_type or "其他"
+        return {
+            "id": str(item.get("id", "")),
+            "title": metadata.get("title") or item.get("title") or f"{fraud_type}案例",
+            "content": item.get("content", ""),
+            "fraud_type": fraud_type,
+            "risk_level": metadata.get("risk_level") or item.get("risk_level"),
+            "similarity": item.get("similarity"),
+        }
+
+    def _format_slogan_item(self, item: Dict[str, Any], default_fraud_type: str = "") -> Dict[str, Any]:
+        metadata = self._safe_metadata(item)
+        return {
+            "id": str(item.get("id", "")),
+            "content": item.get("content", ""),
+            "fraud_type": item.get("fraud_type") or metadata.get("fraud_type") or default_fraud_type or "其他",
+        }
+
+    def _format_video_item(self, item: Dict[str, Any], default_fraud_type: str = "") -> Dict[str, Any]:
+        metadata = self._safe_metadata(item)
+        fraud_type = item.get("fraud_type") or metadata.get("fraud_type") or default_fraud_type or "其他"
+        return {
+            "id": str(item.get("id", "")),
+            "title": metadata.get("title") or item.get("title") or f"{fraud_type}视频",
+            "url": metadata.get("url") or item.get("url") or "",
+            "fraud_type": fraud_type,
+            "description": metadata.get("description") or item.get("description") or item.get("content", ""),
+        }
+
+    def _format_law_item(self, item: Dict[str, Any], default_fraud_type: str = "") -> Dict[str, Any]:
+        metadata = self._safe_metadata(item)
+        return {
+            "id": str(item.get("id", "")),
+            "title": metadata.get("title") or item.get("title") or "反诈法条",
+            "content": item.get("content", ""),
+            "fraud_type": item.get("fraud_type") or metadata.get("fraud_type") or default_fraud_type or "其他",
+            "law_type": metadata.get("law_type") or item.get("law_type") or "反电信网络诈骗法",
+            "source_label": item.get("source_label") or metadata.get("source") or "反诈法",
+        }
 
     async def get_personalized_recommendations(self, user_id: int, limit: int = 5):
         """
         功能1: 根据用户画像和近期通话，为用户定制个人学习视频和案例教育
         """
-        user = self.db.query(User).filter(User.user_id == user_id).first()
+        # 使用异步查询
+        result = await self.db.execute(select(User).filter(User.user_id == user_id))
+        user = result.scalar_one_or_none()
         if not user:
             return []
 
         # 1. 查找近期高危通话记录 (最近3条)
-        recent_calls = self.db.query(CallRecord).filter(
-            CallRecord.user_id == user_id, 
-            CallRecord.risk_level.in_(['high', 'critical'])
-        ).order_by(desc(CallRecord.created_at)).limit(3).all()
+        result = await self.db.execute(
+            select(CallRecord).filter(
+                CallRecord.user_id == user_id, 
+                CallRecord.risk_level.in_(['high', 'critical'])
+            ).order_by(desc(CallRecord.created_at)).limit(3)
+        )
+        recent_calls = result.scalars().all()
 
         vulnerable_tags = set()
         
@@ -77,13 +128,19 @@ class EducationService:
                 vulnerable_tags.add(tag)
 
         # 3. 根据提取到的标签，去 MySQL 中查询对应的学习资料 (视频/图文)
-        recommendations = self.db.query(KnowledgeItem).filter(
-            KnowledgeItem.fraud_type.in_(vulnerable_tags)
-        ).limit(limit).all()
+        result = await self.db.execute(
+            select(KnowledgeItem).filter(
+                KnowledgeItem.fraud_type.in_(vulnerable_tags)
+            ).limit(limit)
+        )
+        recommendations = result.scalars().all()
         
         # 4. 如果没查到针对性的，就返回通用的最新资料兜底
         if not recommendations:
-            recommendations = self.db.query(KnowledgeItem).order_by(desc(KnowledgeItem.created_at)).limit(limit).all()
+            result = await self.db.execute(
+                select(KnowledgeItem).order_by(desc(KnowledgeItem.created_at)).limit(limit)
+            )
+            recommendations = result.scalars().all()
             
         return recommendations
 
@@ -113,16 +170,19 @@ class EducationService:
             "laws": similar_laws
         }
 
-    def record_user_learning(self, user_id: int, item_id: int, is_completed: bool = False):
+    async def record_user_learning(self, user_id: int, item_id: int, is_completed: bool = False):
         """记录用户的学习进度"""
-        record = self.db.query(UserLearningRecord).filter_by(user_id=user_id, item_id=item_id).first()
+        result = await self.db.execute(
+            select(UserLearningRecord).filter_by(user_id=user_id, item_id=item_id)
+        )
+        record = result.scalar_one_or_none()
         if not record:
             record = UserLearningRecord(user_id=user_id, item_id=item_id, is_completed=is_completed)
             self.db.add(record)
         else:
             record.is_completed = is_completed
         
-        self.db.commit()
+        await self.db.commit()
         return record
 
     # ================= 新增推荐方法 =================
@@ -144,7 +204,8 @@ class EducationService:
                 "recommended_types": ["诈骗类型1", "诈骗类型2"]
             }
         """
-        user = self.db.query(User).filter(User.user_id == user_id).first()
+        result = await self.db.execute(select(User).filter(User.user_id == user_id))
+        user = result.scalar_one_or_none()
         if not user:
             return {"error": "用户不存在"}
         
@@ -166,21 +227,21 @@ class EducationService:
         for fraud_type in vulnerable_types[:3]:  # 最多取前3种类型
             # 检索案例
             cases = self.vector_db.search_by_fraud_type("anti_fraud_cases", fraud_type, top_k=2)
-            for case in cases:
-                case["fraud_type"] = fraud_type
-            all_cases.extend(cases)
+            all_cases.extend([
+                self._format_case_item(case, fraud_type) for case in cases
+            ])
             
             # 检索标语
             slogans = self.vector_db.search_by_fraud_type("anti_fraud_slogans", fraud_type, top_k=1)
-            for slogan in slogans:
-                slogan["fraud_type"] = fraud_type
-            all_slogans.extend(slogans)
+            all_slogans.extend([
+                self._format_slogan_item(slogan, fraud_type) for slogan in slogans
+            ])
             
             # 检索视频
             videos = self.vector_db.search_by_fraud_type("anti_fraud_videos", fraud_type, top_k=1)
-            for video in videos:
-                video["fraud_type"] = fraud_type
-            all_videos.extend(videos)
+            all_videos.extend([
+                self._format_video_item(video, fraud_type) for video in videos
+            ])
         
         # 3. 生成用户易受骗分析
         vulnerability_analysis = await self._generate_vulnerability_analysis(
@@ -234,21 +295,27 @@ class EducationService:
         )
         
         # 3. 获取用户画像进行个性化
-        user = self.db.query(User).filter(User.user_id == user_id).first()
+        result = await self.db.execute(select(User).filter(User.user_id == user_id))
+        user = result.scalar_one_or_none()
         user_profile = user.role_type if user else "未知"
         
         # 4. 生成相似度分析和预警提示
         analysis_result = await self._analyze_conversation_similarity(
             conversation_text, similar_cases, user_profile
         )
+        formatted_cases = [self._format_case_item(case) for case in similar_cases]
+        formatted_slogans = [self._format_slogan_item(slogan) for slogan in similar_slogans]
         
         return {
-            "cases": similar_cases,
-            "slogans": similar_slogans,
+            "cases": formatted_cases,
+            "slogans": formatted_slogans,
             "similarity_analysis": analysis_result.get("analysis", ""),
             "alert_message": analysis_result.get("alert", ""),
-            "matched_fraud_types": list(set([case.get("metadata", {}).get("fraud_type", "") 
-                                              for case in similar_cases if case.get("similarity", 0) > 0.7]))
+            "matched_fraud_types": list(set([
+                case.get("fraud_type", "")
+                for case in formatted_cases
+                if case.get("fraud_type") and (case.get("similarity") or 0) > 0.7
+            ]))
         }
     
     async def recommend_from_case_and_law_library(
@@ -276,7 +343,8 @@ class EducationService:
                 "source_stats": {"cases": n, "laws": n}
             }
         """
-        user = self.db.query(User).filter(User.user_id == user_id).first()
+        result = await self.db.execute(select(User).filter(User.user_id == user_id))
+        user = result.scalar_one_or_none()
         
         # 1. 确定查询的诈骗类型
         query_types = []
@@ -294,15 +362,17 @@ class EducationService:
         for ftype in query_types[:2]:  # 最多2种类型
             cases = self.vector_db.search_by_fraud_type("anti_fraud_cases", ftype, top_k=limit)
             for case in cases:
-                case["source_label"] = "大赛案例库"
-                all_cases.append(case)
+                formatted_case = self._format_case_item(case, ftype)
+                formatted_case["source_label"] = "大赛案例库"
+                all_cases.append(formatted_case)
         
         # 3. 从法律集合检索法律条文（anti_fraud_laws）
         for ftype in query_types[:2]:
             laws = self.vector_db.search_by_fraud_type("anti_fraud_laws", ftype, top_k=2)
             for law in laws:
-                law["source_label"] = "反诈法"
-                all_laws.append(law)
+                formatted_law = self._format_law_item(law, ftype)
+                formatted_law["source_label"] = "反诈法"
+                all_laws.append(formatted_law)
         
         # 4. 混合推荐：案例 + 法律条文
         mixed = []
