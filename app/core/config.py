@@ -51,7 +51,7 @@ class Settings(BaseSettings):
     
     # AI模型路径 - 音频检测
     VOICE_MODEL_PATH: str = "./models/voice_detection.onnx"  # 旧版ONNX模型（备用）
-    AASIST_MODEL_PATH: str = "./models/audio_anti_spoof/best_model.pth"  # 微调后的AASIST模型
+    AASIST_MODEL_PATH: str = "./models/aasist/weights/best.pth"  # SpeechFake微调模型
     AASIST_CODE_PATH: str = "./models/aasist"  # AASIST源码路径
     
     # AI模型路径 - 视频检测

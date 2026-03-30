@@ -51,6 +51,7 @@ class ModelService:
         self.aasist_model = None   # AASIST微调模型（主模型）
         self.aasist_config = None
         self.aasist_eer = None     # 模型EER指标
+        self.aasist_model_source = None  # 模型来源: speechfake_finetuned 或 aasist_finetuned
         
         # --- 文本模型组件 ---
         self.text_session = None   # ONNX文本模型（备用）
@@ -139,6 +140,8 @@ class ModelService:
                 
                 self.aasist_model.eval()
                 self.audio_model_type = model_source
+                self.aasist_model_source = model_source  # 记录模型来源
+                # AASIST模型统一语义: Index 0 = 伪造, Index 1 = 真人
                 logger.info(f"✅ AASIST模型加载成功 [{model_source}] (Acc: {best_acc}, EER: {self.aasist_eer})")
                 return
                 
@@ -557,20 +560,18 @@ class ModelService:
             # 2. 推理
             with torch.no_grad():
                 _, outputs = self.aasist_model(waveform, Freq_aug=False)
-                # AASIST模型输出: Index 0 = 伪造(spoof), Index 1 = 真人(bonafide)
-                # 注意: 标准AASIST评估中，分数越高表示越可能是真人
-                # 因此使用 bona_logit 作为分数（或 -spoof_logit）
+                
+                # AASIST模型输出语义（所有模型统一）：
+                # Index 0 = 伪造概率, Index 1 = 真人概率
+                import torch.nn.functional as F
+                probs = F.softmax(outputs, dim=1)[0]
+                
+                # 伪造置信度 = softmax(outputs)[0]
+                score = float(probs[0])
+                
+                # 保留原始信息用于调试
                 spoof_logit = float(outputs[0][0])
                 bona_logit = float(outputs[0][1])
-                
-                # 使用 bona_logit 作为分数（越高越可能是真人）
-                # 转换为伪造置信度: 1 - sigmoid(bona_logit)
-                import math
-                bona_prob = 1 / (1 + math.exp(-bona_logit))
-                score = 1 - bona_prob  # 伪造置信度 = 1 - 真人概率
-                
-                # 保留原始logits用于调试
-                raw_score = bona_logit
             
             # 3. 结果判定
             threshold = settings.VOICE_DETECTION_THRESHOLD
