@@ -352,8 +352,8 @@ def apply_video_debounce(user_id: int, call_id: int, raw_is_fake: bool, confiden
         avg_risk = weighted_sum / len(conf_values) if conf_values else 0.0
         
         # 读取历史状态
-        prev_state_bytes = r.get(state_key)
-        prev_state = prev_state_bytes.decode('utf-8') if prev_state_bytes else "SAFE"
+        prev_state_raw = r.get(state_key)
+        prev_state = prev_state_raw if prev_state_raw else "SAFE"
         
         # 状态机转换（带滞后区）
         current_state = prev_state
@@ -918,7 +918,9 @@ def detect_text_task(self, text: str, user_id: int, call_id: int) -> Dict:
                     user_id, call_id, text_conf, audio_conf, raw_video_conf, fused_score, action_level
                 )
                 _kw = sensitive_keywords.split(",") if sensitive_keywords else []
-                _adv = llm_result.get('advice', '') if action_level > 0 else ''
+                # 仅在融合分数达到高危，或 MDP 判定为最高动作时，前端触发高风险提示
+                _is_high_risk_for_ui = (_fs >= 80.0) or (_af >= 2)
+                _adv = llm_result.get('advice', '') if _is_high_risk_for_ui else ''
 
                 def _push_detection_result():
                     det_payload = {
@@ -928,7 +930,7 @@ def detect_text_task(self, text: str, user_id: int, call_id: int) -> Dict:
                             "voice_confidence": round(_ac, 4),
                             "video_confidence": round(_vc, 4),
                             "text_confidence": round(_tc, 4),
-                            "is_fraud": _af > 0,
+                            "is_fraud": _is_high_risk_for_ui,
                             "advice": _adv,
                             "keywords": _kw,
                         }

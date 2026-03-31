@@ -43,6 +43,11 @@ class ModelService:
     }
     
     def __init__(self):
+        # --- GPU / CPU 自动选择 ---
+        import torch
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        logger.info(f"ModelService 推理设备: {self.device}")
+
         # --- 音频模型组件 ---
         self.voice_session = None  # ONNX深度流模型
         self.gnb_model = None      # 统计流GNB
@@ -108,8 +113,8 @@ class ModelService:
                 
                 from models.AASIST import Model as AASISTModel
                 
-                # 加载checkpoint
-                checkpoint = torch.load(aasist_path, map_location='cpu', weights_only=False)
+                # 加载checkpoint（先到CPU再统一移到目标设备）
+                checkpoint = torch.load(aasist_path, map_location=self.device, weights_only=False)
                 
                 # 判断checkpoint格式：完整checkpoint或纯state_dict
                 if isinstance(checkpoint, OrderedDict) or isinstance(checkpoint, dict) and 'model_state_dict' not in checkpoint:
@@ -138,11 +143,10 @@ class ModelService:
                     best_acc = checkpoint.get('best_acc', 'N/A')
                     model_source = "aasist_finetuned"
                 
-                self.aasist_model.eval()
+                self.aasist_model.to(self.device).eval()
                 self.audio_model_type = model_source
-                self.aasist_model_source = model_source  # 记录模型来源
-                # AASIST模型统一语义: Index 0 = 伪造, Index 1 = 真人
-                logger.info(f"✅ AASIST模型加载成功 [{model_source}] (Acc: {best_acc}, EER: {self.aasist_eer})")
+                self.aasist_model_source = model_source
+                logger.info(f"✅ AASIST模型加载成功 [{model_source}] (Acc: {best_acc}, EER: {self.aasist_eer}, device: {self.device})")
                 return
                 
             except Exception as e:
@@ -204,11 +208,14 @@ class ModelService:
     def _load_video_models(self):
         """加载视频检测模型"""
         if Path(settings.VIDEO_MODEL_PATH).exists():
+            available = ort.get_available_providers()
+            providers = [p for p in ['CUDAExecutionProvider', 'CPUExecutionProvider'] if p in available]
             self.video_session = ort.InferenceSession(
-                settings.VIDEO_MODEL_PATH, 
-                providers=['CPUExecutionProvider']
+                settings.VIDEO_MODEL_PATH,
+                providers=providers or ['CPUExecutionProvider'],
             )
-            logger.info(f"✅ 视频模型加载成功: {settings.VIDEO_MODEL_PATH}")
+            active = self.video_session.get_providers()
+            logger.info(f"✅ 视频模型加载成功: {settings.VIDEO_MODEL_PATH} (providers: {active})")
         else:
             logger.warning(f"⚠️ 视频模型不存在: {settings.VIDEO_MODEL_PATH}")
             self.video_session = MockOnnxSession("video")
@@ -227,10 +234,10 @@ class ModelService:
                 logger.info(f"加载微调后的BERT模型: {finetuned_path}")
                 self.tokenizer = BertTokenizer.from_pretrained(str(finetuned_path))
                 self.text_model_torch = BertForSequenceClassification.from_pretrained(str(finetuned_path))
-                self.text_model_torch.eval()
+                self.text_model_torch.to(self.device).eval()
                 
                 self.text_model_type = "bert_finetuned"
-                logger.info(f"✅ 微调BERT模型加载成功")
+                logger.info(f"✅ 微调BERT模型加载成功 (device: {self.device})")
                 return
                 
             except Exception as e:
@@ -253,10 +260,10 @@ class ModelService:
                     num_labels=2,
                     ignore_mismatched_sizes=True
                 )
-                self.text_model_torch.eval()
+                self.text_model_torch.to(self.device).eval()
                 
                 self.text_model_type = "bert_base"
-                logger.warning(f"⚠️ 使用基础BERT模型（未微调，效果可能不佳）")
+                logger.warning(f"⚠️ 使用基础BERT模型（未微调，效果可能不佳, device: {self.device}）")
                 return
                 
             except Exception as e:
@@ -547,15 +554,17 @@ class ModelService:
             # 获取配置中的音频长度
             target_len = self.aasist_config.get('nb_samp', 64600) if self.aasist_config else 64600
             
-            # 1. 准备输入 tensor
-            if len(y) < target_len:
-                # 填充到目标长度
-                y = np.pad(y, (0, target_len - len(y)), mode='constant')
+            # 1. 预处理：与 eval.py 对齐（trim → center-crop / tile-repeat）
+            y = librosa.effects.trim(y)[0]
+            y_len = len(y)
+            if y_len >= target_len:
+                start = (y_len - target_len) // 2
+                y = y[start: start + target_len]
             else:
-                # 截断到目标长度
-                y = y[:target_len]
+                num_repeats = int(target_len / y_len) + 1
+                y = np.tile(y, num_repeats)[:target_len]
             
-            waveform = torch.FloatTensor(y).unsqueeze(0)  # (1, target_len)
+            waveform = torch.FloatTensor(y).unsqueeze(0).to(self.device)
             
             # 2. 推理
             with torch.no_grad():
@@ -574,13 +583,15 @@ class ModelService:
                 bona_logit = float(outputs[0][1])
             
             # 3. 结果判定
-            threshold = settings.VOICE_DETECTION_THRESHOLD
-            is_fake = score > threshold
+            # is_fake 使用自然分类边界 0.5（与 eval.py 一致）
+            # VOICE_DETECTION_THRESHOLD 仅用于 risk_level 分级和下游告警
+            is_fake = score > 0.5
+            alert_threshold = settings.VOICE_DETECTION_THRESHOLD
             
             return {
                 "confidence": round(score, 4),
                 "is_fake": is_fake,
-                "risk_level": self._calculate_risk_level(score, threshold),
+                "risk_level": self._calculate_risk_level(score, alert_threshold),
                 "method": "aasist_finetuned",
                 "model_type": self.audio_model_type,
                 "model_version": self.MODEL_VERSIONS["audio"],
@@ -588,7 +599,7 @@ class ModelService:
                     "model": "AASIST",
                     "eer": self.aasist_eer,
                     "audio_length": len(y),
-                    "threshold": threshold
+                    "threshold": alert_threshold
                 }
             }
             
@@ -657,12 +668,12 @@ class ModelService:
                 final_score = 0.0
                 method = "mock"
 
-            # 结果判定
-            threshold = settings.VOICE_DETECTION_THRESHOLD
+            # 结果判定：is_fake 用 0.5 自然分类边界，alert_threshold 用于 risk_level
+            alert_threshold = settings.VOICE_DETECTION_THRESHOLD
             return {
                 "confidence": round(final_score, 4),
-                "is_fake": final_score > threshold,
-                "risk_level": self._calculate_risk_level(final_score, threshold),
+                "is_fake": final_score > 0.5,
+                "risk_level": self._calculate_risk_level(final_score, alert_threshold),
                 "method": method,
                 "model_type": self.audio_model_type,
                 "model_version": self.MODEL_VERSIONS.get("audio_fallback", "unknown"),
@@ -784,6 +795,7 @@ class ModelService:
             truncation=True,
             max_length=256
         )
+        inputs = {k: v.to(self.device) for k, v in inputs.items()}
         
         with torch.no_grad():
             outputs = self.text_model_torch(**inputs)

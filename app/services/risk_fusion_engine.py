@@ -73,25 +73,25 @@ class RiskFusionEngineV2:
     
     # 场景自适应权重配置 (P0)
     SCENE_WEIGHTS = {
-        # 屏幕共享类诈骗：视觉权重提高
-        "屏幕共享": {"text": 0.35, "vision": 0.50, "audio": 0.15},
-        "远程控制": {"text": 0.35, "vision": 0.50, "audio": 0.15},
-        "查看余额": {"text": 0.35, "vision": 0.50, "audio": 0.15},
-        
-        # 语音冒充类诈骗：音频权重提高
-        "转账": {"text": 0.35, "vision": 0.15, "audio": 0.50},
-        "汇款": {"text": 0.35, "vision": 0.15, "audio": 0.50},
-        "语音冒充": {"text": 0.35, "vision": 0.15, "audio": 0.50},
-        "冒充公检法": {"text": 0.35, "vision": 0.15, "audio": 0.50},
-        
-        # 钓鱼链接类诈骗：文本权重提高
-        "钓鱼链接": {"text": 0.65, "vision": 0.25, "audio": 0.10},
-        "点击链接": {"text": 0.65, "vision": 0.25, "audio": 0.10},
-        "下载APP": {"text": 0.65, "vision": 0.25, "audio": 0.10},
-        "验证码": {"text": 0.60, "vision": 0.20, "audio": 0.20},
-        
-        # 默认权重
-        "default": {"text": 0.50, "vision": 0.30, "audio": 0.20}
+        # 屏幕共享类诈骗：仍参考视觉，但由文本意图主导
+        "屏幕共享": {"text": 0.55, "vision": 0.25, "audio": 0.20},
+        "远程控制": {"text": 0.55, "vision": 0.25, "audio": 0.20},
+        "查看余额": {"text": 0.60, "vision": 0.20, "audio": 0.20},
+
+        # 语音冒充类诈骗：文本主导，音频作为关键辅助证据
+        "转账": {"text": 0.55, "vision": 0.10, "audio": 0.35},
+        "汇款": {"text": 0.55, "vision": 0.10, "audio": 0.35},
+        "语音冒充": {"text": 0.55, "vision": 0.10, "audio": 0.35},
+        "冒充公检法": {"text": 0.55, "vision": 0.10, "audio": 0.35},
+
+        # 钓鱼链接类诈骗：文本主导
+        "钓鱼链接": {"text": 0.75, "vision": 0.10, "audio": 0.15},
+        "点击链接": {"text": 0.75, "vision": 0.10, "audio": 0.15},
+        "下载APP": {"text": 0.75, "vision": 0.10, "audio": 0.15},
+        "验证码": {"text": 0.70, "vision": 0.10, "audio": 0.20},
+
+        # 默认权重：文本主导，视频仅作辅助参考
+        "default": {"text": 0.70, "vision": 0.10, "audio": 0.20}
     }
     
     # 模态协同放大配置 (P1)
@@ -110,9 +110,10 @@ class RiskFusionEngineV2:
     }
     
     def __init__(self):
-        self.default_weights = {"text": 0.5, "vision": 0.3, "audio": 0.2}
+        self.default_weights = {"text": 0.70, "vision": 0.10, "audio": 0.20}
         # 每个call_id的时序状态缓存
         self._temporal_cache: Dict[str, dict] = {}
+        self._weight_override: Optional[Dict[str, float]] = None
     
     def _get_scene_weights(self, intent: str, match_script: str) -> Dict[str, float]:
         """
@@ -132,13 +133,37 @@ class RiskFusionEngineV2:
                     return weights.copy()
         
         return self.SCENE_WEIGHTS["default"].copy()
+
+    def _is_text_anchor(self, risk_level: str, match_script: str, local_text_conf: float) -> bool:
+        """只有文本侧出现明显诈骗意图时，音视频分数才参与强融合。"""
+        return (
+            risk_level in {"suspicious", "fake"}
+            or (match_script and match_script != "无")
+            or local_text_conf >= 0.65
+        )
+
+    def _adjust_reference_scores(
+        self,
+        text_anchor: bool,
+        audio_conf: float,
+        video_conf: float,
+    ) -> tuple[float, float]:
+        """
+        文本未识别到明显诈骗意图时，压低音视频对总分的影响，
+        避免单靠深伪分数把最终结果拉高。
+        """
+        if text_anchor:
+            return audio_conf * 100, video_conf * 100
+
+        return min(audio_conf * 100, 35.0), min(video_conf * 100, 20.0)
     
     def _calculate_synergy_bonus(
         self, 
         text_score: float, 
         audio_conf: float, 
         video_conf: float,
-        weights: Dict[str, float]
+        weights: Dict[str, float],
+        text_anchor: bool
     ) -> float:
         """
         P1: 计算模态协同风险放大系数
@@ -146,6 +171,9 @@ class RiskFusionEngineV2:
         当多个模态同时超过阈值时，风险非线性叠加
         """
         threshold = self.SYNERGY_CONFIG["threshold"]
+        if not text_anchor:
+            logger.debug("文本未命中明显诈骗意图，禁用音视频协同放大")
+            return 1.0
         
         # 计算各模态风险度（归一化到0-1）
         text_risk = text_score / 100.0
@@ -241,7 +269,7 @@ class RiskFusionEngineV2:
         match_script = llm_classification.get("match_script", "无")
         
         # === P0: 场景自适应权重 ===
-        scene_weights = self._get_scene_weights(intent, match_script)
+        scene_weights = (self._weight_override or self._get_scene_weights(intent, match_script)).copy()
         
         # 1. 熔断机制（保持原有逻辑，但使用场景权重）
         if "屏幕共享" in intent and video_conf > 0.7:
@@ -269,17 +297,23 @@ class RiskFusionEngineV2:
         
         # 文本置信度平滑
         final_text_score = (base_text_score * 0.7) + ((local_text_conf * 100) * 0.3)
+        text_anchor = self._is_text_anchor(risk_level, match_script, local_text_conf)
+        audio_score, video_score = self._adjust_reference_scores(text_anchor, audio_conf, video_conf)
         
         # 3. 构建活跃模态集合
         active_modalities = {"text": final_text_score}
         if audio_conf > 0:
-            active_modalities["audio"] = audio_conf * 100
+            active_modalities["audio"] = audio_score
         if video_conf > 0:
-            active_modalities["vision"] = video_conf * 100
+            active_modalities["vision"] = video_score
         
         # === P1: 模态协同放大 ===
         synergy_bonus = self._calculate_synergy_bonus(
-            final_text_score, audio_conf, video_conf, scene_weights
+            final_text_score,
+            audio_score / 100.0,
+            video_score / 100.0,
+            scene_weights,
+            text_anchor,
         )
         
         # 4. 动态加权融合（使用场景权重）
@@ -294,8 +328,9 @@ class RiskFusionEngineV2:
         fused_score = min(self.SYNERGY_CONFIG["cap"], base_fused_score * synergy_bonus)
         
         logger.info(
-            f"[V2] 融合计算 -> 场景权重: T{scene_weights['text']:.1f}/V{scene_weights['vision']:.1f}/A{scene_weights['audio']:.1f} | "
-            f"协同加成: {synergy_bonus:.2f}x | 基础分: {base_fused_score:.1f} | 加成后: {fused_score:.1f}"
+            f"[V2] 融合计算 -> 文本锚点={text_anchor} | 权重: T{scene_weights['text']:.2f}/V{scene_weights['vision']:.2f}/A{scene_weights['audio']:.2f} | "
+            f"分数: T{final_text_score:.1f}/V{video_score:.1f}/A{audio_score:.1f} | 协同加成: {synergy_bonus:.2f}x | "
+            f"基础分: {base_fused_score:.1f} | 加成后: {fused_score:.1f}"
         )
         
         # === P2: 时序滑动窗口平滑 ===
@@ -339,16 +374,16 @@ class EnvironmentAwareFusionEngine(RiskFusionEngineV2):
         "text_chat": {"text": 1.0, "vision": 0.0, "audio": 0.0},
         
         # 语音聊天：音频+文本
-        "voice_chat": {"text": 0.6, "vision": 0.0, "audio": 0.4},
+        "voice_chat": {"text": 0.72, "vision": 0.0, "audio": 0.28},
         
         # 电话通话：音频+文本均衡
-        "phone_call": {"text": 0.5, "vision": 0.0, "audio": 0.5},
+        "phone_call": {"text": 0.65, "vision": 0.0, "audio": 0.35},
         
-        # 视频通话：三模态均衡
-        "video_call": {"text": 0.4, "vision": 0.3, "audio": 0.3},
+        # 视频通话：文本主导，视频仅作辅助参考
+        "video_call": {"text": 0.68, "vision": 0.12, "audio": 0.20},
         
         # 未知环境：使用默认权重
-        "unknown": {"text": 0.5, "vision": 0.3, "audio": 0.2}
+        "unknown": {"text": 0.70, "vision": 0.10, "audio": 0.20}
     }
     
     # 平台到环境的映射
@@ -436,8 +471,8 @@ class EnvironmentAwareFusionEngine(RiskFusionEngineV2):
         logger.info(f"[环境感知] 通话 {call_id} 最终权重: T{final_weights['text']:.2f}/V{final_weights['vision']:.2f}/A{final_weights['audio']:.2f}")
         
         # 临时替换默认权重进行计算
-        original_weights = self.default_weights.copy()
-        self.default_weights = final_weights
+        original_override = self._weight_override
+        self._weight_override = final_weights
         
         try:
             # 调用父类的完整计算逻辑（包含熔断、协同、时序平滑）
@@ -450,7 +485,7 @@ class EnvironmentAwareFusionEngine(RiskFusionEngineV2):
             )
         finally:
             # 恢复默认权重
-            self.default_weights = original_weights
+            self._weight_override = original_override
         
         return score
     
