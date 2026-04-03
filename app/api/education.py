@@ -1,6 +1,8 @@
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import FileResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from typing import List
+from pathlib import Path
 
 from app.db.database import get_db
 from app.services.education_service import EducationService
@@ -15,6 +17,9 @@ router = APIRouter(
     tags=["Education & Anti-Fraud Cases"]
 )
 
+BASE_DIR = Path(__file__).resolve().parents[2]
+EDU_VIDEO_DIR = BASE_DIR / "data" / "edu_video"
+
 @router.get("/recommendations/{user_id}", response_model=List[KnowledgeItemResponse])
 async def get_recommendations(user_id: int, limit: int = 5, db: AsyncSession = Depends(get_db)):
     """
@@ -26,6 +31,17 @@ async def get_recommendations(user_id: int, limit: int = 5, db: AsyncSession = D
         return items
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/videos/{filename}")
+async def get_education_video(filename: str):
+    """学习中心本地视频文件访问接口。"""
+    file_path = (EDU_VIDEO_DIR / filename).resolve()
+    if not str(file_path).startswith(str(EDU_VIDEO_DIR.resolve())):
+        raise HTTPException(status_code=400, detail="非法文件路径")
+    if not file_path.exists() or not file_path.is_file():
+        raise HTTPException(status_code=404, detail="视频不存在")
+    return FileResponse(path=str(file_path), media_type="video/mp4", filename=file_path.name)
 
 @router.post("/match_cases")
 async def match_similar_cases(request: CaseMatchRequest, db: AsyncSession = Depends(get_db)):
@@ -55,7 +71,12 @@ async def record_learning(user_id: int, request: LearningRecordRequest, db: Asyn
 # ================= 新增推荐 API =================
 
 @router.get("/recommendations/profile/{user_id}", response_model=ProfileRecommendationEnvelope)
-async def get_profile_recommendations(user_id: int, limit: int = 5, db: AsyncSession = Depends(get_db)):
+async def get_profile_recommendations(
+    user_id: int,
+    limit: int = 5,
+    page: int = 1,
+    db: AsyncSession = Depends(get_db)
+):
     """
     基于用户画像的个性化推荐
     
@@ -64,7 +85,7 @@ async def get_profile_recommendations(user_id: int, limit: int = 5, db: AsyncSes
     """
     service = EducationService(db)
     try:
-        result = await service.recommend_by_user_profile(user_id, limit)
+        result = await service.recommend_by_user_profile(user_id, limit, page)
         
         if "error" in result:
             return ResponseModel(code=404, message=result["error"], data=None)
@@ -73,6 +94,36 @@ async def get_profile_recommendations(user_id: int, limit: int = 5, db: AsyncSes
             code=200, 
             message="获取个性化推荐成功", 
             data=result
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/records/{user_id}", response_model=ResponseModel)
+async def get_learning_records(
+    user_id: int,
+    limit: int = 20,
+    completed_only: bool = False,
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    查询用户最近学习记录（支持仅看已完成）。
+    """
+    service = EducationService(db)
+    try:
+        records = await service.get_user_learning_history(
+            user_id=user_id,
+            limit=limit,
+            completed_only=completed_only
+        )
+        return ResponseModel(
+            code=200,
+            message="获取学习记录成功",
+            data={
+                "items": records,
+                "total": len(records),
+                "completed_only": completed_only
+            }
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

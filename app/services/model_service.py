@@ -36,7 +36,7 @@ class ModelService:
     MODEL_VERSIONS = {
         "audio": "aasist-finetuned-v1.0",
         "audio_fallback": "dual-stream-v1.0",
-        "video": "resnet-lstm-v2.0",
+        "video": "xception-bilstm-v1.0",
         "text": "bert-finetuned-v1.0",
         "text_fallback": "bert-base-v1.0",
         "text_onnx": "bert-onnx-v1.0"
@@ -206,19 +206,84 @@ class ModelService:
             logger.warning("⚠ 所有音频模型加载失败，使用Mock模型")
     
     def _load_video_models(self):
-        """加载视频检测模型"""
-        if Path(settings.VIDEO_MODEL_PATH).exists():
-            available = ort.get_available_providers()
-            providers = [p for p in ['CUDAExecutionProvider', 'CPUExecutionProvider'] if p in available]
-            self.video_session = ort.InferenceSession(
-                settings.VIDEO_MODEL_PATH,
-                providers=providers or ['CPUExecutionProvider'],
-            )
-            active = self.video_session.get_providers()
-            logger.info(f"✅ 视频模型加载成功: {settings.VIDEO_MODEL_PATH} (providers: {active})")
-        else:
+        """加载视频检测模型（ONNX Runtime：优先 CUDA，否则 CPU）"""
+        video_model_path = self._resolve_video_model_path()
+        if video_model_path is None:
             logger.warning(f"⚠️ 视频模型不存在: {settings.VIDEO_MODEL_PATH}")
             self.video_session = MockOnnxSession("video")
+            return
+
+        available = ort.get_available_providers()
+        logger.info(f"ONNX Runtime 可用执行提供者: {available}")
+
+        providers = []
+        if "CUDAExecutionProvider" in available:
+            dev_id = int(getattr(settings, "ONNX_GPU_DEVICE_ID", 0))
+            providers.append(
+                (
+                    "CUDAExecutionProvider",
+                    {
+                        "device_id": dev_id,
+                    },
+                )
+            )
+        else:
+            logger.warning(
+                "视频 ONNX 当前只能跑在 CPU：本环境未注册 CUDAExecutionProvider。"
+                "若需 GPU，请安装与 CUDA 版本匹配的 onnxruntime-gpu，并在该环境中卸载普通 onnxruntime（二选一）。"
+            )
+
+        providers.append("CPUExecutionProvider")
+
+        self.video_session = ort.InferenceSession(str(video_model_path), providers=providers)
+        active = self.video_session.get_providers()
+        logger.info(f"✅ 视频模型加载成功: {video_model_path} (实际使用: {active})")
+
+    def _resolve_video_model_path(self) -> Optional[Path]:
+        """解析视频模型路径，兼容目录输入和新旧默认位置。"""
+        project_root = Path(__file__).resolve().parents[2]
+        configured = Path(settings.VIDEO_MODEL_PATH).expanduser()
+
+        candidates = []
+        if configured.is_absolute():
+            candidates.append(configured)
+        else:
+            candidates.append(project_root / configured)
+            candidates.append(configured)
+
+        candidates.extend(
+            [
+                project_root / "models" / "xception",
+                project_root / "models" / "xception" / "deepfake_xception_lstm.onnx",
+                project_root / "models" / "deepfake_xception_lstm.onnx",
+                project_root / "models" / "video_detection.onnx",
+            ]
+        )
+
+        seen = set()
+        for candidate in candidates:
+            key = str(candidate)
+            if key in seen:
+                continue
+            seen.add(key)
+
+            if candidate.is_file():
+                return candidate.resolve()
+
+            if candidate.is_dir():
+                preferred_files = [
+                    candidate / "deepfake_xception_lstm.onnx",
+                    candidate / "video_detection.onnx",
+                ]
+                for preferred in preferred_files:
+                    if preferred.is_file():
+                        return preferred.resolve()
+
+                discovered = sorted(candidate.glob("*.onnx"))
+                if discovered:
+                    return discovered[0].resolve()
+
+        return None
     
     def _load_text_models(self):
         """加载文本检测模型"""
@@ -692,7 +757,7 @@ class ModelService:
 
     async def predict_video(self, video_tensor: np.ndarray) -> Dict:
         """
-        视频Deepfake检测 (ResNet+LSTM 时序检测)
+        视频Deepfake检测 (Xception+BiLSTM 时序检测)
         """
         if self.video_session is None:
             return {

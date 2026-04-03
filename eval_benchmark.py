@@ -15,8 +15,13 @@
   python eval_benchmark.py --all
   python eval_benchmark.py --audio
   python eval_benchmark.py --text
+  python eval_benchmark.py --video
   python eval_benchmark.py --fusion
   python eval_benchmark.py --stability -n 30
+
+数据目录（dataset/ 常被 gitignore，需本地放置）:
+  audio/fake|real/**/*.wav  text/fraud|normal/*.txt
+  video/fake|real/*.mp4     fusion/fraud|safe/*.mp4（优先）或仅 *.txt（自动走仅文本融合）
 """
 
 import os
@@ -54,7 +59,6 @@ import numpy as np
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, List, Optional
-from collections import defaultdict
 
 # ---------------------------------------------------------------------------
 # 数据集路径
@@ -66,6 +70,8 @@ TEXT_FRAUD_DIR = DATASET_ROOT / "text" / "fraud"
 TEXT_NORMAL_DIR = DATASET_ROOT / "text" / "normal"
 FUSION_FRAUD_DIR = DATASET_ROOT / "fusion" / "fraud"
 FUSION_SAFE_DIR = DATASET_ROOT / "fusion" / "safe"
+VIDEO_FAKE_DIR = DATASET_ROOT / "video" / "fake"
+VIDEO_REAL_DIR = DATASET_ROOT / "video" / "real"
 
 SCRIPT_COVERAGE_TARGET = 10
 
@@ -88,26 +94,90 @@ def print_divider():
 
 
 # ---- 视频工具 ----
+_VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".mov", ".webm", ".flv", ".m4v"}
+
+
 def extract_audio_from_video(video_path: str) -> Optional[np.ndarray]:
-    """从视频提取 16kHz mono 音频 numpy 数组"""
-    try:
-        y, sr = librosa.load(video_path, sr=16000, mono=True)
-        return y
-    except Exception:
+    """从视频提取 16kHz mono 音频。视频容器优先走 ffmpeg，避免 librosa 直接读 mp4 触发 PySoundFile/audioread 告警且易失败。"""
+    import librosa
+    import subprocess
+
+    path = Path(video_path)
+    suffix = path.suffix.lower()
+
+    def _load_wav_file(wav_path: str) -> Optional[np.ndarray]:
         try:
-            import subprocess
-            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-                tmp_path = tmp.name
-            subprocess.run(
-                ["ffmpeg", "-i", str(video_path), "-vn", "-acodec", "pcm_s16le",
-                 "-ar", "16000", "-ac", "1", tmp_path, "-y"],
-                capture_output=True, timeout=60,
-            )
-            y, _ = librosa.load(tmp_path, sr=16000, mono=True)
-            os.unlink(tmp_path)
-            return y
+            y, _ = librosa.load(wav_path, sr=16000, mono=True)
+            return y if y is not None and len(y) > 0 else None
         except Exception:
             return None
+
+    # 1) 常见视频后缀：先用 ffmpeg 解出 PCM WAV（比 librosa 直接读 mp4 更稳）
+    if suffix in _VIDEO_EXTS:
+        tmp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+                tmp_path = tmp.name
+            proc = subprocess.run(
+                [
+                    "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
+                    "-i", str(path),
+                    "-vn", "-acodec", "pcm_s16le",
+                    "-ar", "16000", "-ac", "1",
+                    "-y", tmp_path,
+                ],
+                capture_output=True,
+                timeout=120,
+            )
+            if proc.returncode == 0 and os.path.isfile(tmp_path) and os.path.getsize(tmp_path) >= 64:
+                y = _load_wav_file(tmp_path)
+                if y is not None:
+                    return y
+        except FileNotFoundError:
+            pass
+        except Exception:
+            pass
+        finally:
+            if tmp_path and os.path.isfile(tmp_path):
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+
+    # 2) 回退：直接 librosa（纯音频、ffmpeg 失败或无音轨时偶发仍能读到）
+    try:
+        y, _ = librosa.load(str(path), sr=16000, mono=True)
+        return y if y is not None and len(y) > 0 else None
+    except Exception:
+        pass
+
+    # 3) 最后再试一次 ffmpeg（无后缀或非典型命名）
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+            tmp_path = tmp.name
+        proc = subprocess.run(
+            [
+                "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
+                "-i", str(path), "-vn", "-acodec", "pcm_s16le",
+                "-ar", "16000", "-ac", "1", "-y", tmp_path,
+            ],
+            capture_output=True,
+            timeout=120,
+        )
+        if proc.returncode == 0 and os.path.isfile(tmp_path) and os.path.getsize(tmp_path) >= 64:
+            return _load_wav_file(tmp_path)
+    except FileNotFoundError:
+        return None
+    except Exception:
+        pass
+    finally:
+        if tmp_path and os.path.isfile(tmp_path):
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+    return None
 
 
 def slice_audio(y: np.ndarray, sr: int = 16000, slice_sec: float = 5.0) -> List[bytes]:
@@ -139,36 +209,71 @@ def audio_array_to_wav_bytes(y: np.ndarray, sr: int = 16000) -> bytes:
     return buf.read()
 
 
-def extract_face_batches_from_video(video_path: str, processor, input_size, max_batches=3):
-    """从视频提取人脸帧 (每批 10 帧 base64)"""
+def aggregate_video_window_confs(confs: List[float], mode: str, trim: float) -> float:
+    """
+    将一段视频上多次滑窗推理的 fake 概率合成单一标量，用于离线整段标签。
+    mode: trimmed_mean | iqr_mean | mean | median | latest
+    """
+    arr = np.asarray(confs, dtype=np.float64)
+    n = arr.size
+    if n == 0:
+        return 0.0
+    mode = (mode or "trimmed_mean").strip().lower()
+    if mode == "latest":
+        return float(arr[-1])
+    if mode == "mean":
+        return float(np.mean(arr))
+    if mode == "median":
+        return float(np.median(arr))
+    if mode == "trimmed_mean":
+        if n <= 2:
+            return float(np.mean(arr))
+        k = max(1, int(n * float(trim)))
+        if n <= 2 * k:
+            return float(np.median(arr))
+        s = np.sort(arr)
+        return float(np.mean(s[k : n - k]))
+    if mode == "iqr_mean":
+        if n < 4:
+            return float(np.median(arr))
+        q1, q3 = np.percentile(arr, [25.0, 75.0])
+        iqr = q3 - q1
+        lo, hi = q1 - 1.5 * iqr, q3 + 1.5 * iqr
+        kept = arr[(arr >= lo) & (arr <= hi)]
+        if kept.size == 0:
+            return float(np.median(arr))
+        return float(np.mean(kept))
+    return float(np.mean(arr))
+
+
+async def replay_video_like_detection_api(video_path: str, video_processor, user_id: int = 0):
+    """
+    与 app/api/detection.py 视频 WebSocket 分支一致：
+    整帧 JPG(base64) → VideoProcessor.process_frame → status==ready 时
+    detect_video_task 同款 payload，并 clear_buffer 再积下一窗。
+
+    返回按时间顺序的窗列表；线上下一次推理会覆盖 Redis latest_video_conf，
+    故整段视频的「当前分数」应对应列表中最后一次推理（最后一窗）。
+    """
     import cv2
+
+    batches = []
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
-        return []
-
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    interval = max(1, int(fps)) if fps > 0 else 30
-
-    face_batch, all_batches = [], []
-    idx = 0
+        return batches
     while True:
         ret, frame = cap.read()
         if not ret:
             break
-        if idx % interval == 0:
-            face = processor._extract_face_image(frame)
-            if face is not None:
-                face_resized = cv2.resize(face, input_size)
-                _, buf = cv2.imencode(".jpg", face_resized)
-                face_batch.append(base64.b64encode(buf).decode("utf-8"))
-                if len(face_batch) == 10:
-                    all_batches.append(face_batch)
-                    face_batch = []
-                    if len(all_batches) >= max_batches:
-                        break
-        idx += 1
+        # 与 tests/test_video_flow.py 一致：整帧 JPEG，不经由 _extract_face_image(raw)
+        _, buf = cv2.imencode(".jpg", frame)
+        b64 = base64.b64encode(buf).decode("utf-8")
+        result = await video_processor.process_frame(b64, user_id)
+        if result.get("status") == "ready":
+            batches.append(result["celery_payload"])
+            video_processor.clear_buffer(user_id)
     cap.release()
-    return all_batches
+    return batches
 
 
 # ===========================================================================
@@ -358,6 +463,94 @@ async def _run_text_eval(test_cases):
 
 
 # ===========================================================================
+# 评测 2b: 视频换脸检测 (dataset/video/fake vs real，仅视觉模态)
+# ===========================================================================
+def evaluate_video():
+    fake_files = sorted(VIDEO_FAKE_DIR.glob("*.mp4"))
+    real_files = sorted(VIDEO_REAL_DIR.glob("*.mp4"))
+    test_cases = [(f, "fake") for f in fake_files] + [(f, "real") for f in real_files]
+
+    if not test_cases:
+        print("  ⚠ 未找到视频文件，跳过")
+        return {}
+
+    from app.core.config import settings
+
+    print_section(f"视频换脸检测评测 ({len(fake_files)} fake + {len(real_files)} real = {len(test_cases)} 条)")
+    print(
+        f"  多窗聚合={settings.VIDEO_WINDOWS_AGGREGATE} (trim={settings.VIDEO_WINDOWS_TRIM})；"
+        f"整段判定: agg 与阈值 {settings.VIDEO_DETECTION_THRESHOLD} 比较（同单点 fake 概率含义）"
+    )
+    print("  agg=聚合分 latest=最后一窗 peak=峰值（参考）")
+
+    return asyncio.run(_run_video_eval(test_cases))
+
+
+async def _run_video_eval(test_cases):
+    from app.services.model_service import ModelService
+    from app.services.video_processor import VideoProcessor
+    from app.core.config import settings
+
+    ms = ModelService()
+    thr = float(settings.VIDEO_DETECTION_THRESHOLD)
+    agg_mode = settings.VIDEO_WINDOWS_AGGREGATE
+    agg_trim = float(settings.VIDEO_WINDOWS_TRIM)
+
+    print(f"\n  {'序号':>5} {'标签':<6} {'文件名':<24} {'agg':>10} {'latest':>8} {'peak':>8} {'判定':>8}  {'正确':>4} {'耗时':>7}")
+    print_divider()
+
+    y_true, y_pred = [], []
+    latencies = []
+
+    for i, (fp, label) in enumerate(test_cases, 1):
+        true_int = 1 if label == "fake" else 0
+        t0 = time.perf_counter()
+
+        # 每个视频独立 Processor，避免缓冲串线；链路同 WebSocket
+        vp = VideoProcessor()
+        batches = await replay_video_like_detection_api(str(fp), vp, user_id=0)
+
+        pred_int = 0
+        latest = 0.0
+        peak = 0.0
+        agg = 0.0
+
+        if batches:
+            batch_confs = []
+            for batch in batches:
+                try:
+                    video_tensor = VideoProcessor.preprocess_batch(batch)
+                    v_result = await ms.predict_video(video_tensor)
+                    batch_confs.append(v_result.get("confidence", 0.0))
+                except Exception as e:
+                    print(f"  {i:>5}  [{label:<4}] {fp.name:<24} batch ERR: {e}")
+            if batch_confs:
+                latest = float(batch_confs[-1])
+                peak = float(np.max(batch_confs))
+                agg = aggregate_video_window_confs(batch_confs, agg_mode, agg_trim)
+                pred_int = 1 if agg >= thr else 0
+        elapsed = time.perf_counter() - t0
+        latencies.append(elapsed)
+
+        if not batches:
+            print(f"  {i:>5}  [{label:<4}] {fp.name:<24} {'(无窗)':>10} {'—':>8} {'—':>8} {'SKIP':>8}    —  {elapsed:>6.2f}s")
+            continue
+
+        correct = true_int == pred_int
+        mark = "✓" if correct else "✗"
+        pred_str = "FAKE" if pred_int == 1 else "REAL"
+
+        y_true.append(true_int)
+        y_pred.append(pred_int)
+
+        print(f"  {i:>5}  [{label:<4}] {fp.name:<24} {agg:>10.4f} {latest:>8.4f} {peak:>8.4f} {pred_str:>8}  {mark:>4} {elapsed:>6.2f}s")
+
+    if not y_true:
+        return {}
+    return _print_binary_summary("视频换脸检测", y_true, y_pred, latencies, "fake", "real")
+
+
+# ===========================================================================
 # 评测 3: 多模态融合场景
 # 参考 detection_tasks.py 流程:
 #   1. predict_voice → audio_conf
@@ -370,19 +563,30 @@ async def _run_text_eval(test_cases):
 def evaluate_fusion():
     fraud_videos = sorted(FUSION_FRAUD_DIR.glob("*.mp4"))
     safe_videos = sorted(FUSION_SAFE_DIR.glob("*.mp4"))
-    test_cases = [(f, "fraud") for f in fraud_videos] + [(f, "safe") for f in safe_videos]
+    if fraud_videos or safe_videos:
+        test_cases = [(f, "fraud") for f in fraud_videos] + [(f, "safe") for f in safe_videos]
+        print_section(
+            f"多模态融合场景评测 ({len(fraud_videos)} fraud + {len(safe_videos)} safe = {len(test_cases)} 条)"
+        )
+        print("  参考 detection_tasks.py 流程: 音频→视频→ASR→文本→LLM融合→评分")
+        return asyncio.run(_run_fusion(test_cases, text_only=False))
 
+    fraud_txts = sorted(FUSION_FRAUD_DIR.glob("*.txt"))
+    safe_txts = sorted(FUSION_SAFE_DIR.glob("*.txt"))
+    test_cases = [(f, "fraud") for f in fraud_txts] + [(f, "safe") for f in safe_txts]
     if not test_cases:
-        print("  ⚠ 未找到融合测试视频，跳过")
+        print("  ⚠ 未找到融合测试数据（fusion/fraud|safe 下无 .mp4 且无 .txt），跳过")
         return {}
 
-    print_section(f"多模态融合场景评测 ({len(fraud_videos)} fraud + {len(safe_videos)} safe = {len(test_cases)} 条)")
-    print("  参考 detection_tasks.py 流程: 音频→视频→ASR→文本→LLM融合→评分")
+    print_section(
+        f"多模态融合场景评测 [仅文本] ({len(fraud_txts)} fraud + {len(safe_txts)} safe = {len(test_cases)} 条)"
+    )
+    print("  无视频时仅跑文本+LLM+融合评分（audio_conf=0, video_conf=0）")
 
-    return asyncio.run(_run_fusion(test_cases))
+    return asyncio.run(_run_fusion(test_cases, text_only=True))
 
 
-async def _run_fusion(test_cases):
+async def _run_fusion(test_cases, text_only: bool = False):
     from app.services.model_service import ModelService
     from app.services.video_processor import VideoProcessor
     from app.services.risk_fusion_engine import RiskFusionEngine
@@ -390,18 +594,18 @@ async def _run_fusion(test_cases):
     from app.core.config import settings
 
     ms = ModelService()
-    vp = VideoProcessor()
     fe = RiskFusionEngine()
     llm = LLMService()
 
-    # ASR (可选)
+    # ASR (可选，仅视频模式)
     asr_service = None
-    try:
-        from app.services.asr_service import ASRService
-        asr_service = ASRService()
-        print("  ASR 引擎加载成功")
-    except Exception as e:
-        print(f"  ⚠ ASR 不可用: {e}，将跳过语音转文本")
+    if not text_only:
+        try:
+            from app.services.asr_service import ASRService
+            asr_service = ASRService()
+            print("  ASR 引擎加载成功")
+        except Exception as e:
+            print(f"  ⚠ ASR 不可用: {e}，将跳过语音转文本")
 
     y_true, y_pred = [], []
     latencies = []
@@ -415,71 +619,91 @@ async def _run_fusion(test_cases):
         print(f"  [{i:02d}/{len(test_cases)}] {video_path.name}  (标签: {label})")
         print(f"{'='*70}")
 
-        # ---- 1. 音频模态: predict_voice (切片检测) ----
         audio_conf = 0.0
-        audio_is_fake = False
-        audio_array = extract_audio_from_video(str(video_path))
-        audio_bytes = audio_array_to_wav_bytes(audio_array) if audio_array is not None else None
-        if audio_array is not None and len(audio_array) > 16000:
-            slices = slice_audio(audio_array, sr=16000, slice_sec=5.0)
-            if slices:
-                slice_confs = []
-                slice_fakes = []
-                for s_bytes in slices:
-                    try:
-                        a_result = await ms.predict_voice(s_bytes)
-                        slice_confs.append(a_result.get("confidence", 0.0))
-                        slice_fakes.append(a_result.get("is_fake", False))
-                    except Exception:
-                        pass
-                if slice_confs:
-                    audio_conf = float(np.max(slice_confs))
-                    audio_is_fake = any(slice_fakes)
-                    fake_cnt = sum(slice_fakes)
-                    print(f"  [1] 音频伪造检测   {len(slices)} 切片, max_conf={audio_conf:.4f}, fake={fake_cnt}/{len(slices)}")
-                else:
-                    print(f"  [1] 音频伪造检测   切片推理全部失败")
-            else:
-                print(f"  [1] 音频伪造检测   音频过短，无法切片")
-        else:
-            print(f"  [1] 音频伪造检测   跳过(提取失败)")
-
-        # ---- 2. 视频模态: predict_video ----
         video_conf = 0.0
-        face_batches = extract_face_batches_from_video(str(video_path), vp, settings.VIDEO_INPUT_SIZE, max_batches=3)
-        if face_batches:
-            batch_confs = []
-            for batch in face_batches:
-                try:
-                    video_tensor = VideoProcessor.preprocess_batch(batch)
-                    v_result = await ms.predict_video(video_tensor)
-                    batch_confs.append(v_result.get("confidence", 0.0))
-                except Exception as e:
-                    print(f"  [2] 视频批次错误: {e}")
-            video_conf = float(np.mean(batch_confs)) if batch_confs else 0.0
-            print(f"  [2] 视频换脸检测   conf={video_conf:.4f}  ({len(face_batches)} 批次)")
-        else:
-            print(f"  [2] 视频换脸检测   跳过(未检测到人脸)")
-
-        # ---- 3. 文本获取：优先读同名 .txt 标注，否则走 ASR ----
+        audio_bytes = None
         transcript = ""
-        txt_path = video_path.with_suffix(".txt")
-        if txt_path.exists():
-            transcript = txt_path.read_text(encoding="utf-8").strip()
+
+        if text_only:
+            transcript = video_path.read_text(encoding="utf-8").strip()
             t_preview = transcript[:50].replace("\n", " ") + ("..." if len(transcript) > 50 else "")
+            print(f"  [1] 音频伪造检测   (仅文本模式，跳过)")
+            print(f"  [2] 视频换脸检测   (仅文本模式，跳过)")
             print(f"  [3] 文本(标注)     \"{t_preview}\"")
-        elif asr_service and audio_bytes:
-            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-                tmp.write(audio_bytes)
-                tmp_path = tmp.name
-            try:
-                transcript = await asr_service.transcribe_audio_file(tmp_path)
-            finally:
-                os.unlink(tmp_path)
-            t_preview = transcript[:50].replace("\n", " ") + ("..." if len(transcript) > 50 else "")
-            print(f"  [3] 文本(ASR)      \"{t_preview}\"")
         else:
-            print(f"  [3] 文本           无标注且 ASR 不可用")
+            # ---- 1. 音频模态: predict_voice (切片检测) ----
+            audio_array = extract_audio_from_video(str(video_path))
+            audio_bytes = audio_array_to_wav_bytes(audio_array) if audio_array is not None else None
+            if audio_array is not None and len(audio_array) > 16000:
+                slices = slice_audio(audio_array, sr=16000, slice_sec=5.0)
+                if slices:
+                    slice_confs = []
+                    slice_fakes = []
+                    for s_bytes in slices:
+                        try:
+                            a_result = await ms.predict_voice(s_bytes)
+                            slice_confs.append(a_result.get("confidence", 0.0))
+                            slice_fakes.append(a_result.get("is_fake", False))
+                        except Exception:
+                            pass
+                    if slice_confs:
+                        audio_conf = float(np.max(slice_confs))
+                        fake_cnt = sum(slice_fakes)
+                        print(f"  [1] 音频伪造检测   {len(slices)} 切片, max_conf={audio_conf:.4f}, fake={fake_cnt}/{len(slices)}")
+                    else:
+                        print(f"  [1] 音频伪造检测   切片推理全部失败")
+                else:
+                    print(f"  [1] 音频伪造检测   音频过短，无法切片")
+            else:
+                if audio_array is None:
+                    print(f"  [1] 音频伪造检测   跳过(未提取到音频；请确认已安装 ffmpeg 且视频含音轨)")
+                else:
+                    n = len(audio_array)
+                    print(f"  [1] 音频伪造检测   跳过(音频过短 {n} 样本，需 >16000 即约 1s@16kHz)")
+
+            # ---- 2. 视频模态: predict_video（与 detection.py → detect_video_task 相同数据源）----
+            vp_vid = VideoProcessor()
+            batches = await replay_video_like_detection_api(str(video_path), vp_vid, user_id=0)
+            if batches:
+                batch_confs = []
+                for batch in batches:
+                    try:
+                        video_tensor = VideoProcessor.preprocess_batch(batch)
+                        v_result = await ms.predict_video(video_tensor)
+                        batch_confs.append(v_result.get("confidence", 0.0))
+                    except Exception as e:
+                        print(f"  [2] 视频批次错误: {e}")
+                video_conf = aggregate_video_window_confs(
+                    batch_confs,
+                    settings.VIDEO_WINDOWS_AGGREGATE,
+                    float(settings.VIDEO_WINDOWS_TRIM),
+                )
+                peak_conf = float(np.max(batch_confs)) if batch_confs else 0.0
+                print(
+                    f"  [2] 视频换脸检测   conf(agg)={video_conf:.4f} peak={peak_conf:.4f} "
+                    f"[{settings.VIDEO_WINDOWS_AGGREGATE}] ({len(batches)} 窗)"
+                )
+            else:
+                print(f"  [2] 视频换脸检测   跳过(未积满人脸窗)")
+
+            # ---- 3. 文本获取：优先读同名 .txt 标注，否则走 ASR ----
+            txt_path = video_path.with_suffix(".txt")
+            if txt_path.exists():
+                transcript = txt_path.read_text(encoding="utf-8").strip()
+                t_preview = transcript[:50].replace("\n", " ") + ("..." if len(transcript) > 50 else "")
+                print(f"  [3] 文本(标注)     \"{t_preview}\"")
+            elif asr_service and audio_bytes:
+                with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+                    tmp.write(audio_bytes)
+                    tmp_path = tmp.name
+                try:
+                    transcript = await asr_service.transcribe_audio_file(tmp_path)
+                finally:
+                    os.unlink(tmp_path)
+                t_preview = transcript[:50].replace("\n", " ") + ("..." if len(transcript) > 50 else "")
+                print(f"  [3] 文本(ASR)      \"{t_preview}\"")
+            else:
+                print(f"  [3] 文本           无标注且 ASR 不可用")
 
         # ---- 4. 文本模态: predict_text → text_conf ----
         text_conf = 0.0
@@ -554,6 +778,7 @@ async def _run_fusion(test_cases):
 
     metrics = _print_binary_summary("多模态融合", y_true, y_pred, latencies, "fraud", "safe")
     metrics["identified_scripts"] = sorted(identified_scripts)
+    metrics["fusion_mode"] = "text_only" if text_only else "full"
 
     coverage = len(identified_scripts)
     print(f"\n  融合场景剧本覆盖: {coverage} 种")
@@ -675,12 +900,15 @@ def print_final_report(all_metrics: dict):
     checks = []
 
     fusion_acc = all_metrics.get("fusion", {}).get("accuracy")
-    text_acc = all_metrics.get("text", {}).get("accuracy")
-    best_acc = fusion_acc if fusion_acc is not None else text_acc
-    if best_acc is not None:
-        checks.append(("融合识别准确率 > 90%", best_acc, 0.90, best_acc >= 0.90))
+    if fusion_acc is not None:
+        checks.append(("融合识别准确率 > 90%", fusion_acc, 0.90, fusion_acc >= 0.90))
 
-    for name, key in [("融合安全场景", "fusion"), ("文本正常消息", "text"), ("音频真实语音", "audio")]:
+    for name, key in [
+        ("融合安全场景", "fusion"),
+        ("文本正常消息", "text"),
+        ("音频真实语音", "audio"),
+        ("视频真实场景", "video"),
+    ]:
         fpr = all_metrics.get(key, {}).get("fpr")
         if fpr is not None:
             checks.append((f"{name} FPR < 5%", fpr, 0.05, fpr < 0.05))
@@ -734,11 +962,12 @@ def main():
     parser.add_argument("--audio", action="store_true", help="音频伪造检测")
     parser.add_argument("--text", action="store_true", help="文本诈骗检测 (BERT+LLM)")
     parser.add_argument("--fusion", action="store_true", help="多模态融合场景")
+    parser.add_argument("--video", action="store_true", help="视频换脸检测 (dataset/video)")
     parser.add_argument("--stability", action="store_true", help="连续运行稳定性")
     parser.add_argument("-n", "--rounds", type=int, default=20, help="稳定性测试轮次")
     args = parser.parse_args()
 
-    run_all = args.all or not any([args.audio, args.text, args.fusion, args.stability])
+    run_all = args.all or not any([args.audio, args.text, args.fusion, args.stability, args.video])
 
     print("=" * 80)
     print("  综合性能评测基准")
@@ -753,6 +982,9 @@ def main():
 
     if run_all or args.text:
         all_metrics["text"] = evaluate_text()
+
+    if run_all or args.video:
+        all_metrics["video"] = evaluate_video()
 
     if run_all or args.fusion:
         result = evaluate_fusion()

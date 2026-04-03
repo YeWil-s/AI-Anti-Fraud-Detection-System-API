@@ -1,7 +1,10 @@
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import desc, select
+from sqlalchemy import desc, select, func
 from typing import List, Dict, Any
 import asyncio
+import json
+import os
+from pathlib import Path
 
 from app.services.vector_db_service import vector_db
 from app.services.llm_service import llm_service
@@ -36,10 +39,13 @@ FRAUD_TYPES = [
 ]
 
 class EducationService:
+    _bootstrap_checked = False
+
     def __init__(self, db: AsyncSession):
         self.db = db
         # 引入向量数据库单例
         self.vector_db = vector_db 
+        self.base_dir = Path(__file__).resolve().parents[2]
 
     def _safe_metadata(self, item: Dict[str, Any]) -> Dict[str, Any]:
         """统一将向量库返回的 metadata 转成普通 dict。"""
@@ -88,10 +94,22 @@ class EducationService:
             "source_label": item.get("source_label") or metadata.get("source") or "反诈法",
         }
 
+    def _deduplicate_by_id(self, items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        seen = set()
+        deduped = []
+        for item in items:
+            item_id = str(item.get("id", ""))
+            if not item_id or item_id in seen:
+                continue
+            seen.add(item_id)
+            deduped.append(item)
+        return deduped
+
     async def get_personalized_recommendations(self, user_id: int, limit: int = 5):
         """
         功能1: 根据用户画像和近期通话，为用户定制个人学习视频和案例教育
         """
+        await self._ensure_knowledge_items_seeded()
         # 使用异步查询
         result = await self.db.execute(select(User).filter(User.user_id == user_id))
         user = result.scalar_one_or_none()
@@ -142,7 +160,16 @@ class EducationService:
             )
             recommendations = result.scalars().all()
             
-        return recommendations
+        return [
+            {
+                "id": item.id,
+                "title": item.title,
+                "content_type": item.item_type or "article",
+                "url": item.content_url,
+                "fraud_type": item.fraud_type
+            }
+            for item in recommendations
+        ]
 
     async def match_similar_cases_for_call(self, transcript: str, top_k: int = 1):
         """
@@ -187,7 +214,7 @@ class EducationService:
 
     # ================= 新增推荐方法 =================
     
-    async def recommend_by_user_profile(self, user_id: int, limit: int = 5) -> Dict[str, Any]:
+    async def recommend_by_user_profile(self, user_id: int, limit: int = 5, page: int = 1) -> Dict[str, Any]:
         """
         基于用户画像的个性化推荐
         
@@ -219,42 +246,106 @@ class EducationService:
         
         logger.info(f"用户 {user_id} 角色: {user.role_type}, 易受骗类型: {vulnerable_types}")
         
-        # 2. 为每种易受骗类型检索案例、标语、视频
-        all_cases = []
-        all_slogans = []
-        all_videos = []
-        
-        for fraud_type in vulnerable_types[:3]:  # 最多取前3种类型
-            # 检索案例
-            cases = self.vector_db.search_by_fraud_type("anti_fraud_cases", fraud_type, top_k=2)
-            all_cases.extend([
-                self._format_case_item(case, fraud_type) for case in cases
-            ])
-            
-            # 检索标语
-            slogans = self.vector_db.search_by_fraud_type("anti_fraud_slogans", fraud_type, top_k=1)
-            all_slogans.extend([
-                self._format_slogan_item(slogan, fraud_type) for slogan in slogans
-            ])
-            
-            # 检索视频
-            videos = self.vector_db.search_by_fraud_type("anti_fraud_videos", fraud_type, top_k=1)
-            all_videos.extend([
-                self._format_video_item(video, fraud_type) for video in videos
-            ])
+        await self._ensure_knowledge_items_seeded()
+
+        # 2. 从关系库拉取学习中心内容（主数据源）
+        all_cases: List[Dict[str, Any]] = []
+        all_slogans: List[Dict[str, Any]] = []
+        all_videos: List[Dict[str, Any]] = []
+
+        page = max(1, page)
+        offset = (page - 1) * limit
+
+        case_result = await self.db.execute(
+            select(KnowledgeItem).where(
+                KnowledgeItem.item_type == "case",
+                KnowledgeItem.fraud_type.in_(vulnerable_types)
+            ).order_by(desc(KnowledgeItem.created_at)).offset(offset).limit(limit * 4)
+        )
+        case_items = case_result.scalars().all()
+        for item in case_items:
+            all_cases.append({
+                "id": str(item.id),
+                "title": item.title,
+                "content": item.summary or "",
+                "fraud_type": item.fraud_type or "其他",
+                "risk_level": None,
+                "similarity": None
+            })
+
+        # 现有前端依赖 slogans 字段，先保留兼容结构
+        for item in case_items[:limit]:
+            all_slogans.append({
+                "id": str(item.id),
+                "content": f"警惕{item.fraud_type or '诈骗'}，核实身份后再操作。",
+                "fraud_type": item.fraud_type or "其他"
+            })
+
+        video_result = await self.db.execute(
+            select(KnowledgeItem).where(
+                KnowledgeItem.item_type == "video",
+                KnowledgeItem.fraud_type.in_(vulnerable_types)
+            ).order_by(desc(KnowledgeItem.created_at)).offset(offset).limit(limit * 4)
+        )
+        video_items = video_result.scalars().all()
+        for item in video_items:
+            all_videos.append({
+                "id": str(item.id),
+                "title": item.title,
+                "url": item.content_url or "",
+                "fraud_type": item.fraud_type or "其他",
+                "description": item.summary or ""
+            })
         
         # 3. 生成用户易受骗分析
         vulnerability_analysis = await self._generate_vulnerability_analysis(
             user.role_type, vulnerable_types, user.profession, user.marital_status
         )
         
+        unique_cases = self._deduplicate_by_id(all_cases)
+        unique_slogans = self._deduplicate_by_id(all_slogans)
+        unique_videos = self._deduplicate_by_id(all_videos)
+
         return {
-            "cases": all_cases[:limit],
-            "slogans": all_slogans[:limit],
-            "videos": all_videos[:limit],
+            "cases": unique_cases[:limit],
+            "slogans": unique_slogans[:limit],
+            "videos": unique_videos[:limit],
             "vulnerability_analysis": vulnerability_analysis,
             "recommended_types": vulnerable_types
         }
+
+    async def get_user_learning_history(
+        self, user_id: int, limit: int = 20, completed_only: bool = False
+    ) -> List[Dict[str, Any]]:
+        await self._ensure_knowledge_items_seeded()
+
+        query = (
+            select(UserLearningRecord, KnowledgeItem)
+            .join(KnowledgeItem, KnowledgeItem.id == UserLearningRecord.item_id)
+            .where(UserLearningRecord.user_id == user_id)
+            .order_by(desc(UserLearningRecord.created_at))
+            .limit(limit)
+        )
+        if completed_only:
+            query = query.where(UserLearningRecord.is_completed.is_(True))
+
+        result = await self.db.execute(query)
+        rows = result.all()
+
+        history = []
+        for record, item in rows:
+            history.append({
+                "record_id": record.id,
+                "item_id": item.id,
+                "item_type": item.item_type,
+                "title": item.title,
+                "url": item.content_url,
+                "fraud_type": item.fraud_type,
+                "is_completed": bool(record.is_completed),
+                "learned_at": record.learned_at.isoformat() if record.learned_at else None,
+                "created_at": record.created_at.isoformat() if record.created_at else None,
+            })
+        return history
     
     async def recommend_by_conversation(
         self, 
@@ -343,6 +434,7 @@ class EducationService:
                 "source_stats": {"cases": n, "laws": n}
             }
         """
+        await self._ensure_knowledge_items_seeded()
         result = await self.db.execute(select(User).filter(User.user_id == user_id))
         user = result.scalar_one_or_none()
         
@@ -357,22 +449,39 @@ class EducationService:
         
         all_cases = []
         all_laws = []
-        
-        # 2. 从案例集合检索案例（anti_fraud_cases）
-        for ftype in query_types[:2]:  # 最多2种类型
-            cases = self.vector_db.search_by_fraud_type("anti_fraud_cases", ftype, top_k=limit)
-            for case in cases:
-                formatted_case = self._format_case_item(case, ftype)
-                formatted_case["source_label"] = "大赛案例库"
-                all_cases.append(formatted_case)
-        
-        # 3. 从法律集合检索法律条文（anti_fraud_laws）
-        for ftype in query_types[:2]:
-            laws = self.vector_db.search_by_fraud_type("anti_fraud_laws", ftype, top_k=2)
-            for law in laws:
-                formatted_law = self._format_law_item(law, ftype)
-                formatted_law["source_label"] = "反诈法"
-                all_laws.append(formatted_law)
+
+        case_result = await self.db.execute(
+            select(KnowledgeItem).where(
+                KnowledgeItem.item_type == "case",
+                KnowledgeItem.fraud_type.in_(query_types)
+            ).order_by(desc(KnowledgeItem.created_at)).limit(limit * 2)
+        )
+        for item in case_result.scalars().all():
+            all_cases.append({
+                "id": str(item.id),
+                "title": item.title,
+                "content": item.summary or "",
+                "fraud_type": item.fraud_type or "其他",
+                "risk_level": None,
+                "similarity": None,
+                "source_label": "大赛案例库"
+            })
+
+        law_result = await self.db.execute(
+            select(KnowledgeItem).where(
+                KnowledgeItem.item_type == "law",
+                KnowledgeItem.fraud_type.in_(query_types)
+            ).order_by(desc(KnowledgeItem.created_at)).limit(max(2, limit))
+        )
+        for item in law_result.scalars().all():
+            all_laws.append({
+                "id": str(item.id),
+                "title": item.title,
+                "content": item.summary or "",
+                "fraud_type": item.fraud_type or "其他",
+                "law_type": "反电信网络诈骗法",
+                "source_label": "反诈法"
+            })
         
         # 4. 混合推荐：案例 + 法律条文
         mixed = []
@@ -405,6 +514,92 @@ class EducationService:
             },
             "query_types": query_types
         }
+
+    def _normalize_fraud_type(self, value: str) -> str:
+        if not value:
+            return "其他"
+        normalized = value.replace("“", "").replace("”", "").strip()
+        for fraud_type in FRAUD_TYPES:
+            if fraud_type in normalized:
+                return fraud_type
+        return normalized
+
+    async def _ensure_knowledge_items_seeded(self) -> None:
+        if EducationService._bootstrap_checked:
+            return
+
+        count_result = await self.db.execute(select(func.count(KnowledgeItem.id)))
+        existing_count = count_result.scalar() or 0
+        if existing_count > 0:
+            EducationService._bootstrap_checked = True
+            return
+
+        items: List[KnowledgeItem] = []
+        data_dir = self.base_dir / "data" / "competition_cases"
+        case_files = [
+            data_dir / "300数据集标注.json",
+            data_dir / "300数据集标注 (2).json",
+        ]
+        law_files = [
+            data_dir / "法律234.json",
+            data_dir / "法律567.json",
+        ]
+
+        for file_path in case_files:
+            if not file_path.exists():
+                continue
+            with open(file_path, "r", encoding="utf-8") as f:
+                records = json.load(f)
+            for row in records:
+                content = (row.get("content") or "").strip()
+                summary = content[:500] if content else ""
+                fraud_type = self._normalize_fraud_type(row.get("title", ""))
+                items.append(KnowledgeItem(
+                    item_type="case",
+                    title=(row.get("title") or "反诈案例").strip()[:255],
+                    summary=summary,
+                    content_url=None,
+                    fraud_type=fraud_type[:100],
+                    target_group=(row.get("target_group") or "通用")[:255]
+                ))
+
+        for file_path in law_files:
+            if not file_path.exists():
+                continue
+            with open(file_path, "r", encoding="utf-8") as f:
+                records = json.load(f)
+            for row in records:
+                content = (row.get("content") or "").strip()
+                summary = content[:500] if content else ""
+                raw_fraud = (row.get("fraud_type") or "").split(",")[0]
+                items.append(KnowledgeItem(
+                    item_type="law",
+                    title=(row.get("title") or "反诈法条").strip()[:255],
+                    summary=summary,
+                    content_url=None,
+                    fraud_type=self._normalize_fraud_type(raw_fraud)[:100],
+                    target_group="通用"
+                ))
+
+        video_dir = self.base_dir / "data" / "edu_video"
+        if video_dir.exists():
+            video_files = sorted([p for p in video_dir.iterdir() if p.suffix.lower() == ".mp4"])
+            for idx, file_path in enumerate(video_files, start=1):
+                fraud_type = FRAUD_TYPES[(idx - 1) % len(FRAUD_TYPES)]
+                items.append(KnowledgeItem(
+                    item_type="video",
+                    title=f"反诈学习视频{idx}",
+                    summary=f"本地教育视频：{file_path.name}",
+                    content_url=f"/api/education/videos/{file_path.name}",
+                    fraud_type=fraud_type,
+                    target_group="通用"
+                ))
+
+        if items:
+            self.db.add_all(items)
+            await self.db.commit()
+            logger.info(f"学习中心资源初始化完成，共写入 {len(items)} 条知识项。")
+        EducationService._bootstrap_checked = True
     
     async def _generate_vulnerability_analysis(
         self, 

@@ -94,20 +94,20 @@ def _defense_control_config(target_level: int, ui_message: str) -> dict:
     """与 upgrade_level 分支一致，用于升级与降级（含 target_level=1）。"""
     if target_level <= 1:
         return {
-            "video_fps": 5.0,
+            "video_fps": settings.VIDEO_TARGET_FPS,
             "ui_message": ui_message,
             "warning_mode": "inline",
             "block_call": False,
         }
     if target_level == 2:
         return {
-            "video_fps": 15.0,
+            "video_fps": settings.VIDEO_TARGET_FPS,
             "ui_message": ui_message,
             "warning_mode": "modal",
             "block_call": False,
         }
     return {
-        "video_fps": 30.0,
+        "video_fps": settings.VIDEO_TARGET_FPS,
         "ui_message": ui_message,
         "warning_mode": "fullscreen",
         "block_call": True,
@@ -227,12 +227,13 @@ def publish_realtime_score(user_id: int, call_id: int, detection_type: str, is_r
 
         overall = max(audio_conf, video_conf, text_conf) * 100
 
-        # 产品策略：音频/视频高风险仅用于“提高检测等级”，不直接弹窗打扰用户；
-        # 只有文本/LLM 融合阶段给出高风险结论后，前端再展示风险弹窗。
+        # 产品策略：本函数仅推送实时分数，不承担“风险弹窗”结论。
+        # 音视频高分不弹窗；文本 ONNX 快筛路径若传入 is_risk=False，也不得因 overall
+        #（被音视频拉高）而误报 is_fraud。诈骗弹窗仅在文本融合 commit 后的 _push_detection_result 下发。
         if detection_type in ("audio", "video"):
             is_fraud = False
         else:
-            is_fraud = is_risk or (overall >= 60)
+            is_fraud = bool(is_risk)
 
         payload = {
             "type": "detection_result",
@@ -244,6 +245,8 @@ def publish_realtime_score(user_id: int, call_id: int, detection_type: str, is_r
                 "is_fraud": is_fraud,
                 "advice": "" if not is_fraud else "检测到风险，请提高警惕",
                 "keywords": [],
+                # 明示：音视频实时分不触发弹窗；弹窗以文本融合推送为准
+                "show_risk_popup": False,
             }
         }
         message_data = {"user_id": user_id, "payload": payload}
@@ -443,14 +446,14 @@ def detect_audio_task(self, audio_base64: str, user_id: int, call_id: int) -> Di
                 # 音频高危特征：提升防御等级，但不直接触发警报
                 # 最终决策交给文本检测融合判断
                 if is_fake and confidence >= 0.95:
-                    # 只提升防御等级，增加检测频率
+                    # 只提升防御等级与采样策略，不向前端发弹窗文案（待文本融合结束再提示）
                     payload_control = {
                         "type": "control", "action": "upgrade_level", "target_level": 2,
                         "config": {
-                            "ui_message": "【风险提示】检测到AI合成语音特征，请提高警惕", 
-                            "warning_mode": "normal",
-                            "video_fps": 15.0  # 增加检测频率
-                        } 
+                            "ui_message": "",
+                            "warning_mode": "inline",
+                            "video_fps": settings.VIDEO_TARGET_FPS,
+                        }
                     }
                     publish_control_command(user_id, payload_control)
                     _set_published_defense_level(call_id, 2)
@@ -513,9 +516,14 @@ def detect_video_task(self, frame_data: list, user_id: int, call_id: int) -> Dic
                             with tempfile.NamedTemporaryFile(suffix='.mp4', delete=False) as temp_video:
                                 temp_video_path = temp_video.name
 
-                            # 初始化视频写入器 (mp4v 编码，假设前端传过来相当于 10 帧/秒)
+                            # 初始化视频写入器，使用与实时采样一致的目标帧率
                             fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-                            video_writer = cv2.VideoWriter(temp_video_path, fourcc, 10.0, (width, height))
+                            video_writer = cv2.VideoWriter(
+                                temp_video_path,
+                                fourcc,
+                                settings.VIDEO_TARGET_FPS,
+                                (width, height),
+                            )
 
                             # 依次写入每一帧
                             for frame in frames:
@@ -561,14 +569,14 @@ def detect_video_task(self, frame_data: list, user_id: int, call_id: int) -> Dic
                 # 视频高危特征：提升防御等级，但不直接触发警报
                 # 最终决策交给文本检测融合判断
                 if curr_state == "ALARM" and raw_conf >= 0.95:
-                    # 只提升防御等级，增加检测频率
+                    # 只提升防御等级与采样策略，不向前端发弹窗文案（待文本融合结束再提示）
                     payload_control = {
                         "type": "control", "action": "upgrade_level", "target_level": 2,
                         "config": {
-                            "video_fps": 30.0, 
-                            "ui_message": "【风险提示】画面存在异常，请提高警惕", 
-                            "warning_mode": "normal"
-                        } 
+                            "video_fps": settings.VIDEO_TARGET_FPS,
+                            "ui_message": "",
+                            "warning_mode": "inline",
+                        }
                     }
                     publish_control_command(user_id, payload_control)
                     _set_published_defense_level(call_id, 2)
@@ -850,7 +858,7 @@ def detect_text_task(self, text: str, user_id: int, call_id: int) -> Dict:
                 target_level = action_level + 1 # Action(0,1,2) 对应 System Level(1,2,3)
 
                 if action_level == 2:
-                    # MDP 裁定：三级最高防御 (强制阻断 + 联动监护人)
+                    # MDP 裁定：三级最高防御 (联动监护人)
                     alert_level = 'critical'
                     record_verdict = DetectionResult.FAKE
                     ui_message = f"【极度高危】系统已阻断。防骗建议：{llm_result.get('advice', '请立刻停止操作！')}"
@@ -872,13 +880,15 @@ def detect_text_task(self, text: str, user_id: int, call_id: int) -> Dict:
                     ui_message = f"【风险提示】行为可疑。防骗建议：{llm_result.get('advice', '请仔细核实对方身份！')}"
                 
                 # 通知前端展示并在记录中更新（MessageLog 写入在事务内）
-                decision_message_log = await notification_service.handle_detection_result(
-                    db=db, user_id=user_id, call_id=call_id,
-                    detection_type="MDP动态决策", is_risk=(action_level > 0), 
-                    confidence=fused_score / 100.0,
-                    risk_level=alert_level,
-                    details=f"命中剧本: {llm_result.get('match_script', '无')} | 融合分: {fused_score:.1f}"
-                )
+                # 三级防御已在上方单独发送一次关键告警，避免重复触发家人联动与邮件。
+                if action_level != 2:
+                    decision_message_log = await notification_service.handle_detection_result(
+                        db=db, user_id=user_id, call_id=call_id,
+                        detection_type="MDP动态决策", is_risk=(action_level > 0), 
+                        confidence=fused_score / 100.0,
+                        risk_level=alert_level,
+                        details=f"命中剧本: {llm_result.get('match_script', '无')} | 融合分: {fused_score:.1f}"
+                    )
 
                 if record:
                     record.analysis = llm_result.get('analysis', '')
@@ -922,6 +932,17 @@ def detect_text_task(self, text: str, user_id: int, call_id: int) -> Dict:
                 _is_high_risk_for_ui = (_fs >= 80.0) or (_af >= 2)
                 _adv = llm_result.get('advice', '') if _is_high_risk_for_ui else ''
 
+                # --- LLM 个性化提醒策略（不改变 MDP 决策的防御等级） ---
+                _role_type = getattr(user, "role_type", "") if user else ""
+                _tts_enabled = bool(llm_result.get("tts_enabled", False))
+                _tts_text = str(llm_result.get("tts_text", "") or "").strip()
+                _tts_priority = str(llm_result.get("tts_priority", "high") or "high")
+                _tts_cooldown_seconds = int(llm_result.get("tts_cooldown_seconds", 60) or 60)
+                # 语音播报需要限流：避免连续触发造成用户困扰
+                _tts_cooldown_seconds = max(10, min(120, _tts_cooldown_seconds))
+                _is_elderly_or_child = _role_type in ("老人", "儿童")
+                _should_push_tts = _is_high_risk_for_ui and _tts_enabled and _is_elderly_or_child and bool(_tts_text)
+
                 def _push_detection_result():
                     det_payload = {
                         "type": "detection_result",
@@ -933,12 +954,36 @@ def detect_text_task(self, text: str, user_id: int, call_id: int) -> Dict:
                             "is_fraud": _is_high_risk_for_ui,
                             "advice": _adv,
                             "keywords": _kw,
+                            "show_risk_popup": _is_high_risk_for_ui,
                         }
                     }
                     msg = {"user_id": _uid, "payload": det_payload}
                     notification_service.redis.publish("fraud_alerts", json.dumps(msg, ensure_ascii=False))
 
                 tx_ctx.add_post_commit_task(_push_detection_result)
+
+                def _push_tts_control():
+                    if not _should_push_tts:
+                        return
+
+                    # 限制同一通话同一等级的重复播报
+                    r = get_redis_pool()
+                    redis_key = f"mdp:published_tts:{call_id}:{target_level}"
+                    if r.get(redis_key):
+                        return
+
+                    r.setex(redis_key, _tts_cooldown_seconds, "1")
+
+                    payload_tts = {
+                        "type": "control",
+                        "action": "tts_speak",
+                        "target_level": target_level,
+                        "tts_priority": _tts_priority,
+                        "tts_text": _tts_text,
+                    }
+                    publish_control_command(_uid, payload_tts)
+
+                tx_ctx.add_post_commit_task(_push_tts_control)
 
                 await db.flush()
                 primary_message_log = decision_message_log or critical_message_log

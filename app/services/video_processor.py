@@ -14,13 +14,16 @@ from app.core.config import settings
 # 初始化模块级 logger
 logger = get_logger(__name__)
 
+# 与 Xception 输入一致：传输与预处理均为 299×299 JPG（质量）
+_VIDEO_JPEG_PARAMS = [int(cv2.IMWRITE_JPEG_QUALITY), 92]
+
 
 class VideoProcessor:
     """
     视频帧提取和处理 (Scheme A: MediaPipe + Temporal Buffer)
     """
     
-    def __init__(self, sequence_length: int = 10):
+    def __init__(self, sequence_length: int = settings.VIDEO_SEQUENCE_LENGTH):
         """
         初始化视频处理器
         Args:
@@ -30,14 +33,20 @@ class VideoProcessor:
         # 存储每个用户的视频帧缓冲 (存储的是 cropped face uint8 numpy array)
         self.frame_buffers: Dict[int, deque] = {}
         
-        # 初始化 MediaPipe Face Mesh
+        # MediaPipe Face Mesh：稠密关键点，适合正脸裁剪；侧脸/小脸/运动模糊时易漏检
         self.mp_face_mesh = mp.solutions.face_mesh
         self.face_mesh = self.mp_face_mesh.FaceMesh(
             static_image_mode=False,
             max_num_faces=1,
             refine_landmarks=True,
-            min_detection_confidence=0.5,
-            min_tracking_confidence=0.5
+            min_detection_confidence=0.35,
+            min_tracking_confidence=0.35,
+        )
+        # Face Detection：全图人脸框，作为 Mesh 失败时的回退（model_selection=1 适合远景/小脸）
+        self.mp_face_detection = mp.solutions.face_detection
+        self.face_detection = self.mp_face_detection.FaceDetection(
+            model_selection=1,
+            min_detection_confidence=0.3,
         )
     
     async def process_frame(self, frame_data: str, user_id: int) -> Dict:
@@ -79,13 +88,10 @@ class VideoProcessor:
                 # 这样传给 Celery/Redis 的数据量极小 (从 6MB -> 200KB)
                 face_batch_base64 = []
                 for face in self.frame_buffers[user_id]:
-                    # Resize 到配置大小再传输，进一步减少带宽
-                    # 虽然 Celery 也会检查 Resize，但在这里先做可以保证传输的一致性
-                    face_resized = cv2.resize(face, settings.VIDEO_INPUT_SIZE)
-                    
-                    # 编码为 JPG
-                    _, buffer = cv2.imencode('.jpg', face_resized)
-                    face_batch_base64.append(base64.b64encode(buffer).decode('utf-8'))
+                    # 训练输入 299×299，与 VIDEO_INPUT_SIZE / 模型一致
+                    face_resized = cv2.resize(face, settings.VIDEO_INPUT_SIZE, interpolation=cv2.INTER_AREA)
+                    _, buffer = cv2.imencode(".jpg", face_resized, _VIDEO_JPEG_PARAMS)
+                    face_batch_base64.append(base64.b64encode(buffer).decode("utf-8"))
                 
                 return {
                     "status": "ready",
@@ -110,42 +116,68 @@ class VideoProcessor:
                 "message": str(e)
             }
 
-    def _extract_face_image(self, img: np.ndarray) -> Optional[np.ndarray]:
-        """
-        辅助方法: 仅使用 MediaPipe 裁剪人脸，返回 uint8 图像
-        """
+    def _crop_from_mesh_landmarks(self, img: np.ndarray, rgb_img: np.ndarray) -> Optional[np.ndarray]:
         h, w, _ = img.shape
-        # MediaPipe 需要 RGB 输入
-        rgb_img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        
         results = self.face_mesh.process(rgb_img)
-        
         if not results.multi_face_landmarks:
             return None
-
-        # 获取关键点
         landmarks = results.multi_face_landmarks[0].landmark
         x_coords = [lm.x for lm in landmarks]
         y_coords = [lm.y for lm in landmarks]
-        
         x1, x2 = int(min(x_coords) * w), int(max(x_coords) * w)
         y1, y2 = int(min(y_coords) * h), int(max(y_coords) * h)
-        
-        # Padding
-        pad_w = int((x2 - x1) * 0.2)
-        pad_h = int((y2 - y1) * 0.2)
-        
+        if x2 <= x1 or y2 <= y1:
+            return None
+        pad_w = max(int((x2 - x1) * 0.2), 2)
+        pad_h = max(int((y2 - y1) * 0.2), 2)
         x1 = max(0, x1 - pad_w)
         y1 = max(0, y1 - pad_h)
         x2 = min(w, x2 + pad_w)
         y2 = min(h, y2 + pad_h)
-        
-        # Crop (注意: 这里返回的是原图 BGR 格式的切片，方便后续 cv2 处理)
         face_img = img[y1:y2, x1:x2]
-        
-        if face_img.size == 0:
+        if face_img.size == 0 or face_img.shape[0] < 16 or face_img.shape[1] < 16:
             return None
-            
+        return face_img
+
+    def _crop_from_face_detection(self, img: np.ndarray, rgb_img: np.ndarray) -> Optional[np.ndarray]:
+        """Face Detection 回退：对侧脸、部分遮挡、小脸更稳。"""
+        h, w, _ = img.shape
+        det = self.face_detection.process(rgb_img)
+        if not det.detections:
+            return None
+        bbox = det.detections[0].location_data.relative_bounding_box
+        bw = bbox.width * w
+        bh = bbox.height * h
+        if bw <= 0 or bh <= 0:
+            return None
+        xmin, ymin = bbox.xmin * w, bbox.ymin * h
+        pad_x = max(bw * 0.15, 2.0)
+        pad_y = max(bh * 0.15, 2.0)
+        x1 = int(max(0, xmin - pad_x))
+        y1 = int(max(0, ymin - pad_y))
+        x2 = int(min(w, xmin + bw + pad_x))
+        y2 = int(min(h, ymin + bh + pad_y))
+        if x2 <= x1 or y2 <= y1:
+            return None
+        face_img = img[y1:y2, x1:x2]
+        if face_img.size == 0 or face_img.shape[0] < 16 or face_img.shape[1] < 16:
+            return None
+        return face_img
+
+    def _extract_face_image(self, img: np.ndarray) -> Optional[np.ndarray]:
+        """
+        MediaPipe：优先 Face Mesh 稠密框；失败则用 Face Detection 框。
+        返回 BGR uint8 切片，后续统一 resize 为 299×299 JPG。
+        """
+        rgb_img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+        face_img = self._crop_from_mesh_landmarks(img, rgb_img)
+        if face_img is not None:
+            return face_img
+
+        face_img = self._crop_from_face_detection(img, rgb_img)
+        if face_img is not None:
+            logger.debug("Face crop: used Face Detection fallback (Mesh missed)")
         return face_img
 
     @staticmethod
@@ -185,16 +217,16 @@ class VideoProcessor:
             face_chw = np.transpose(face_norm, (2, 0, 1))
             processed_faces.append(face_chw)
             
-        # 5. Stack -> (Batch=10, 3, 224, 224)
+        # 5. Stack -> (Seq, 3, H, W)
         seq_array = np.array(processed_faces)
         
-        # 6. Add Batch Dim -> (1, 10, 3, 224, 224)
+        # 6. Add Batch Dim -> (1, Seq, 3, H, W)
         # 这就是可以直接送入 ONNX 的 Tensor
         return np.expand_dims(seq_array, axis=0).astype(np.float32)
 
     # --- 兼容性方法 ---
     
-    async def extract_frames(self, video_bytes: bytes, frame_rate: int = 1) -> List[str]:
+    async def extract_frames(self, video_bytes: bytes, frame_rate: int = 0) -> List[str]:
         """从视频文件中提取关键帧"""
         frames = []
         try:
@@ -207,7 +239,8 @@ class VideoProcessor:
             
             cap = cv2.VideoCapture(tmp_path)
             fps = cap.get(cv2.CAP_PROP_FPS)
-            interval = int(fps / frame_rate) if fps > 0 else 30
+            target_fps = frame_rate if frame_rate and frame_rate > 0 else int(settings.VIDEO_TARGET_FPS)
+            interval = max(1, int(round(fps / target_fps))) if fps > 0 else 1
             
             count = 0
             while True:

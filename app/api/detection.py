@@ -19,6 +19,7 @@ from app.services.audio_processor import AudioProcessor
 from app.services.video_processor import VideoProcessor
 from app.models.call_record import CallRecord
 from app.schemas import ResponseModel
+from app.core.config import settings
 
 from app.core.redis import get_all_user_preferences
 
@@ -64,8 +65,8 @@ async def websocket_endpoint(
         logger.warning(f"Failed to restore user preferences: {e}")
 
     # [关键] 为每个连接创建独立的处理器实例
-    # 视频: 设置 sequence_length=10 (积攒10帧才检测)
-    local_video_processor = VideoProcessor(sequence_length=10)
+    # 视频: 积攒训练配置对应的时序长度后再检测
+    local_video_processor = VideoProcessor(sequence_length=settings.VIDEO_SEQUENCE_LENGTH)
     local_audio_processor = AudioProcessor()
 
     try:
@@ -240,7 +241,7 @@ async def upload_video(
 @router.post("/extract-frames", response_model=ResponseModel)
 async def extract_video_frames(
     file: UploadFile = File(...),
-    frame_rate: int = 1,
+    frame_rate: int = int(settings.VIDEO_TARGET_FPS),
     current_user_id: int = Depends(get_current_user_id)
 ):
     """从视频中提取关键帧"""

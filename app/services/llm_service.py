@@ -29,6 +29,10 @@ class RiskAssessmentOutput(BaseModel):
     intent: str = Field(description="核心意图识别，如'诱导转账/汇款','索要验证码/密码','要求屏幕共享','常规业务沟通'等")
     analysis: str = Field(description="对用户意图和话术套路的逻辑分析过程")
     advice: str = Field(description="针对特定受众人群给出的个性化防骗建议")
+    tts_enabled: bool = Field(description="是否需要触发语音提醒（例如对老人/儿童等人群）")
+    tts_text: str = Field(description="触发语音提醒时的朗读文本；不需要则填空字符串")
+    tts_priority: str = Field(description="语音提醒优先级：normal|high|critical")
+    tts_cooldown_seconds: int = Field(description="建议的语音触发冷却秒数，用于防止重复播报；建议在10-120范围")
 
 class LLMService:
     def __init__(self):
@@ -366,7 +370,11 @@ class LLMService:
   "fraud_type": "诈骗类型，没有则填 其他",
   "intent": "核心意图识别",
   "analysis": "逻辑分析过程",
-  "advice": "给用户的防骗建议"
+  "advice": "给用户的防骗建议",
+  "tts_enabled": false,
+  "tts_text": "仅当需要语音提醒时填写简短中文播报内容（否选择空字符串）",
+  "tts_priority": "high",
+  "tts_cooldown_seconds": 60
 }}
 
 【极其重要】：
@@ -406,7 +414,11 @@ class LLMService:
             return {
                 "is_fraud": False, "risk_level": "safe", 
                 "match_script": "无", "intent": "无法识别",
-                "analysis": "大模型调用异常，降级通过", "advice": "系统繁忙"
+                "analysis": "大模型调用异常，降级通过", "advice": "系统繁忙",
+                "tts_enabled": False,
+                "tts_text": "",
+                "tts_priority": "high",
+                "tts_cooldown_seconds": 60,
             }
     
     async def generate_security_report(self, user: User, recent_calls_with_logs: list) -> str:

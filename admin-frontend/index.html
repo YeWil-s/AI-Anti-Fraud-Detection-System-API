@@ -3,13 +3,12 @@
 <head>
     <meta charset="UTF-8">
     <title>AI 反诈防御系统 - 管理后台</title>
-    <!-- 安全头部 -->
+    <!-- 安全头部 (X-Frame-Options 应通过服务器HTTP响应头设置，不在meta标签中使用) -->
     <meta http-equiv="X-Content-Type-Options" content="nosniff">
-    <meta http-equiv="X-Frame-Options" content="SAMEORIGIN">
     <!-- 本地CSS资源 -->
     <link href="./lib/element-plus.index.min.css" rel="stylesheet">
-    <!-- 图标字体使用CDN（需要字体文件） -->
-    <link href="https://cdn.jsdelivr.net/npm/remixicon@4.1.0/fonts/remixicon.css" rel="stylesheet">
+    <!-- 本地图标字体资源 -->
+    <link href="./lib/remixicon.css" rel="stylesheet">
     <link href="./css/style.css" rel="stylesheet">
     <!-- 添加加载动画样式 -->
     <style>

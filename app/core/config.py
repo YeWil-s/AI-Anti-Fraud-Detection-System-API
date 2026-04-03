@@ -55,7 +55,7 @@ class Settings(BaseSettings):
     AASIST_CODE_PATH: str = "./models/aasist"  # AASIST源码路径
     
     # AI模型路径 - 视频检测
-    VIDEO_MODEL_PATH: str = "./models/video_detection.onnx"
+    VIDEO_MODEL_PATH: str = "./models/xception/deepfake_xception_lstm.onnx"
     
     # AI模型路径 - 文本检测
     TEXT_MODEL_PATH: str = "./models/text_fraud_model.onnx"  # 旧版ONNX模型（备用）
@@ -78,15 +78,26 @@ class Settings(BaseSettings):
         "nb_samp": 64600,   # 音频采样点数（约4秒@16kHz）
     }
 
-    # 视频预处理标准
-    VIDEO_INPUT_SIZE: tuple = (224, 224) 
+    # 视频 ONNX：安装 onnxruntime-gpu 且 CUDA 可用时自动用 GPU（见 ModelService._load_video_models 日志）
+    ONNX_GPU_DEVICE_ID: int = 0
+
+    # 视频预处理标准（与 Xception + BiLSTM 训练配置保持一致）
+    VIDEO_INPUT_SIZE: tuple = (299, 299)
+    VIDEO_SEQUENCE_LENGTH: int = 10
+    VIDEO_TARGET_FPS: float = 15.0
     VIDEO_NORM_MEAN: list = [0.485, 0.456, 0.406] 
     VIDEO_NORM_STD: list = [0.229, 0.224, 0.225]
 
     # AI 检测阈值配置
     VOICE_DETECTION_THRESHOLD: float = 0.90
-    VIDEO_DETECTION_THRESHOLD: float = 0.90   
-    TEXT_DETECTION_THRESHOLD: float = 0.80   
+    VIDEO_DETECTION_THRESHOLD: float = 0.74
+    TEXT_DETECTION_THRESHOLD: float = 0.80
+
+    # 离线评测 / eval_benchmark：一段视频多窗推理结果的聚合方式
+    # trimmed_mean：排序后两端各去掉 VIDEO_WINDOWS_TRIM 比例的窗再取平均，抑制偶发极端帧
+    # iqr_mean：落在 [Q1-1.5*IQR, Q3+1.5*IQR] 内的窗取平均；latest 与线上一致（仅最后一窗）
+    VIDEO_WINDOWS_AGGREGATE: str = "trimmed_mean"
+    VIDEO_WINDOWS_TRIM: float = 0.1
     
     # WebSocket配置
     WS_HEARTBEAT_INTERVAL: int = 30
