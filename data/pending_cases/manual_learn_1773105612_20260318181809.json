@@ -1,0 +1,9 @@
+[
+  {
+    "modality": "audio",
+    "fraud_type": "管理员标记案例_realtime_detection",
+    "risk_level": "高危",
+    "content": "系统拦截了与 realtime_detection 的高危通话，判定为疑似欺诈。",
+    "source": "管理员人工核实 (CallID:1773105612)"
+  }
+]

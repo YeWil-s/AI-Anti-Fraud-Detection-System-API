@@ -13,13 +13,13 @@ from typing import List
 
 class AudioDetectionRequest(BaseModel):
     """音频检测请求"""
-    audio_features: List[List[float]]
+    audio_base64: str
     call_id: int
 
 
 class VideoDetectionRequest(BaseModel):
     """视频检测请求"""
-    frame_data: List[List[int]]
+    frame_data: List[str]
     call_id: int
 
 

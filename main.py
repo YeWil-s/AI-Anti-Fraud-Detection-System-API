@@ -1,6 +1,52 @@
 """
-FastAPI主应用入口 - 优化版
+FastAPI主应用入口
 """
+import os
+import sys
+from unittest.mock import MagicMock
+
+# 禁用所有遥测/统计功能（必须在导入ChromaDB之前设置）
+os.environ["ANONYMIZED_TELEMETRY"] = "false"
+os.environ["CHROMA_TELEMETRY"] = "false"
+os.environ["POSTHOG_DISABLED"] = "1"
+os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+os.environ["DISABLE_TELEMETRY"] = "1"
+os.environ["CHROMA_DISABLE_TELEMETRY"] = "true"
+
+# 创建一个模拟的telemetry模块，让它返回可调用对象
+class MockTelemetry:
+    def __init__(self, *args, **kwargs):
+        pass
+    def __call__(self, *args, **kwargs):
+        return self
+    def capture(self, *args, **kwargs):
+        # ChromaDB 可能以多种方式调用 capture，需要兼容所有情况
+        return self
+    def identify(self, *args, **kwargs):
+        return self
+    def alias(self, *args, **kwargs):
+        return self
+    def group(self, *args, **kwargs):
+        return self
+
+# 创建完整的 Mock posthog 模块
+mock_posthog = MagicMock()
+mock_posthog.capture = MockTelemetry().capture
+mock_posthog.identify = MockTelemetry().identify
+mock_posthog.alias = MockTelemetry().alias
+mock_posthog.group = MockTelemetry().group
+
+# Mock posthog 相关模块
+sys.modules['posthog'] = mock_posthog
+sys.modules['chromadb.telemetry.posthog'] = MagicMock()
+
+# 同时 Mock chromadb 的 telemetry 相关模块
+try:
+    import chromadb
+    if hasattr(chromadb, 'telemetry'):
+        sys.modules['chromadb.telemetry'] = MagicMock()
+except ImportError:
+    pass
 import asyncio
 import json
 import uuid
@@ -12,7 +58,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
 
 from app.db.database import engine
-from app.api import users_router, detection_router, tasks_router, call_records_router
+from app.api import users_router, detection_router, tasks_router, call_records_router, family
+from app.api.education import router as education_router
 from app.api.admin import router as admin_router
 from app.core.config import settings
 from app.core.logger import setup_logging, logger, request_id_ctx
@@ -139,7 +186,9 @@ app.include_router(users_router)
 app.include_router(detection_router)
 app.include_router(tasks_router)
 app.include_router(call_records_router)
+app.include_router(family.router)
 app.include_router(admin_router, prefix="/api/admin", tags=["Admin Management"])
+app.include_router(education_router)
 
 @app.get("/")
 async def root():
@@ -182,5 +231,15 @@ async def health_check():
         }
     }
 
+# 导出 app 供 ASGI 服务器使用
+__all__ = ["app"]
+
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=settings.DEBUG)
+    import platform
+    
+    if platform.system() == "Windows":
+        # Windows 下直接传入 app 对象，避免模块重新导入问题
+        uvicorn.run(app, host="0.0.0.0", port=8000)
+    else:
+        # 其他系统可以使用 reload 模式
+        uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=settings.DEBUG)

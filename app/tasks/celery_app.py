@@ -1,6 +1,16 @@
 """
 Celery应用配置 
 """
+import os
+import sys
+from unittest.mock import MagicMock
+os.environ["ANONYMIZED_TELEMETRY"] = "false"
+os.environ["CHROMA_TELEMETRY"] = "false"
+os.environ["POSTHOG_DISABLED"] = "1"
+os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+sys.modules['chromadb.telemetry.posthog'] = MagicMock()
+sys.modules['posthog'] = MagicMock()
+
 from celery import Celery
 from celery.schedules import crontab  #  导入定时调度工具
 from app.core.config import settings

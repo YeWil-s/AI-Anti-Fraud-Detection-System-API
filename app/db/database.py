@@ -50,6 +50,8 @@ async def get_db():
 async def init_db():
     """初始化数据库"""
     try:
+        # 确保所有模型在 create_all 前完成注册
+        import app.models  # noqa: F401
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
         logger.info("Database schema initialized successfully")

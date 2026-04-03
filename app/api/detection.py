@@ -19,12 +19,12 @@ from app.services.audio_processor import AudioProcessor
 from app.services.video_processor import VideoProcessor
 from app.models.call_record import CallRecord
 from app.schemas import ResponseModel
+from app.core.config import settings
 
-# [Day 8 新增] 导入 Redis 工具以恢复状态
 from app.core.redis import get_all_user_preferences
 
 # 导入检测任务
-from app.tasks.detection_tasks import detect_video_task, detect_audio_task, detect_text_task
+from app.tasks.detection_tasks import detect_video_task, detect_audio_task, detect_text_task, detect_image_task
 
 router = APIRouter(prefix="/api/detection", tags=["实时检测"])
 logger = get_logger(__name__)
@@ -65,9 +65,8 @@ async def websocket_endpoint(
         logger.warning(f"Failed to restore user preferences: {e}")
 
     # [关键] 为每个连接创建独立的处理器实例
-    # 视频: 设置 sequence_length=10 (积攒10帧才检测)
-    local_video_processor = VideoProcessor(sequence_length=10)
-    # 音频: 用于简单预处理或校验
+    # 视频: 积攒训练配置对应的时序长度后再检测
+    local_video_processor = VideoProcessor(sequence_length=settings.VIDEO_SEQUENCE_LENGTH)
     local_audio_processor = AudioProcessor()
 
     try:
@@ -170,9 +169,13 @@ async def websocket_endpoint(
                 record = result.scalar_one_or_none()
                 if record and record.end_time is None:
                     record.end_time = datetime.now()
-                    record.duration = int((record.end_time - record.start_time).total_seconds())
+                    if record.start_time:
+                        record.duration = int((record.end_time - record.start_time).total_seconds())
                     await db.commit()
         await _fallback_end_call()
+
+        from app.tasks.detection_tasks import generate_post_call_summary_task
+        generate_post_call_summary_task.delay(call_id, user_id)
 
     except Exception as e:
         logger.error(f"WebSocket error: {e}", exc_info=True)
@@ -238,7 +241,7 @@ async def upload_video(
 @router.post("/extract-frames", response_model=ResponseModel)
 async def extract_video_frames(
     file: UploadFile = File(...),
-    frame_rate: int = 1,
+    frame_rate: int = int(settings.VIDEO_TARGET_FPS),
     current_user_id: int = Depends(get_current_user_id)
 ):
     """从视频中提取关键帧"""
@@ -253,5 +256,53 @@ async def extract_video_frames(
             "frame_count": len(frames),
             "frame_rate": frame_rate,
             "frames": frames
+        }
+    )
+
+
+@router.post("/upload/image", response_model=ResponseModel)
+async def upload_image(
+    file: UploadFile = File(...),
+    call_id: Optional[int] = None,
+    current_user_id: int = Depends(get_current_user_id),
+    db: AsyncSession = Depends(get_db)
+):
+    """上传图片并触发OCR检测"""
+    allowed_types = ["image/jpeg", "image/png", "image/jpg", "image/webp"]
+    if file.content_type not in allowed_types:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"不支持的图片格式: {file.content_type}"
+        )
+    
+    content = await file.read()
+    
+    # 限制图片大小（最大10MB）
+    if len(content) > 10 * 1024 * 1024:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="图片大小不能超过10MB"
+        )
+    
+    # 上传到MinIO存储
+    file_url = await upload_to_minio(
+        content,
+        f"image/{current_user_id}/{file.filename}",
+        content_type=file.content_type
+    )
+    
+    # 触发图片OCR检测任务
+    import base64
+    image_base64 = base64.b64encode(content).decode('utf-8')
+    task = detect_image_task.delay(image_base64, current_user_id, call_id)
+    
+    return ResponseModel(
+        code=200,
+        message="图片上传成功，正在进行OCR识别",
+        data={
+            "url": file_url,
+            "filename": file.filename,
+            "size": len(content),
+            "task_id": task.id
         }
     )
