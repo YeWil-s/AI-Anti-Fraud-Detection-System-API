@@ -2,11 +2,11 @@
 用户管理API路由
 """
 from datetime import datetime
-from app.models.call_record import CallRecord
+from app.models.call_record import CallRecord, DetectionResult
 from app.services.llm_service import llm_service
 from fastapi import APIRouter, Depends, HTTPException, status, Query
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select, case, func
 from typing import List
 from pydantic import BaseModel
 from app.db.database import get_db
@@ -452,9 +452,10 @@ async def get_user_security_report(
 
 async def _get_user_call_stats(db: AsyncSession, user_id: int) -> dict:
     """获取用户通话统计数据"""
-    from sqlalchemy import func
-    from app.models.call_record import CallRecord
-    
+    from datetime import timedelta
+
+    risk_values = (DetectionResult.FAKE, DetectionResult.SUSPICIOUS)
+
     # 总通话数
     total_calls_result = await db.execute(
         select(func.count(CallRecord.call_id)).where(CallRecord.user_id == user_id)
@@ -465,7 +466,7 @@ async def _get_user_call_stats(db: AsyncSession, user_id: int) -> dict:
     risk_calls_result = await db.execute(
         select(func.count(CallRecord.call_id)).where(
             CallRecord.user_id == user_id,
-            CallRecord.detected_result.in_(["fake", "suspicious"])
+            CallRecord.detected_result.in_(risk_values)
         )
     )
     risk_calls = risk_calls_result.scalar() or 0
@@ -474,7 +475,7 @@ async def _get_user_call_stats(db: AsyncSession, user_id: int) -> dict:
     fake_calls_result = await db.execute(
         select(func.count(CallRecord.call_id)).where(
             CallRecord.user_id == user_id,
-            CallRecord.detected_result == "fake"
+            CallRecord.detected_result == DetectionResult.FAKE
         )
     )
     fake_calls = fake_calls_result.scalar() or 0
@@ -482,20 +483,24 @@ async def _get_user_call_stats(db: AsyncSession, user_id: int) -> dict:
     suspicious_calls_result = await db.execute(
         select(func.count(CallRecord.call_id)).where(
             CallRecord.user_id == user_id,
-            CallRecord.detected_result == "suspicious"
+            CallRecord.detected_result == DetectionResult.SUSPICIOUS
         )
     )
     suspicious_calls = suspicious_calls_result.scalar() or 0
     
     # 最近7天通话趋势
-    from datetime import timedelta
     seven_days_ago = datetime.now() - timedelta(days=7)
     
     daily_stats_result = await db.execute(
         select(
             func.date(CallRecord.start_time).label("date"),
             func.count(CallRecord.call_id).label("count"),
-            func.sum(func.case((CallRecord.detected_result.in_(["fake", "suspicious"]), 1), else_=0)).label("risk_count")
+            func.sum(
+                case(
+                    (CallRecord.detected_result.in_(risk_values), 1),
+                    else_=0,
+                )
+            ).label("risk_count")
         )
         .where(
             CallRecord.user_id == user_id,

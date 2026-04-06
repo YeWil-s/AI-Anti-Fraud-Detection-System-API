@@ -7,17 +7,18 @@ import cv2
 import tempfile
 import os
 import redis
+import re
 import json
 import asyncio
 import base64
 import io
 import time
 import numpy as np
-from typing import Dict, List, Union, Optional
-from datetime import datetime
+from typing import Dict, List, Union, Optional, Tuple
+from datetime import datetime, timedelta
 from asgiref.sync import async_to_sync
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from app.models.call_record import CallRecord, DetectionResult, CallPlatform
 
 from app.services.memory_service import memory_service
@@ -208,9 +209,10 @@ async def _create_mdp_decision_event(
     return event
 
 def publish_realtime_score(user_id: int, call_id: int, detection_type: str, is_risk: bool, confidence: float):
-    """向前端 WebSocket 实时推送综合检测分数
-    
-    从 Redis 读取各模态最新置信度，组合成前端期望的 detection_result 格式推送。
+    """向前端 WebSocket 推送各模态置信度；总分为环境权重下的预览融合分（非 LLM 全量融合）。
+
+    overall_score 使用 environment_fusion_engine.calculate_preview_fused_score：
+    仅对 Redis 中已有且环境权重>0 的模态归一化加权，避免等于 max 单模态。
     """
     try:
         r = get_redis_pool()
@@ -225,11 +227,13 @@ def publish_realtime_score(user_id: int, call_id: int, detection_type: str, is_r
         elif detection_type == "text":
             text_conf = confidence
 
-        overall = max(audio_conf, video_conf, text_conf) * 100
+        overall = environment_fusion_engine.calculate_preview_fused_score(
+            str(call_id), audio_conf, video_conf, text_conf
+        )
 
         # 产品策略：本函数仅推送实时分数，不承担“风险弹窗”结论。
         # 音视频高分不弹窗；文本 ONNX 快筛路径若传入 is_risk=False，也不得因 overall
-        #（被音视频拉高）而误报 is_fraud。诈骗弹窗仅在文本融合 commit 后的 _push_detection_result 下发。
+        # 误报 is_fraud。诈骗弹窗仅在文本 LLM+融合 commit 后的 _push_detection_result 下发。
         if detection_type in ("audio", "video"):
             is_fraud = False
         else:
@@ -242,16 +246,20 @@ def publish_realtime_score(user_id: int, call_id: int, detection_type: str, is_r
                 "voice_confidence": round(audio_conf, 4),
                 "video_confidence": round(video_conf, 4),
                 "text_confidence": round(text_conf, 4),
+                "fusion_stage": "preview",
                 "is_fraud": is_fraud,
                 "advice": "" if not is_fraud else "检测到风险，请提高警惕",
                 "keywords": [],
-                # 明示：音视频实时分不触发弹窗；弹窗以文本融合推送为准
+                # 明示：预览路径不触发诈骗弹窗；弹窗以 full 融合推送为准
                 "show_risk_popup": False,
             }
         }
         message_data = {"user_id": user_id, "payload": payload}
         notification_service.redis.publish("fraud_alerts", json.dumps(message_data))
-        logger.info(f"Realtime score pushed: user={user_id}, type={detection_type}, audio={audio_conf:.2f}, video={video_conf:.2f}, text={text_conf:.2f}")
+        logger.info(
+            f"Realtime score pushed: user={user_id}, type={detection_type}, preview_overall={overall:.1f}, "
+            f"audio={audio_conf:.2f}, video={video_conf:.2f}, text={text_conf:.2f}"
+        )
     except Exception as e:
         logger.error(f"Failed to publish real-time score: {e}")
 
@@ -267,39 +275,25 @@ async def save_raw_data(data: bytes, user_id: int, call_id: int, data_type: str,
     except Exception as e:
         logger.warning(f"Failed to collect training data: {e}")
 
-async def ensure_call_record_exists(db, call_id: int, user_id: int, auto_commit: bool = True) -> Optional[CallRecord]:
+async def load_call_record_for_task(
+    db, call_id: int, user_id: int
+) -> Optional[CallRecord]:
     """
-    确保 CallRecord 存在，并返回通话记录对象
-    
-    Args:
-        db: 数据库会话
-        call_id: 通话ID
-        user_id: 用户ID
-        auto_commit: 是否自动提交事务，默认True。
-                     在使用统一事务管理器时应设为False
+    仅加载已由 POST /api/call-records/start 创建的通话记录。
+
+    不在 Celery 任务中自动 INSERT call_records：一次实时监测应对应一条记录，
+    细节落在 ai_detection_logs / chat_messages；重复自动建表会导致一次检测多条 call_record。
     """
     try:
-        result = await db.execute(select(CallRecord).where(CallRecord.call_id == call_id))
-        record = result.scalar_one_or_none()
-        
-        if record:
-            return record
-        
-        logger.info(f"CallRecord {call_id} not found, auto-creating...")
-        now = datetime.now()
-        new_record = CallRecord(
-            call_id=call_id,
-            user_id=user_id,
-            start_time=now,
-            caller_number="unknown",
-            duration=0
+        result = await db.execute(
+            select(CallRecord).where(
+                CallRecord.call_id == call_id,
+                CallRecord.user_id == user_id,
+            )
         )
-        db.add(new_record)
-        if auto_commit:
-            await db.commit()
-        return new_record
+        return result.scalar_one_or_none()
     except Exception as e:
-        logger.error(f"Failed to ensure call record: {e}")
+        logger.error(f"加载通话记录失败: {e}")
         return None
 
 def publish_control_command(user_id: int, payload: dict):
@@ -397,7 +391,13 @@ def detect_audio_task(self, audio_base64: str, user_id: int, call_id: int) -> Di
     async def _process():
         async with AsyncSessionLocal() as db:
             try:
-                record = await ensure_call_record_exists(db, call_id, user_id)
+                record = await load_call_record_for_task(db, call_id, user_id)
+                if not record:
+                    logger.warning(
+                        f"通话记录不存在，跳过音频检测（请先 POST /call-records/start）: "
+                        f"call_id={call_id}, user_id={user_id}"
+                    )
+                    return {"status": "skipped", "reason": "call_record_not_found"}
                 try:
                     audio_bytes = base64.b64decode(audio_base64)
                 except Exception as e:
@@ -430,6 +430,7 @@ def detect_audio_task(self, audio_base64: str, user_id: int, call_id: int) -> Di
                 
                 ai_log = AIDetectionLog(
                     call_id=call_id,
+                    detection_type="audio",
                     voice_confidence=confidence,
                     overall_score=confidence * 100,
                     evidence_snapshot=evidence_url,
@@ -439,10 +440,18 @@ def detect_audio_task(self, audio_base64: str, user_id: int, call_id: int) -> Di
                 db.add(ai_log)
                 await db.commit()
 
-                if evidence_url and record and not record.audio_url:
-                    record.audio_url = evidence_url
+                if evidence_url:
+                    await db.execute(
+                        update(CallRecord)
+                        .where(
+                            CallRecord.call_id == call_id,
+                            CallRecord.user_id == user_id,
+                            CallRecord.audio_url.is_(None),
+                        )
+                        .values(audio_url=evidence_url)
+                    )
                     await db.commit()
-                
+
                 # 音频高危特征：提升防御等级，但不直接触发警报
                 # 最终决策交给文本检测融合判断
                 if is_fake and confidence >= 0.95:
@@ -484,9 +493,15 @@ def detect_video_task(self, frame_data: list, user_id: int, call_id: int) -> Dic
     async def _process():
         async with AsyncSessionLocal() as db:
             try:
-                record = await ensure_call_record_exists(db, call_id, user_id)
+                record = await load_call_record_for_task(db, call_id, user_id)
+                if not record:
+                    logger.warning(
+                        f"通话记录不存在，跳过视频检测（请先 POST /call-records/start）: "
+                        f"call_id={call_id}, user_id={user_id}"
+                    )
+                    return {"status": "skipped", "reason": "call_record_not_found"}
                 now = datetime.now()
-                call_start_time = record.start_time if record and hasattr(record, 'start_time') and record.start_time else now
+                call_start_time = record.start_time if hasattr(record, 'start_time') and record.start_time else now
                 
                 time_offset = int((now - call_start_time).total_seconds())
                 if time_offset < 0: time_offset = 0
@@ -557,10 +572,13 @@ def detect_video_task(self, frame_data: list, user_id: int, call_id: int) -> Dic
                 
                 if not last_tech_ts or (now_ts - float(last_tech_ts) >= log_interval):
                     ai_log = AIDetectionLog(
-                        call_id=call_id, video_confidence=raw_conf,
-                        overall_score=raw_conf * 100, time_offset=time_offset,
+                        call_id=call_id,
+                        detection_type="video",
+                        video_confidence=raw_conf,
+                        overall_score=raw_conf * 100,
+                        time_offset=time_offset,
                         evidence_snapshot=evidence_url,
-                        model_version=raw_result.get("model_version", "unknown")
+                        model_version=raw_result.get("model_version", "unknown"),
                     )
                     db.add(ai_log)
                     await db.commit()
@@ -599,13 +617,21 @@ def detect_video_task(self, frame_data: list, user_id: int, call_id: int) -> Dic
 
 # 核心中枢：多模态融合与 MDP 决策
 @celery_app.task(name="detect_text", bind=True)
-def detect_text_task(self, text: str, user_id: int, call_id: int) -> Dict:
+def detect_text_task(
+    self,
+    text: str,
+    user_id: int,
+    call_id: int,
+    persist_chat_messages: bool = True,
+) -> Dict:
     """文本触发器 & 大模型多模态融合决策司令部
     
     事务管理优化：
     - 所有数据库操作（AIDetectionLog、ChatMessage、CallRecord）在同一事务中
     - 外部服务调用（Redis发布、邮件发送）在事务commit后执行
     - 外部服务失败仅记录日志，不影响数据库数据一致性
+    
+    persist_chat_messages: 为 False 时表示调用方（如截图 OCR）已逐条写入 chat_messages，本任务仅做风控融合。
     """
     bind_context(user_id=user_id, call_id=call_id)
     logger.info(f"Task started: MDP Fusion Command Center (Len: {len(text)})")
@@ -616,30 +642,37 @@ def detect_text_task(self, text: str, user_id: int, call_id: int) -> Dict:
         
         async with tx_ctx.begin() as db:
             try:
-                record = await ensure_call_record_exists(db, call_id, user_id, auto_commit=False)
-                
+                record = await load_call_record_for_task(db, call_id, user_id)
+                if not record:
+                    logger.warning(
+                        f"通话记录不存在，跳过文本融合（请先 POST /call-records/start）: "
+                        f"call_id={call_id}, user_id={user_id}"
+                    )
+                    return {"status": "skipped", "reason": "call_record_not_found"}
+
                 if len(text.strip()) < 2:
                     return {"status": "skipped", "reason": "text too short"}
-                    
-                await memory_service.add_message(call_id, text)
 
-                # 每次收到前端文本都持久化到 chat_messages，避免被后续分支提前 return 跳过
-                seq_result = await db.execute(
-                    select(ChatMessage.sequence)
-                    .where(ChatMessage.call_id == call_id)
-                    .order_by(ChatMessage.sequence.desc(), ChatMessage.message_id.desc())
-                    .limit(1)
-                )
-                last_seq = seq_result.scalar_one_or_none() or 0
-                current_sequence = last_seq + 1
-                msg = ChatMessage(
-                    call_id=call_id,
-                    sequence=current_sequence,
-                    speaker="other",
-                    content=text[:1000] if len(text) > 1000 else text
-                )
-                db.add(msg)
-                await db.flush()
+                if persist_chat_messages:
+                    await memory_service.add_message(call_id, text)
+
+                    # 每次收到前端文本都持久化到 chat_messages，避免被后续分支提前 return 跳过
+                    seq_result = await db.execute(
+                        select(ChatMessage.sequence)
+                        .where(ChatMessage.call_id == call_id)
+                        .order_by(ChatMessage.sequence.desc(), ChatMessage.message_id.desc())
+                        .limit(1)
+                    )
+                    last_seq = seq_result.scalar_one_or_none() or 0
+                    current_sequence = last_seq + 1
+                    msg = ChatMessage(
+                        call_id=call_id,
+                        sequence=current_sequence,
+                        speaker="other",
+                        content=text[:1000] if len(text) > 1000 else text
+                    )
+                    db.add(msg)
+                    await db.flush()
 
                 now = datetime.now()
                 call_start_time = record.start_time if record and hasattr(record, 'start_time') and record.start_time else now
@@ -703,7 +736,7 @@ def detect_text_task(self, text: str, user_id: int, call_id: int) -> Dict:
                         )
                         db.add(ai_log)
                         await db.flush()
-                        # 推送一次实时融合分数（由 publish_realtime_score 读取 Redis 黑板值）
+                        # 推送预览融合总分（环境权重 + 各模态 Redis 黑板，非 LLM 全量融合）
                         publish_realtime_score(user_id, call_id, "text", False, text_conf)
                         logger.info("ONNX 判定为安全闲聊，已记录检测日志并跳过重量级决策")
                         return {"status": "success", "result": {"is_fraud": False, "risk_level": "safe", "source": "onnx"}}
@@ -870,7 +903,8 @@ def detect_text_task(self, text: str, user_id: int, call_id: int) -> Dict:
                         detection_type="MDP三级防御-强制阻断", is_risk=True, 
                         confidence=fused_score / 100.0,
                         risk_level='critical',
-                        details=f"触发三级防御：{llm_result.get('match_script', '未知剧本')} | 融合分: {fused_score:.1f} | 建议: {llm_result.get('advice', '')}"
+                        details=f"触发三级防御：{llm_result.get('match_script', '未知剧本')} | 融合分: {fused_score:.1f} | 建议: {llm_result.get('advice', '')}",
+                        websocket_push=False,
                     )
 
                 elif action_level == 1:
@@ -887,7 +921,8 @@ def detect_text_task(self, text: str, user_id: int, call_id: int) -> Dict:
                         detection_type="MDP动态决策", is_risk=(action_level > 0), 
                         confidence=fused_score / 100.0,
                         risk_level=alert_level,
-                        details=f"命中剧本: {llm_result.get('match_script', '无')} | 融合分: {fused_score:.1f}"
+                        details=f"命中剧本: {llm_result.get('match_script', '无')} | 融合分: {fused_score:.1f}",
+                        websocket_push=False,
                     )
 
                 if record:
@@ -944,21 +979,36 @@ def detect_text_task(self, text: str, user_id: int, call_id: int) -> Dict:
                 _should_push_tts = _is_high_risk_for_ui and _tts_enabled and _is_elderly_or_child and bool(_tts_text)
 
                 def _push_detection_result():
-                    det_payload = {
-                        "type": "detection_result",
-                        "data": {
-                            "overall_score": round(_fs, 1),
-                            "voice_confidence": round(_ac, 4),
-                            "video_confidence": round(_vc, 4),
-                            "text_confidence": round(_tc, 4),
-                            "is_fraud": _is_high_risk_for_ui,
-                            "advice": _adv,
-                            "keywords": _kw,
-                            "show_risk_popup": _is_high_risk_for_ui,
-                        }
+                    try:
+                        r_fs = get_redis_pool()
+                        r_fs.setex(f"call:{_cid}:latest_fused_score", 3600, str(round(_fs, 1)))
+                    except Exception as e:
+                        logger.warning(f"latest_fused_score redis: {e}")
+                    # 全量融合结果：始终发 detection_result（供悬浮窗 overall_score / is_fraud）；
+                    # 高危时再发一条 alert（供弹窗），避免「只监听 detection_result 时永远收不到 is_fraud=true」。
+                    _data_base = {
+                        "call_id": _cid,
+                        "overall_score": round(_fs, 1),
+                        "voice_confidence": round(_ac, 4),
+                        "video_confidence": round(_vc, 4),
+                        "text_confidence": round(_tc, 4),
+                        "fusion_stage": "full",
+                        "is_fraud": _is_high_risk_for_ui,
+                        "advice": _adv,
+                        "keywords": _kw,
+                        "show_risk_popup": _is_high_risk_for_ui,
                     }
-                    msg = {"user_id": _uid, "payload": det_payload}
-                    notification_service.redis.publish("fraud_alerts", json.dumps(msg, ensure_ascii=False))
+                    rds = notification_service.redis
+                    uid = _uid
+                    msg_dr = {"user_id": uid, "payload": {"type": "detection_result", "data": _data_base}}
+                    rds.publish("fraud_alerts", json.dumps(msg_dr, ensure_ascii=False))
+                    if _is_high_risk_for_ui:
+                        msg_alert = {"user_id": uid, "payload": {"type": "alert", "data": _data_base}}
+                        rds.publish("fraud_alerts", json.dumps(msg_alert, ensure_ascii=False))
+                        logger.info(
+                            f"[WS] 融合高危，已发布 detection_result+alert: user={uid}, call={_cid}, "
+                            f"fused={_fs:.1f}, action_level={_af}"
+                        )
 
                 tx_ctx.add_post_commit_task(_push_detection_result)
 
@@ -1061,142 +1111,124 @@ async def save_video_evidence(video_bytes: bytes, user_id: int, call_id: int) ->
         logger.error(f"视频证据保存失败: {e}")
         return ""
 
-@celery_app.task(name="detect_image", bind=True)
-def detect_image_task(self, image_base64: str, user_id: int, call_id: int) -> Dict:
+_PLATFORM_MAP = {
+    "wechat": CallPlatform.WECHAT,
+    "qq": CallPlatform.QQ,
+    "phone": CallPlatform.PHONE,
+    "video_call": CallPlatform.VIDEO_CALL,
+    "other": CallPlatform.OTHER,
+}
+
+
+def _parse_ocr_line_to_speaker_content(line: str) -> Optional[Tuple[str, str]]:
     """
-    图片检测任务 - 使用GLM-4V-Flash提取文字，支持去重和增量识别
+    将 OCR 增量行解析为 chat_messages：speaker 仅 user/other。
+    优先识别标准前缀 user: / other:（与截图结构化 OCR 一致）。
+    """
+    line = (line or "").strip()
+    if not line:
+        return None
+    m = re.match(r"^(user|other)\s*[:：]\s*(.*)$", line, re.IGNORECASE | re.DOTALL)
+    if m:
+        role = m.group(1).lower()
+        body = (m.group(2) or "").strip()
+        if body:
+            return (role, body[:1000])
+    for sep in (":", "："):
+        if sep in line:
+            left, right = line.split(sep, 1)
+            left, right = left.strip(), right.strip()
+            if right:
+                label = (left or "对方")[:20]
+                content = f"[{label}] {right}" if left else right
+                return ("other", content[:1000])
+    return ("other", line[:1000])
+
+
+async def _persist_ocr_new_lines_to_chat_messages(
+    db,
+    call_id: int,
+    new_lines: List[str],
+) -> int:
+    """将截图 OCR 增量行逐条写入 chat_messages，并同步到 Redis 短期记忆。"""
+    if not new_lines:
+        return 0
+    seq_result = await db.execute(
+        select(ChatMessage.sequence)
+        .where(ChatMessage.call_id == call_id)
+        .order_by(ChatMessage.sequence.desc(), ChatMessage.message_id.desc())
+        .limit(1)
+    )
+    last_seq = seq_result.scalar_one_or_none() or 0
+    seq = last_seq
+    n = 0
+    for raw_line in new_lines:
+        parsed = _parse_ocr_line_to_speaker_content(raw_line)
+        if not parsed:
+            continue
+        speaker, content = parsed
+        if not (content or "").strip():
+            continue
+        seq += 1
+        db.add(
+            ChatMessage(
+                call_id=call_id,
+                sequence=seq,
+                speaker=speaker,
+                content=content,
+            )
+        )
+        mem_line = raw_line.strip()[:1000]
+        if mem_line:
+            await memory_service.add_message(call_id, mem_line)
+        n += 1
+    if n:
+        await db.flush()
+    return n
+
+
+@celery_app.task(name="detect_image_dialogue", bind=True)
+def detect_image_dialogue_task(self, image_base64: str, user_id: int, call_id: int) -> Dict:
+    """
+    第二步：仅在已判定为文字聊天后执行——提取聊天文字、去重增量、触发文本风控。
+    与 detect_image_task（环境分类）解耦，避免一次请求混写两类业务。
     """
     bind_context(user_id=user_id, call_id=call_id)
-    
+
     async def _process():
         async with AsyncSessionLocal() as db:
             try:
-                record = await ensure_call_record_exists(db, call_id, user_id)
-                
-                # 解码图片
+                record = await load_call_record_for_task(db, call_id, user_id)
+                if not record:
+                    logger.warning(
+                        f"通话记录不存在，跳过聊天 OCR（请先 POST /call-records/start）: "
+                        f"call_id={call_id}, user_id={user_id}"
+                    )
+                    return {"status": "skipped", "reason": "call_record_not_found"}
                 try:
                     image_bytes = base64.b64decode(image_base64)
-                except Exception as e:
+                except Exception:
                     return {"status": "error", "message": "Invalid base64 image"}
-                
-                # 保存原始图片（如果需要）
-                if getattr(settings, 'COLLECT_TRAINING_DATA', False):
+
+                if getattr(settings, "COLLECT_TRAINING_DATA", False):
                     await save_raw_data(image_bytes, user_id, call_id, "image", "jpg")
-                
-                # 使用OCR提取文字
-                logger.info(f"开始图片OCR，用户: {user_id}, 通话: {call_id}")
+
+                logger.info(f"开始聊天文字提取（第二步），用户: {user_id}, 通话: {call_id}")
                 ocr_result = await image_ocr_service.extract_chat_from_screenshot(image_bytes)
-                
+
                 if not ocr_result or not ocr_result.get("text"):
-                    return {"status": "success", "result": {"text": "", "is_fraud": False, "source": "ocr_empty"}}
-                
-                extracted_text = ocr_result["text"]
-                logger.info(f"图片OCR完成，提取文字长度: {len(extracted_text)}")
-                
-                # 提取通话环境信息并更新call_record
-                environment = ocr_result.get("environment", {})
-                if environment:
-                    platform_str = environment.get("platform", "other")
-                    caller_number = environment.get("caller_number", "")
-                    target_name = environment.get("target_name", "")
-                    
-                    # 转换平台字符串为枚举
-                    platform_map = {
-                        "wechat": CallPlatform.WECHAT,
-                        "qq": CallPlatform.QQ,
-                        "phone": CallPlatform.PHONE,
-                        "video_call": CallPlatform.VIDEO_CALL,
-                        "other": CallPlatform.OTHER
+                    return {
+                        "status": "success",
+                        "result": {"text": "", "is_fraud": False, "source": "ocr_empty"},
                     }
-                    detected_platform = platform_map.get(platform_str.lower(), CallPlatform.OTHER)
-                    
-                    # 更新call_record（仅当字段为空时）
-                    updated = False
-                    if record.platform == CallPlatform.PHONE or record.platform is None:
-                        record.platform = detected_platform
-                        updated = True
-                    if not record.caller_number and caller_number:
-                        record.caller_number = caller_number
-                        updated = True
-                    if not record.target_name and target_name:
-                        record.target_name = target_name
-                        updated = True
-                    
-                    if updated:
-                        await db.commit()
-                        logger.info(f"更新通话环境: platform={detected_platform.value}, caller={caller_number or target_name}")
-                    
-                    # ===== 环境感知：设置融合引擎环境并推送给前端 =====
-                    try:
-                        # 判断是否为纯文字聊天（从OCR结果分析）
-                        is_text_chat = False
-                        if ocr_result.get("dialogues"):
-                            # 如果有对话结构，检查是否为纯文字聊天界面
-                            dialogues = ocr_result.get("dialogues", [])
-                            # 文字聊天特征：有明确的发送者标识，消息气泡样式
-                            has_chat_structure = len(dialogues) > 0 and any(
-                                "sender" in d and "content" in d for d in dialogues
-                            )
-                            # 语音聊天特征：有通话时长、麦克风图标等
-                            has_voice_indicators = any(
-                                indicator in extracted_text for indicator in 
-                                ["通话时长", "麦克风", "扬声器", "挂断", "免提"]
-                            )
-                            is_text_chat = has_chat_structure and not has_voice_indicators
-                        
-                        # 设置环境到融合引擎
-                        environment_fusion_engine.set_call_environment(
-                            call_id=str(call_id),
-                            platform=platform_str,
-                            is_text_chat=is_text_chat
-                        )
-                        
-                        # 获取环境信息
-                        env_info = environment_fusion_engine.get_environment_info(str(call_id))
-                        
-                        # 通过WebSocket推送给前端
-                        payload = {
-                            "type": "environment_detected",
-                            "data": {
-                                "call_id": call_id,
-                                "platform": platform_str,
-                                "is_text_chat": is_text_chat,
-                                "environment_type": env_info["environment_type"],
-                                "description": env_info["description"],
-                                "active_modalities": env_info["active_modalities"],
-                                "weights": env_info["weights"]
-                            }
-                        }
-                        
-                        message_data = {
-                            "user_id": user_id,
-                            "payload": payload
-                        }
-                        
-                        r = get_redis_pool()
-                        r.publish("fraud_alerts", json.dumps(message_data, ensure_ascii=False))
-                        logger.info(f"[环境感知] 环境识别结果已推送到前端: call_id={call_id}, env={env_info['environment_type']}, is_text_chat={is_text_chat}")
-                        
-                        # 根据环境调整后续检测策略
-                        if is_text_chat:
-                            logger.info(f"[环境感知] 检测到文字聊天场景，建议前端关闭音频/视频检测，专注文本分析")
-                        elif platform_str in ["wechat", "qq"]:
-                            logger.info(f"[环境感知] 检测到{platform_str}语音聊天，启用音频+文本检测")
-                        elif platform_str == "phone":
-                            logger.info(f"[环境感知] 检测到电话通话，启用音频+文本检测")
-                        elif platform_str == "video_call":
-                            logger.info(f"[环境感知] 检测到视频通话，启用三模态检测")
-                            
-                    except Exception as env_e:
-                        logger.warning(f"[环境感知] 环境设置或推送失败: {env_e}")
-                
-                # 计算对话哈希
+
+                extracted_text = ocr_result["text"]
+                logger.info(f"聊天文字提取完成，长度: {len(extracted_text)}")
+
                 dialogue_hash = image_ocr_service.calculate_dialogue_hash(extracted_text)
-                
-                # 查询该通话最近10分钟的OCR记录，用于去重
-                from sqlalchemy import select, and_, desc
-                from datetime import timedelta
-                
+
+                from sqlalchemy import and_, desc
+
                 ten_minutes_ago = datetime.now() - timedelta(minutes=10)
                 recent_logs_result = await db.execute(
                     select(AIDetectionLog)
@@ -1204,66 +1236,98 @@ def detect_image_task(self, image_base64: str, user_id: int, call_id: int) -> Di
                         and_(
                             AIDetectionLog.call_id == call_id,
                             AIDetectionLog.detection_type == "image",
-                            AIDetectionLog.created_at >= ten_minutes_ago
+                            AIDetectionLog.created_at >= ten_minutes_ago,
                         )
                     )
                     .order_by(desc(AIDetectionLog.created_at))
                     .limit(5)
                 )
                 recent_logs = recent_logs_result.scalars().all()
-                
-                # 获取之前的对话文本用于增量识别
                 previous_texts = [log.image_ocr_text for log in recent_logs if log.image_ocr_text]
-                
-                # 增量识别：找出新增对话
+
                 increment_result = image_ocr_service.extract_new_dialogues(
                     current_text=extracted_text,
                     previous_texts=previous_texts,
-                    similarity_threshold=0.85
+                    similarity_threshold=0.85,
                 )
-                
-                # 记录OCR结果到数据库
+
                 now = datetime.now()
-                call_start_time = record.start_time if record and hasattr(record, 'start_time') and record.start_time else now
+                call_start_time = (
+                    record.start_time
+                    if record and hasattr(record, "start_time") and record.start_time
+                    else now
+                )
                 time_offset = int((now - call_start_time).total_seconds())
-                if time_offset < 0: time_offset = 0
-                
+                if time_offset < 0:
+                    time_offset = 0
+
+                dialogue_struct = ocr_result.get("dialogue") or []
                 ai_log = AIDetectionLog(
                     call_id=call_id,
                     detection_type="image",
-                    detected_keywords=f"图片OCR提取: {extracted_text[:100]}...",
-                    image_ocr_text=extracted_text,  # 保存完整OCR文本
-                    ocr_dialogue_hash=dialogue_hash,  # 保存哈希用于去重
+                    detected_keywords=f"图片OCR|条数:{len(dialogue_struct)}|{extracted_text[:80]}...",
+                    detected_text=(
+                        extracted_text[:2000] if extracted_text else None
+                    ),
+                    image_ocr_text=extracted_text,
+                    ocr_dialogue_hash=dialogue_hash,
                     overall_score=0,
                     time_offset=time_offset,
-                    model_version="glm-4v-flash-ocr"
+                    model_version="glm-4v-flash-ocr",
+                    algorithm_details=(
+                        json.dumps(
+                            {"dialogue": dialogue_struct},
+                            ensure_ascii=False,
+                        )[:8000]
+                        if dialogue_struct
+                        else None
+                    ),
                 )
                 db.add(ai_log)
                 await db.commit()
-                
-                # 如果是重复内容，只记录不触发检测
+
                 if increment_result["is_duplicate"]:
-                    logger.info(f"图片内容重复，相似度: {increment_result['similarity']:.2%}，跳过检测")
+                    logger.info(
+                        f"图片内容重复，相似度: {increment_result['similarity']:.2%}，跳过文本检测"
+                    )
                     return {
-                        "status": "success", 
+                        "status": "success",
                         "result": {
                             "text": extracted_text,
                             "is_duplicate": True,
                             "similarity": increment_result["similarity"],
-                            "source": "ocr_duplicate"
-                        }
+                            "source": "ocr_duplicate",
+                        },
                     }
-                
-                # 使用新增内容触发文本检测
+
                 new_content = increment_result["new_content"] or extracted_text
-                new_lines = increment_result["new_lines"]
-                
+                new_lines = list(increment_result.get("new_lines") or [])
+                if not new_lines and (new_content or "").strip():
+                    new_lines = [
+                        ln.strip()
+                        for ln in (new_content or "").split("\n")
+                        if ln.strip()
+                    ]
+
+                if new_lines:
+                    inserted = await _persist_ocr_new_lines_to_chat_messages(
+                        db, call_id, new_lines
+                    )
+                    if inserted:
+                        await db.commit()
+                        logger.info(
+                            f"截图 OCR 增量已逐条写入 chat_messages: {inserted} 条"
+                        )
+
                 if len(new_content.strip()) > 2:
-                    logger.info(f"触发文本检测，新增内容长度: {len(new_content)}, 新增行数: {len(new_lines)}")
-                    detect_text_task.delay(new_content, user_id, call_id)
-                
+                    logger.info(
+                        f"触发文本检测，新增内容长度: {len(new_content)}, 新增行数: {len(new_lines)}"
+                    )
+                    # OCR 已在上方逐条持久化，此处不再合并写入 chat_messages
+                    detect_text_task.delay(new_content, user_id, call_id, False)
+
                 return {
-                    "status": "success", 
+                    "status": "success",
                     "result": {
                         "text": extracted_text,
                         "new_content": new_content,
@@ -1271,14 +1335,160 @@ def detect_image_task(self, image_base64: str, user_id: int, call_id: int) -> Di
                         "similarity": increment_result["similarity"],
                         "is_duplicate": False,
                         "dialogue": ocr_result.get("dialogue", []),
-                        "source": "ocr"
-                    }
+                        "source": "ocr",
+                    },
                 }
-                
+
+            except Exception as e:
+                logger.error(f"detect_image_dialogue failed: {e}", exc_info=True)
+                return {"status": "error", "message": str(e)}
+
+    try:
+        return async_to_sync(_process)()
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+@celery_app.task(name="detect_image", bind=True)
+def detect_image_task(self, image_base64: str, user_id: int, call_id: int) -> Dict:
+    """
+    第一步：截图环境分类（平台、沟通方式），更新通话记录并推送前端；仅当判定为文字聊天时再异步触发 detect_image_dialogue_task。
+    """
+    bind_context(user_id=user_id, call_id=call_id)
+
+    async def _process():
+        async with AsyncSessionLocal() as db:
+            try:
+                record = await load_call_record_for_task(db, call_id, user_id)
+                if not record:
+                    logger.warning(
+                        f"通话记录不存在，跳过截图环境分类（请先 POST /call-records/start）: "
+                        f"call_id={call_id}, user_id={user_id}"
+                    )
+                    return {"status": "skipped", "reason": "call_record_not_found"}
+
+                try:
+                    image_bytes = base64.b64decode(image_base64)
+                except Exception:
+                    return {"status": "error", "message": "Invalid base64 image"}
+
+                if getattr(settings, "COLLECT_TRAINING_DATA", False):
+                    await save_raw_data(image_bytes, user_id, call_id, "image", "jpg")
+
+                logger.info(f"开始截图环境分类（第一步），用户: {user_id}, 通话: {call_id}")
+                classify_result = await image_ocr_service.classify_screenshot_environment(
+                    image_bytes
+                )
+
+                if not classify_result:
+                    return {
+                        "status": "success",
+                        "result": {
+                            "source": "environment_unknown",
+                            "message": "环境分类失败或未配置智谱 API",
+                        },
+                    }
+
+                environment = classify_result.get("environment") or {}
+                platform_str = (environment.get("platform") or "other").lower()
+                caller_number = environment.get("caller_number") or ""
+                target_name = environment.get("target_name") or ""
+                communication_mode = (environment.get("communication_mode") or "unknown").lower()
+                is_text_chat = bool(classify_result.get("is_text_chat"))
+                should_extract_dialogue = bool(classify_result.get("should_extract_dialogue"))
+
+                detected_platform = _PLATFORM_MAP.get(platform_str, CallPlatform.OTHER)
+
+                # 使用单列 UPDATE，避免 ORM 在长时间 OCR 后提交时把并发写入的 end_time 覆盖回 NULL
+                # （识别为 wechat/phone 时常会改 platform 并 commit；识别为 other 时可能不改任何列，故不易触发）
+                values = {}
+                if record.platform == CallPlatform.PHONE or record.platform is None:
+                    values["platform"] = detected_platform
+                if not record.caller_number and caller_number:
+                    values["caller_number"] = caller_number
+                if not record.target_name and target_name:
+                    values["target_name"] = target_name
+
+                if values:
+                    await db.execute(
+                        update(CallRecord)
+                        .where(
+                            CallRecord.call_id == call_id,
+                            CallRecord.user_id == user_id,
+                        )
+                        .values(**values)
+                    )
+                    await db.commit()
+                    logger.info(
+                        f"更新通话环境: platform={detected_platform.value}, caller={caller_number or target_name}"
+                    )
+
+                try:
+                    environment_fusion_engine.set_call_environment(
+                        call_id=str(call_id),
+                        platform=platform_str,
+                        is_text_chat=is_text_chat,
+                    )
+                    env_info = environment_fusion_engine.get_environment_info(str(call_id))
+                    payload = {
+                        "type": "environment_detected",
+                        "data": {
+                            "call_id": call_id,
+                            "platform": platform_str,
+                            "communication_mode": communication_mode,
+                            "is_text_chat": is_text_chat,
+                            "environment_type": env_info["environment_type"],
+                            "description": env_info["description"],
+                            "active_modalities": env_info["active_modalities"],
+                            "weights": env_info["weights"],
+                        },
+                    }
+                    message_data = {"user_id": user_id, "payload": payload}
+                    r = get_redis_pool()
+                    r.publish("fraud_alerts", json.dumps(message_data, ensure_ascii=False))
+                    logger.info(
+                        f"[环境感知] 环境识别结果已推送: call_id={call_id}, env={env_info['environment_type']}, mode={communication_mode}"
+                    )
+                    if is_text_chat:
+                        logger.info(
+                            "[环境感知] 文字聊天场景，将异步提取聊天文字并做文本检测"
+                        )
+                    elif platform_str in ["wechat", "qq"]:
+                        logger.info(
+                            f"[环境感知] 检测到 {platform_str} 非纯文字界面，不跑聊天 OCR"
+                        )
+                    elif platform_str == "phone":
+                        logger.info("[环境感知] 电话通话界面，不跑聊天 OCR")
+                    elif platform_str == "video_call":
+                        logger.info("[环境感知] 视频通话界面，不跑聊天 OCR")
+                except Exception as env_e:
+                    logger.warning(f"[环境感知] 环境设置或推送失败: {env_e}")
+
+                dialogue_task_id = None
+                if should_extract_dialogue and is_text_chat:
+                    async_result = detect_image_dialogue_task.delay(
+                        image_base64, user_id, call_id
+                    )
+                    dialogue_task_id = async_result.id
+                    logger.info(
+                        f"已排队聊天文字提取任务 detect_image_dialogue: {dialogue_task_id}"
+                    )
+
+                return {
+                    "status": "success",
+                    "result": {
+                        "platform": platform_str,
+                        "communication_mode": communication_mode,
+                        "is_text_chat": is_text_chat,
+                        "dialogue_task_id": dialogue_task_id,
+                        "source": "environment",
+                    },
+                }
+
             except Exception as e:
                 logger.error(f"Image task failed: {e}", exc_info=True)
                 return {"status": "error", "message": str(e)}
-    
+
     try:
         return async_to_sync(_process)()
     except Exception as e:

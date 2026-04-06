@@ -488,6 +488,43 @@ class EnvironmentAwareFusionEngine(RiskFusionEngineV2):
             self._weight_override = original_override
         
         return score
+
+    def calculate_preview_fused_score(
+        self,
+        call_id: Optional[str],
+        audio_conf: float,
+        video_conf: float,
+        text_conf: float,
+    ) -> float:
+        """
+        无 LLM 时的实时总分：按当前通话「环境权重」仅在已有置信度的模态上归一化加权，0–100。
+
+        用于音视频轮询、ONNX 快路径等场景，避免 overall 等于某一模态或简单 max。
+        与 calculate_score（意图/剧本/协同/时序）不同，此处不跑 LLM，仅做环境占比融合。
+        """
+        env_weights = self._get_environment_weights(call_id)
+        modalities = {
+            "text": max(0.0, min(1.0, float(text_conf))),
+            "vision": max(0.0, min(1.0, float(video_conf))),
+            "audio": max(0.0, min(1.0, float(audio_conf))),
+        }
+        eps = 1e-9
+        active: List[tuple] = []
+        for mod in ("text", "vision", "audio"):
+            w = float(env_weights.get(mod, 0.0))
+            if w <= eps:
+                continue
+            c = modalities[mod]
+            if c <= eps:
+                continue
+            active.append((mod, c * 100.0, w))
+        if not active:
+            return 0.0
+        tw = sum(w for _, _, w in active)
+        if tw <= eps:
+            return 0.0
+        fused = sum(score * (w / tw) for _, score, w in active)
+        return round(min(100.0, max(0.0, fused)), 2)
     
     def get_environment_info(self, call_id: str) -> dict:
         """获取环境信息（用于前端展示）"""

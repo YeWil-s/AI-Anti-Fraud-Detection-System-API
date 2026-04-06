@@ -88,13 +88,13 @@ async def redis_listener():
                     payload = data.get('payload')
                     
                     if user_id and connection_manager.is_user_online(user_id):
-                        # 处理特殊的控制逻辑：防御等级变更
+                        # control+upgrade_level → 仅下发 level_sync（静默同步防御等级与采集策略，不弹诈骗窗）
+                        # detection_result 等原样转发；融合判定高危由任务发 type=alert（与前端弹窗一致）
                         if payload.get("type") == "control" and payload.get("action") == "upgrade_level":
                             target_level = payload.get("target_level")
                             config = payload.get("config")
                             await connection_manager.set_defense_level(user_id, target_level, config)
                         else:
-                            # 正常的风险通知或普通消息
                             await connection_manager.send_personal_message(payload, user_id)
                         
                         logger.info(f" [转发成功] Celery -> User {user_id} | Type: {payload.get('type')}")

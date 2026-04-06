@@ -24,10 +24,29 @@ from app.core.config import settings
 from app.core.redis import get_all_user_preferences
 
 # 导入检测任务
-from app.tasks.detection_tasks import detect_video_task, detect_audio_task, detect_text_task, detect_image_task
+from app.tasks.detection_tasks import (
+    detect_video_task,
+    detect_audio_task,
+    detect_text_task,
+    detect_image_task,
+    detect_image_dialogue_task,
+    generate_post_call_summary_task,
+)
 
 router = APIRouter(prefix="/api/detection", tags=["实时检测"])
 logger = get_logger(__name__)
+
+
+async def _fallback_end_call_record(call_id: int) -> None:
+    """WebSocket 断开或异常结束时，若尚未归档则补写 end_time（避免仅依赖客户端 POST /end）。"""
+    async with AsyncSessionLocal() as db:
+        result = await db.execute(select(CallRecord).where(CallRecord.call_id == call_id))
+        record = result.scalar_one_or_none()
+        if record and record.end_time is None:
+            record.end_time = datetime.now()
+            if record.start_time:
+                record.duration = int((record.end_time - record.start_time).total_seconds())
+            await db.commit()
 
 @router.websocket("/ws/{user_id}/{call_id}")
 async def websocket_endpoint(
@@ -163,23 +182,15 @@ async def websocket_endpoint(
         connection_manager.disconnect(user_id)
         local_video_processor.clear_buffer(user_id)
         logger.info(f"User {user_id} disconnected")
-        async def _fallback_end_call():
-            async with AsyncSessionLocal() as db:
-                result = await db.execute(select(CallRecord).where(CallRecord.call_id == call_id))
-                record = result.scalar_one_or_none()
-                if record and record.end_time is None:
-                    record.end_time = datetime.now()
-                    if record.start_time:
-                        record.duration = int((record.end_time - record.start_time).total_seconds())
-                    await db.commit()
-        await _fallback_end_call()
-
-        from app.tasks.detection_tasks import generate_post_call_summary_task
+        await _fallback_end_call_record(call_id)
         generate_post_call_summary_task.delay(call_id, user_id)
 
     except Exception as e:
         logger.error(f"WebSocket error: {e}", exc_info=True)
-        await connection_manager.disconnect(user_id)
+        connection_manager.disconnect(user_id)
+        local_video_processor.clear_buffer(user_id)
+        await _fallback_end_call_record(call_id)
+        generate_post_call_summary_task.delay(call_id, user_id)
 
 # --- Upload 接口保持不变 ---
 @router.post("/upload/audio", response_model=ResponseModel)
@@ -263,46 +274,60 @@ async def extract_video_frames(
 @router.post("/upload/image", response_model=ResponseModel)
 async def upload_image(
     file: UploadFile = File(...),
-    call_id: Optional[int] = None,
+    call_id: int = Query(
+        ...,
+        description="当前监测会话的通话 ID，必须与 POST /api/call-records/start 返回的 call_id 一致；"
+        "未传或传错会导致 Celery 中 call_id 为 None、环境感知与通话记录无法关联。",
+    ),
+    dialogue_only: bool = Query(
+        False,
+        description="为 true 时仅排队增量聊天 OCR（detect_image_dialogue），不再重复做环境分类（detect_image）",
+    ),
     current_user_id: int = Depends(get_current_user_id),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
 ):
-    """上传图片并触发OCR检测"""
+    """上传图片并触发 OCR：默认识别环境；dialogue_only 时仅做通话内增量对话提取与文本检测。"""
     allowed_types = ["image/jpeg", "image/png", "image/jpg", "image/webp"]
     if file.content_type not in allowed_types:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"不支持的图片格式: {file.content_type}"
         )
-    
+
     content = await file.read()
-    
+
     # 限制图片大小（最大10MB）
     if len(content) > 10 * 1024 * 1024:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="图片大小不能超过10MB"
         )
-    
+
     # 上传到MinIO存储
     file_url = await upload_to_minio(
         content,
         f"image/{current_user_id}/{file.filename}",
-        content_type=file.content_type
+        content_type=file.content_type,
     )
-    
-    # 触发图片OCR检测任务
+
     import base64
-    image_base64 = base64.b64encode(content).decode('utf-8')
-    task = detect_image_task.delay(image_base64, current_user_id, call_id)
-    
+
+    image_base64 = base64.b64encode(content).decode("utf-8")
+    if dialogue_only:
+        task = detect_image_dialogue_task.delay(image_base64, current_user_id, call_id)
+        msg = "图片上传成功，正在进行增量聊天 OCR（已跳过环境分类）"
+    else:
+        task = detect_image_task.delay(image_base64, current_user_id, call_id)
+        msg = "图片上传成功，正在进行截图环境识别（文字聊天将另行提取对话并检测）"
+
     return ResponseModel(
         code=200,
-        message="图片上传成功，正在进行OCR识别",
+        message=msg,
         data={
             "url": file_url,
             "filename": file.filename,
             "size": len(content),
-            "task_id": task.id
-        }
+            "task_id": task.id,
+            "dialogue_only": dialogue_only,
+        },
     )

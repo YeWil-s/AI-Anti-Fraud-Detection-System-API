@@ -916,7 +916,7 @@ async def trigger_emergency_alert(
     result = await db.execute(
         select(CallRecord).where(
             and_(
-                CallRecord.id == call_id,
+                CallRecord.call_id == call_id,
                 CallRecord.user_id == current_user_id
             )
         )

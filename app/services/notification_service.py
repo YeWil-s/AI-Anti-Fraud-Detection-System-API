@@ -39,7 +39,8 @@ class NotificationService:
         is_risk: bool, 
         confidence: float,
         risk_level: str = "low",
-        details: str = ""
+        details: str = "",
+        websocket_push: bool = True,
     ) -> Optional[MessageLog]:
         """
         处理检测结果：记录日志并触发实时预警
@@ -64,6 +65,10 @@ class NotificationService:
         
         【事务管理】
         本方法不单独 commit，由调用方统一管理事务
+        
+        websocket_push:
+            为 False 时不向当前用户发 WebSocket（避免与 detect_text 融合后的 alert 重复弹窗），
+            仍写入 MessageLog，仍可按策略通知监护人/邮件。
         """
         timestamp = datetime.now().isoformat()
         
@@ -124,7 +129,8 @@ class NotificationService:
                 "display_mode": display_mode
             }
         }
-        self._publish_to_redis(user_id, ws_payload)
+        if websocket_push:
+            self._publish_to_redis(user_id, ws_payload)
 
         # 5. [监护人联动] 使用统一的防御等级判断是否通知家人
         if is_risk and should_notify_guardian(risk_level):

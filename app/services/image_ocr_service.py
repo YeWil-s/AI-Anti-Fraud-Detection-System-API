@@ -114,22 +114,141 @@ class ImageOCRService:
             logger.error(f"图片OCR处理失败: {e}")
             return None
     
+    async def _post_vision_chat(self, base64_image: str, system_prompt: str, user_text: str) -> Optional[str]:
+        """调用智谱多模态 chat/completions，返回 assistant 文本内容。"""
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"},
+                        },
+                        {"type": "text", "text": user_text},
+                    ],
+                },
+            ],
+        }
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"{self.base_url}/chat/completions",
+                headers=headers,
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as response:
+                if response.status != 200:
+                    error_text = await response.text()
+                    logger.error(f"智谱API请求失败: {response.status}, {error_text}")
+                    return None
+                result = await response.json()
+                if result.get("choices") and len(result["choices"]) > 0:
+                    return result["choices"][0].get("message", {}).get("content", "")
+                logger.warning("智谱API返回结果为空")
+                return None
+
+    @staticmethod
+    def _parse_json_object(content: str) -> Optional[dict]:
+        import json
+
+        try:
+            json_match = re.search(r"\{[\s\S]*\}", content)
+            if json_match:
+                return json.loads(json_match.group())
+            return json.loads(content)
+        except json.JSONDecodeError:
+            return None
+
+    async def classify_screenshot_environment(self, image_bytes: bytes) -> Optional[dict]:
+        """
+        第一步：仅识别平台、号码/昵称与沟通方式（文字/语音/视频/电话），不提取对话正文。
+        """
+        if not self.api_key:
+            logger.warning("智谱API密钥未配置，跳过截图环境分类")
+            return None
+
+        base64_image = self._encode_image(image_bytes)
+        system_prompt = """你是通话/聊天截图分析助手。请仅根据界面判断以下信息，不要编造对话内容。
+
+1. platform（必选）：
+   - wechat: 微信界面
+   - qq: QQ界面
+   - phone: 系统电话拨号/来电/通话中界面
+   - video_call: 视频通话全屏或悬浮窗为主
+   - other: 其他或无法判断
+
+2. communication_mode（必选）：
+   - text: 纯文字聊天（消息列表、气泡为主，非语音通话中界面）
+   - voice: 微信/QQ 等语音通话中界面（含通话时长、麦克风、扬声器等）
+   - video: 视频通话为主
+   - phone: 传统电话通话界面
+   - unknown: 无法判断
+
+3. caller_number / target_name：可见则填写，否则空字符串。
+
+请只输出 JSON：
+{
+  "platform": "wechat|qq|phone|video_call|other",
+  "communication_mode": "text|voice|video|phone|unknown",
+  "caller_number": "",
+  "target_name": ""
+}"""
+
+        try:
+            content = await self._post_vision_chat(
+                base64_image,
+                system_prompt,
+                "请分析这张截图的平台与沟通方式，只输出 JSON。",
+            )
+            if not content:
+                return None
+            parsed = self._parse_json_object(content)
+            if not parsed:
+                logger.warning(f"环境分类 JSON 解析失败: {content[:200]}")
+                return None
+
+            platform = (parsed.get("platform") or "other").lower()
+            mode = (parsed.get("communication_mode") or "unknown").lower()
+            if mode not in ("text", "voice", "video", "phone", "unknown"):
+                mode = "unknown"
+
+            is_text_chat = mode == "text"
+
+            logger.info(
+                f"截图环境分类: platform={platform}, communication_mode={mode}, is_text_chat={is_text_chat}"
+            )
+
+            return {
+                "environment": {
+                    "platform": platform,
+                    "caller_number": parsed.get("caller_number") or "",
+                    "target_name": parsed.get("target_name") or "",
+                    "communication_mode": mode,
+                },
+                "is_text_chat": is_text_chat,
+                "should_extract_dialogue": is_text_chat,
+            }
+        except Exception as e:
+            logger.error(f"截图环境分类失败: {e}")
+            return None
+
     async def extract_chat_from_screenshot(self, image_bytes: bytes) -> Optional[dict]:
         """
-        专门处理聊天记录截图，提取结构化对话
-        
+        第二步：仅提取聊天记录中的文字与结构化对话（在已判定为文字交流后调用）。
+
         Returns:
             {
-                "text": "提取的完整对话文本",
+                "text": "按行标准格式，供去重与文本检测（每行 user: … / other: …）",
                 "dialogue": [
-                    {"speaker": "发送者", "content": "消息内容"},
+                    {"speaker": "user"|"other", "content": "单条消息"},
                     ...
                 ],
-                "environment": {
-                    "platform": "wechat/qq/phone/other",
-                    "caller_number": "来电号码",
-                    "target_name": "对方昵称"
-                }
             }
         """
         if not self.api_key:
@@ -139,145 +258,116 @@ class ImageOCRService:
         try:
             base64_image = self._encode_image(image_bytes)
             
-            headers = {
-                "Authorization": f"Bearer {self.api_key}",
-                "Content-Type": "application/json"
-            }
-            
-            # 增强版提示词：同时提取对话内容和通话环境信息
-            system_prompt = """你是一个专门分析聊天截图的助手。请从图片中提取以下信息：
+            # 分条 + 左右气泡 -> user/other；与后端 ChatMessage.speaker、增量解析一致
+            system_prompt = """你是聊天记录截图 OCR 助手。请按截图中消息从上到下的时间顺序，逐条输出每一条气泡内的完整文字。
 
-1. 对话内容：按时间顺序提取所有对话，保留发送者信息
-2. 平台识别：识别这是哪个平台的截图
-   - wechat: 微信聊天界面
-   - qq: QQ聊天界面  
-   - phone: 电话通话界面（显示来电号码）
-   - video_call: 视频通话界面
-   - other: 其他平台
-3. 号码/昵称：识别对方的电话号码或昵称
+【说话人判定（必遵守）】
+- 根据消息气泡在页面中的左右位置判断角色（适用于微信/QQ 等常见布局）：
+  - 气泡主体在屏幕右侧、或明显属于「自己发出的消息」→ speaker_role 为 "user"（本机用户）。
+  - 气泡主体在屏幕左侧、或明显属于「对方发来的消息」→ speaker_role 为 "other"（对方）。
+- 同时填写 side：气泡整体更靠左填 "left"，更靠右填 "right"；若无法判断 side，仅依据左右习惯推断 speaker_role 即可。
+- 不要合并多条消息；一条气泡对应 messages 中一项。
+- 不要编造截图中不存在的文字；看不清的 content 可为空字符串并仍保留该条结构。
 
-请按以下JSON格式输出：
+【输出格式】只输出一个 JSON 对象，不要 Markdown、不要解释：
 {
-  "platform": "wechat/qq/phone/video_call/other",
-  "caller_number": "电话号码（如果是电话）",
-  "target_name": "对方昵称或名称",
-  "dialogue_text": "完整的对话文本"
+  "messages": [
+    {
+      "side": "left|right",
+      "speaker_role": "user|other",
+      "content": "该条气泡内完整文本"
+    }
+  ]
 }
 
-只输出JSON，不要添加其他解释。"""
-            
-            payload = {
-                "model": self.model,
-                "messages": [
-                    {
-                        "role": "system",
-                        "content": system_prompt
-                    },
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "image_url",
-                                "image_url": {
-                                    "url": f"data:image/jpeg;base64,{base64_image}"
-                                }
-                            },
-                            {
-                                "type": "text",
-                                "text": "请分析这张截图，提取平台信息、号码/昵称和对话内容。"
-                            }
-                        ]
-                    }
-                ]
-            }
-            
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    f"{self.base_url}/chat/completions",
-                    headers=headers,
-                    json=payload,
-                    timeout=aiohttp.ClientTimeout(total=30)
-                ) as response:
-                    if response.status != 200:
-                        error_text = await response.text()
-                        logger.error(f"智谱API请求失败: {response.status}, {error_text}")
-                        return None
-                    
-                    result = await response.json()
-                    
-                    if result.get("choices") and len(result["choices"]) > 0:
-                        content = result["choices"][0].get("message", {}).get("content", "")
-                        
-                        # 尝试解析JSON
-                        import json
-                        try:
-                            # 提取JSON部分（可能被markdown包裹）
-                            json_match = re.search(r'\{[\s\S]*\}', content)
-                            if json_match:
-                                parsed = json.loads(json_match.group())
-                            else:
-                                parsed = json.loads(content)
-                            
-                            logger.info(f"图片OCR成功: platform={parsed.get('platform')}, caller={parsed.get('caller_number') or parsed.get('target_name')}")
-                            
-                            # 解析对话结构
-                            dialogue = []
-                            dialogue_text = parsed.get("dialogue_text", "")
-                            if dialogue_text:
-                                for line in dialogue_text.split('\n'):
-                                    line = line.strip()
-                                    if not line:
-                                        continue
-                                    if ':' in line or '：' in line:
-                                        parts = line.replace('：', ':').split(':', 1)
-                                        if len(parts) == 2:
-                                            dialogue.append({"speaker": parts[0].strip(), "content": parts[1].strip()})
-                                        else:
-                                            dialogue.append({"speaker": "未知", "content": line})
-                                    else:
-                                        dialogue.append({"speaker": "未知", "content": line})
-                            
-                            return {
-                                "text": dialogue_text,
-                                "dialogue": dialogue,
-                                "environment": {
-                                    "platform": parsed.get("platform", "other"),
-                                    "caller_number": parsed.get("caller_number", ""),
-                                    "target_name": parsed.get("target_name", "")
-                                }
-                            }
-                        except json.JSONDecodeError as e:
-                            logger.warning(f"JSON解析失败，使用原始文本: {e}")
-                            # 回退到原始文本
-                            return {
-                                "text": content,
-                                "dialogue": [],
-                                "environment": {
-                                    "platform": "other",
-                                    "caller_number": "",
-                                    "target_name": ""
-                                }
-                            }
-                    else:
-                        logger.warning("智谱API返回结果为空")
-                        return None
-                        
+若图中无任何聊天文字，输出：{"messages": []}"""
+
+            content = await self._post_vision_chat(
+                base64_image,
+                system_prompt,
+                "请逐条提取截图中的聊天内容，只输出 JSON。",
+            )
+            if not content:
+                return None
+
+            try:
+                parsed = self._parse_json_object(content)
+                if not parsed:
+                    raise ValueError("no json object")
+                messages = parsed.get("messages")
+                if not isinstance(messages, list):
+                    # 兼容旧版 dialogue_text
+                    dt = (parsed.get("dialogue_text") or "").strip()
+                    if dt:
+                        return self._fallback_dialogue_from_flat_text(dt)
+                    messages = []
+
+                dialogue: List[Dict[str, str]] = []
+                lines_out: List[str] = []
+                for item in messages:
+                    if not isinstance(item, dict):
+                        continue
+                    raw_content = (item.get("content") or "").strip()
+                    if not raw_content:
+                        continue
+                    side = (item.get("side") or "").lower()
+                    role = (item.get("speaker_role") or "").lower()
+                    if role not in ("user", "other"):
+                        if side == "right":
+                            role = "user"
+                        elif side == "left":
+                            role = "other"
+                        else:
+                            role = "other"
+                    dialogue.append({"speaker": role, "content": raw_content[:2000]})
+                    lines_out.append(f"{role}: {raw_content[:2000]}")
+
+                text = "\n".join(lines_out)
+                logger.info(
+                    f"聊天文字提取成功: {len(dialogue)} 条, 总长度: {len(text)}"
+                )
+                return {"text": text, "dialogue": dialogue}
+
+            except (ValueError, TypeError) as e:
+                logger.warning(f"结构化 JSON 解析失败，回退为纯文本: {e}")
+                dialogue_text = content.strip()
+                return self._fallback_dialogue_from_flat_text(dialogue_text)
+
         except Exception as e:
             logger.error(f"图片OCR处理失败: {e}")
             return None
 
+    def _fallback_dialogue_from_flat_text(self, dialogue_text: str) -> dict:
+        """旧版 dialogue_text 或模型未按 JSON 输出时的回退。"""
+        dialogue_text = (dialogue_text or "").strip()
+        dialogue: List[Dict[str, str]] = []
+        if dialogue_text:
+            for line in dialogue_text.split("\n"):
+                line = line.strip()
+                if not line:
+                    continue
+                if ":" in line or "：" in line:
+                    parts = line.replace("：", ":").split(":", 1)
+                    if len(parts) == 2:
+                        left = parts[0].strip().lower()
+                        right = parts[1].strip()
+                        sp = "other"
+                        if left in ("user", "other"):
+                            sp = left
+                        dialogue.append({"speaker": sp, "content": right[:2000]})
+                    else:
+                        dialogue.append({"speaker": "other", "content": line[:2000]})
+                else:
+                    dialogue.append({"speaker": "other", "content": line[:2000]})
+        lines_out = [f"{d['speaker']}: {d['content']}" for d in dialogue]
+        text = "\n".join(lines_out)
+        return {"text": text, "dialogue": dialogue}
+
     async def extract_call_environment(self, image_bytes: bytes) -> Optional[dict]:
         """
         专门提取截图中的通话环境信息（平台、号码、昵称）
-        
-        Returns:
-            {
-                "platform": "wechat/qq/phone/video_call/other",
-                "caller_number": "电话号码",
-                "target_name": "对方昵称"
-            }
         """
-        result = await self.extract_chat_from_screenshot(image_bytes)
+        result = await self.classify_screenshot_environment(image_bytes)
         if result:
             return result.get("environment")
         return None
