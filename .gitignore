@@ -68,7 +68,7 @@ tests/
 data/competition_cases/
 
 dataset/
-
+data/
 .qoder/
 check_app.py
 test*
