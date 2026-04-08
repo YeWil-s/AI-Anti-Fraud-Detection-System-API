@@ -166,36 +166,42 @@ export default {
                 </el-col>
             </el-row>
 
-            <!-- 最近检测记录 -->
+            <!-- 最近通话记录 -->
             <el-row :gutter="20" style="margin-top: 20px;">
                 <el-col :span="24">
                     <div class="page-card">
-                        <div class="page-title">最近检测记录</div>
+                        <div class="page-title">最近通话记录与检测建议</div>
                         <div style="color: #6b7280; font-size: 13px; margin-top: 5px; margin-bottom: 15px;">
-                            显示最近20条AI检测记录，包含风险评分和检测类型
+                            展示 call_record 表中的最近通话，包含检测结果与建议
                         </div>
                         <el-table :data="recentDetections" stripe style="margin-top: 15px; width: 100%;" :header-cell-style="{background:'#f8fafc', color:'#475569', fontWeight:'600'}">
                             <template #empty>
-                                <el-empty description="暂无检测记录" :image-size="80" />
+                                <el-empty description="暂无通话记录" :image-size="80" />
                             </template>
-                            <el-table-column prop="log_id" label="ID" width="80" align="center"></el-table-column>
                             <el-table-column prop="call_id" label="通话ID" width="100" align="center"></el-table-column>
                             <el-table-column prop="caller_number" label="来电号码" width="150" align="center"></el-table-column>
-                            <el-table-column prop="detection_type" label="检测类型" width="120" align="center">
+                            <el-table-column prop="detected_result" label="检测结果" width="120" align="center">
                                 <template #default="scope">
-                                    <el-tag :type="getDetectionTypeType(scope.row.detection_type)">
-                                        {{ getDetectionTypeLabel(scope.row.detection_type) }}
+                                    <el-tag :type="getResultTagType(scope.row.detected_result)">
+                                        {{ getResultLabel(scope.row.detected_result) }}
                                     </el-tag>
                                 </template>
                             </el-table-column>
-                            <el-table-column prop="overall_score" label="风险评分" width="180" align="center">
+                            <el-table-column prop="risk_score" label="风险评分" width="180" align="center">
                                 <template #default="scope">
                                     <el-progress 
-                                        :percentage="scope.row.overall_score" 
-                                        :color="getRiskColor(scope.row.overall_score)"
+                                        :percentage="Math.round(scope.row.risk_score || 0)" 
+                                        :color="getRiskColor(scope.row.risk_score || 0)"
                                         :stroke-width="12"
                                         style="width: 140px; margin: 0 auto;">
                                     </el-progress>
+                                </template>
+                            </el-table-column>
+                            <el-table-column prop="advice" label="建议" min-width="260">
+                                <template #default="scope">
+                                    <div style="white-space: pre-wrap; line-height: 1.5;">
+                                        {{ scope.row.advice || '暂无建议' }}
+                                    </div>
                                 </template>
                             </el-table-column>
                             <el-table-column prop="created_at" label="检测时间" align="center">
@@ -327,7 +333,7 @@ export default {
             }
         },
         async loadRecentDetections() {
-            this.recentDetections = await api.getRecentDetections(10);
+            this.recentDetections = await api.getRecentCallSummaries(6);
         },
         async loadSystemHealth() {
             this.systemHealth = await api.getSystemHealth();
@@ -603,6 +609,14 @@ export default {
         getDetectionTypeLabel(type) {
             const map = { text: '文本', audio: '音频', video: '视频', image: '图片' };
             return map[type] || type;
+        },
+        getResultTagType(result) {
+            const map = { fake: 'danger', suspicious: 'warning', safe: 'success' };
+            return map[result] || 'info';
+        },
+        getResultLabel(result) {
+            const map = { fake: '诈骗', suspicious: '可疑', safe: '安全' };
+            return map[result] || result || '未知';
         },
         getRiskColor(score) {
             if (score >= 80) return '#dc2626';

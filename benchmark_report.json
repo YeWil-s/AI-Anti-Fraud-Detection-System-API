@@ -1,27 +1,148 @@
 {
-  "timestamp": "2026-04-03 18:56:16",
+  "timestamp": "2026-04-06 14:03:58",
   "metrics": {
-    "video": {
-      "accuracy": 0.7619047619047619,
+    "audio": {
+      "accuracy": 0.9607142857142857,
       "precision": 1.0,
-      "recall": 0.5454545454545454,
-      "f1": 0.7058823529411765,
+      "recall": 0.9214285714285714,
+      "f1": 0.9591078066914498,
       "fpr": 0.0,
-      "fnr": 0.45454545454545453,
+      "fnr": 0.07857142857142857,
+      "tn": "140",
+      "fp": "0",
+      "fn": "11",
+      "tp": "129",
+      "avg_latency": 0.023250882855583247,
+      "p95_latency": 0.03270579499076121
+    },
+    "text": {
+      "accuracy": 1.0,
+      "precision": 1.0,
+      "recall": 1.0,
+      "f1": 1.0,
+      "fpr": 0.0,
+      "fnr": 0.0,
+      "tn": "20",
+      "fp": "0",
+      "fn": "0",
+      "tp": "20",
+      "avg_latency": 5.618334810007946,
+      "p95_latency": 6.751113389938836,
+      "identified_scripts": [
+        "冒充公检法",
+        "冒充客服/航班诈骗",
+        "冒充客服/虚假服务",
+        "冒充客服诈骗",
+        "冒充熟人/老师诈骗",
+        "冒充社保/政府机构",
+        "敲诈勒索/色情诈骗",
+        "虚假投资理财",
+        "虚假服务/预付定金诈骗",
+        "虚假贷款/美容贷诈骗",
+        "虚假贷款诈骗",
+        "裸聊敲诈"
+      ],
+      "script_coverage": 12
+    },
+    "video": {
+      "accuracy": 0.95,
+      "precision": 1.0,
+      "recall": 0.9,
+      "f1": 0.9473684210526315,
+      "fpr": 0.0,
+      "fnr": 0.1,
       "tn": "10",
       "fp": "0",
-      "fn": "5",
-      "tp": "6",
-      "avg_latency": 10.204737028567164,
-      "p95_latency": 20.447124899947084
+      "fn": "1",
+      "tp": "9",
+      "avg_latency": 10.407368564989884,
+      "p95_latency": 24.590114179981185
+    },
+    "fusion": {
+      "accuracy": 1.0,
+      "precision": 1.0,
+      "recall": 1.0,
+      "f1": 1.0,
+      "fpr": 0.0,
+      "fnr": 0.0,
+      "tn": "15",
+      "fp": "0",
+      "fn": "0",
+      "tp": "15",
+      "avg_latency": 39.09136149000066,
+      "p95_latency": 82.6467948500125,
+      "identified_scripts": [
+        "冒充公检法诈骗",
+        "冒充客服诈骗",
+        "冒充征信机构诈骗",
+        "冒充领导熟人诈骗",
+        "投资理财",
+        "投资理财诈骗",
+        "消除不良记录诈骗",
+        "游戏产品虚假交易",
+        "虚假交易",
+        "虚假投资理财诈骗",
+        "虚假贷款诈骗",
+        "诱导办理虚假贷款/分期"
+      ],
+      "fusion_mode": "stem_aligned_mp4_txt_wav",
+      "detail_report_path": "benchmark_detailed_report.json",
+      "script_coverage": 12
+    },
+    "stability": {
+      "total_ops": 600,
+      "crashes": 0,
+      "passed": true
     }
   },
   "checks": [
+    {
+      "name": "融合识别准确率 > 90%",
+      "value": 1.0,
+      "threshold": 0.9,
+      "passed": true
+    },
+    {
+      "name": "融合安全场景 FPR < 5%",
+      "value": 0.0,
+      "threshold": 0.05,
+      "passed": "True"
+    },
+    {
+      "name": "文本正常消息 FPR < 5%",
+      "value": 0.0,
+      "threshold": 0.05,
+      "passed": "True"
+    },
+    {
+      "name": "音频真实语音 FPR < 5%",
+      "value": 0.0,
+      "threshold": 0.05,
+      "passed": "True"
+    },
     {
       "name": "视频真实场景 FPR < 5%",
       "value": 0.0,
       "threshold": 0.05,
       "passed": "True"
+    },
+    {
+      "name": "诈骗剧本覆盖 ≥ 10 种",
+      "value": 22.0,
+      "threshold": 10.0,
+      "passed": true
+    },
+    {
+      "name": "文本平均响应时间 < 10s",
+      "value": 5.618334810007946,
+      "threshold": 10.0,
+      "passed": true
+    },
+    {
+      "name": "连续运行零崩溃",
+      "value": 0.0,
+      "threshold": 0.0,
+      "passed": true
     }
   ]
 }

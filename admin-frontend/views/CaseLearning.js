@@ -70,6 +70,22 @@ export default {
                         </div>
                         
                         <el-form :model="uploadForm" label-width="100px" :rules="uploadRules" ref="uploadFormRef">
+                            <div style="margin-bottom: 16px; background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 12px;">
+                                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
+                                    <div style="font-weight:600;">文件属性识别结果</div>
+                                    <el-button size="small" type="primary" plain @click="autoFillByLLM" :loading="llmFilling">
+                                        LLM一键补全
+                                    </el-button>
+                                </div>
+                                <div style="font-size: 12px; color: #64748b; margin-bottom: 8px;">
+                                    绿色为文件中已识别字段，灰色为缺失字段（可由你手动或LLM补全）。
+                                </div>
+                                <div style="display:flex; flex-wrap:wrap; gap:8px;">
+                                    <el-tag v-for="item in parsedFieldPreview" :key="item.key" :type="item.filled ? 'success' : 'info'">
+                                        {{ item.label }}：{{ item.filled ? '已识别' : '缺失' }}
+                                    </el-tag>
+                                </div>
+                            </div>
                             <el-row :gutter="20">
                                 <el-col :span="12">
                                     <el-form-item label="诈骗类型" prop="fraud_type">
@@ -144,7 +160,7 @@ export default {
                             
                             <el-form-item>
                                 <el-button type="primary" @click="submitUpload" :loading="uploading">
-                                    提交到学习队列
+                                    提交到待处理库
                                 </el-button>
                                 <el-button @click="resetUploadForm">重置</el-button>
                             </el-form-item>
@@ -208,7 +224,7 @@ export default {
                 <el-tab-pane label="高危拦截审核" name="review">
                     <el-alert
                         title="审核说明"
-                        description="点击'编辑并学习'按钮，对系统拦截的高危通话进行标注。必须选择诈骗类型后才能加入学习队列。"
+                        description="点击“编辑并提交”按钮，对系统拦截的高危通话进行标注。提交后将写入待处理案例库。"
                         type="info"
                         show-icon
                         :closable="false"
@@ -242,7 +258,7 @@ export default {
                         <el-table-column label="操作" width="140" align="center" fixed="right">
                             <template #default="scope">
                                 <el-button type="primary" size="small" @click="openEditDialog(scope.row)">
-                                    编辑并学习
+                                    编辑并提交
                                 </el-button>
                             </template>
                         </el-table-column>
@@ -275,8 +291,8 @@ export default {
                 </el-descriptions>
             </el-dialog>
 
-            <!-- 编辑并学习对话框 -->
-            <el-dialog v-model="editDialogVisible" title="编辑案例并加入学习队列" width="650px">
+            <!-- 编辑并提交对话框 -->
+            <el-dialog v-model="editDialogVisible" title="编辑案例并提交到待处理库" width="650px">
                 <el-form :model="editForm" label-width="100px" :rules="editRules" ref="editFormRef">
                     <el-form-item label="通话ID">
                         <el-input v-model="editForm.call_id" disabled />
@@ -351,7 +367,7 @@ export default {
                 <template #footer>
                     <el-button @click="editDialogVisible = false">取消</el-button>
                     <el-button type="primary" @click="submitEditLearn" :loading="editLoading">
-                        确认并学习
+                        确认并提交
                     </el-button>
                 </template>
             </el-dialog>
@@ -364,6 +380,7 @@ export default {
             loadingPending: false,
             loadingLearned: false,
             uploading: false,
+            llmFilling: false,
             editLoading: false,
             cases: [],
             pendingFiles: [],
@@ -382,6 +399,14 @@ export default {
                 tags: [],
                 uploader: 'admin'
             },
+            parsedFieldPreview: [
+                { key: 'fraud_type', label: '诈骗类型', filled: false },
+                { key: 'modality', label: '内容模态', filled: false },
+                { key: 'risk_level', label: '风险等级', filled: false },
+                { key: 'content', label: '案例内容', filled: false },
+                { key: 'source', label: '来源', filled: false },
+                { key: 'tags', label: '标签', filled: false }
+            ],
             uploadRules: {
                 fraud_type: [{ required: true, message: '请选择诈骗类型', trigger: 'change' }],
                 modality: [{ required: true, message: '请选择内容模态', trigger: 'change' }],
@@ -484,7 +509,24 @@ export default {
                 tags: [],
                 uploader: 'admin'
             };
+            this.refreshParsedPreview({});
             this.$refs.uploadFormRef?.resetFields();
+        },
+        refreshParsedPreview(parsed = {}) {
+            const hasTags = Array.isArray(parsed.tags) ? parsed.tags.length > 0 : false;
+            const sourceFilled = !!(parsed.source && String(parsed.source).trim());
+            const contentFilled = !!(parsed.content && String(parsed.content).trim());
+            const fraudTypeFilled = !!(parsed.fraud_type && String(parsed.fraud_type).trim());
+            const modalityFilled = !!(parsed.modality && String(parsed.modality).trim());
+            const riskLevelFilled = !!(parsed.risk_level && String(parsed.risk_level).trim());
+            this.parsedFieldPreview = [
+                { key: 'fraud_type', label: '诈骗类型', filled: fraudTypeFilled },
+                { key: 'modality', label: '内容模态', filled: modalityFilled },
+                { key: 'risk_level', label: '风险等级', filled: riskLevelFilled },
+                { key: 'content', label: '案例内容', filled: contentFilled },
+                { key: 'source', label: '来源', filled: sourceFilled },
+                { key: 'tags', label: '标签', filled: hasTags }
+            ];
         },
         handleFileChange(file) {
             if (!file) return;
@@ -525,26 +567,34 @@ export default {
                 
                 // 支持数组或单个对象
                 const caseData = Array.isArray(data) ? data[0] : data;
+                const parsed = {};
                 
                 // 自动填充识别的属性
                 if (caseData.fraud_type) {
                     this.uploadForm.fraud_type = caseData.fraud_type;
+                    parsed.fraud_type = caseData.fraud_type;
                 }
                 if (caseData.modality) {
                     this.uploadForm.modality = caseData.modality;
+                    parsed.modality = caseData.modality;
                 }
                 if (caseData.risk_level) {
                     this.uploadForm.risk_level = caseData.risk_level;
+                    parsed.risk_level = caseData.risk_level;
                 }
                 if (caseData.content) {
                     this.uploadForm.content = caseData.content;
+                    parsed.content = caseData.content;
                 }
                 if (caseData.source) {
                     this.uploadForm.source = caseData.source;
+                    parsed.source = caseData.source;
                 }
                 if (caseData.tags && Array.isArray(caseData.tags)) {
                     this.uploadForm.tags = caseData.tags;
+                    parsed.tags = caseData.tags;
                 }
+                this.refreshParsedPreview(parsed);
                 
                 // 显示识别的属性提示
                 const recognizedFields = [];
@@ -564,6 +614,7 @@ export default {
         parseTxtFile(content) {
             // 将TXT内容作为案例内容
             this.uploadForm.content = content.trim();
+            const parsed = { content: this.uploadForm.content };
             
             // 尝试从内容中提取诈骗类型关键词
             const fraudTypeKeywords = {
@@ -582,6 +633,7 @@ export default {
             for (const [type, keywords] of Object.entries(fraudTypeKeywords)) {
                 if (keywords.some(kw => content.includes(kw))) {
                     this.uploadForm.fraud_type = type;
+                    parsed.fraud_type = type;
                     ElementPlus.ElMessage.info(`从内容中识别到可能的诈骗类型: ${type}`);
                     break;
                 }
@@ -589,6 +641,32 @@ export default {
             
             // 自动设置为文本模态
             this.uploadForm.modality = 'text';
+            parsed.modality = 'text';
+            this.refreshParsedPreview(parsed);
+        },
+        async autoFillByLLM() {
+            if (!this.uploadForm.content || !this.uploadForm.content.trim()) {
+                ElementPlus.ElMessage.warning('请先上传文件或填写案例内容');
+                return;
+            }
+            this.llmFilling = true;
+            try {
+                const suggestion = await api.suggestCaseFields(this.uploadForm.content);
+                this.uploadForm = {
+                    ...this.uploadForm,
+                    fraud_type: suggestion.fraud_type || this.uploadForm.fraud_type,
+                    modality: suggestion.modality || this.uploadForm.modality,
+                    risk_level: suggestion.risk_level || this.uploadForm.risk_level,
+                    source: suggestion.source || this.uploadForm.source,
+                    tags: Array.isArray(suggestion.tags) ? suggestion.tags : this.uploadForm.tags
+                };
+                this.refreshParsedPreview(this.uploadForm);
+                ElementPlus.ElMessage.success('LLM已完成字段建议，可再手动调整后提交');
+            } catch (error) {
+                console.error('LLM补全失败:', error);
+            } finally {
+                this.llmFilling = false;
+            }
         },
         async viewPendingDetail(row) {
             try {
@@ -652,7 +730,7 @@ export default {
                     // 调用新的API接口
                     await api.learnCaseWithEdit(this.editForm.call_id, learnData);
                     
-                    ElementPlus.ElMessage.success('案例已编辑并加入学习队列');
+                    ElementPlus.ElMessage.success('案例已编辑并提交到待处理库');
                     this.editDialogVisible = false;
                     this.cases = this.cases.filter(item => item.call_id !== this.editForm.call_id);
                     this.fetchPendingFiles();

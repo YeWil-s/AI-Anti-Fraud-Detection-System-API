@@ -203,6 +203,29 @@ class NotificationService:
         
         # 4. 逐一发布消息到 Redis 频道
         for admin_record, admin_user in admins:
+            # [离线兜底] 给每位管理员写入消息日志，避免管理员不在线时丢提醒
+            existing = await db.execute(
+                select(MessageLog).where(
+                    and_(
+                        MessageLog.user_id == admin_user.user_id,
+                        MessageLog.call_id == original_payload["data"].get("call_id"),
+                        MessageLog.msg_type == "family_alert",
+                        MessageLog.title == guardian_payload["data"]["title"],
+                    )
+                )
+            )
+            if not existing.scalar_one_or_none():
+                db.add(
+                    MessageLog(
+                        user_id=admin_user.user_id,
+                        call_id=original_payload["data"].get("call_id"),
+                        msg_type="family_alert",
+                        risk_level=risk_level,
+                        title=guardian_payload["data"]["title"],
+                        content=guardian_payload["data"]["message"],
+                        is_read=False,
+                    )
+                )
             self._publish_to_redis(admin_user.user_id, guardian_payload)
             logger.info(f"Sent family alert for User {current_user_id} to Admin {admin_user.user_id} (role={admin_record.admin_role})")
 

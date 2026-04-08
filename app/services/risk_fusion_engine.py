@@ -497,10 +497,13 @@ class EnvironmentAwareFusionEngine(RiskFusionEngineV2):
         text_conf: float,
     ) -> float:
         """
-        无 LLM 时的实时总分：按当前通话「环境权重」仅在已有置信度的模态上归一化加权，0–100。
+        无 LLM 时的实时总分（preview）：各模态置信度映射到 0–100 后，与「当前场景」环境权重逐模态相乘再求和。
 
-        用于音视频轮询、ONNX 快路径等场景，避免 overall 等于某一模态或简单 max。
-        与 calculate_score（意图/剧本/协同/时序）不同，此处不跑 LLM，仅做环境占比融合。
+        权重来自 ENVIRONMENT_WEIGHTS（按 text_chat / voice_chat / phone_call / video_call / unknown
+        等场景配置，每场景三项和为 1）。不在「仅有信号的模态」上二次归一化，避免单模态高分
+        被放大成接近 100 的 overall，便于前端 preview 展示偏保守。
+
+        与 calculate_score（意图/剧本/协同/时序）不同，此处不跑 LLM。
         """
         env_weights = self._get_environment_weights(call_id)
         modalities = {
@@ -508,23 +511,12 @@ class EnvironmentAwareFusionEngine(RiskFusionEngineV2):
             "vision": max(0.0, min(1.0, float(video_conf))),
             "audio": max(0.0, min(1.0, float(audio_conf))),
         }
-        eps = 1e-9
-        active: List[tuple] = []
+        total = 0.0
         for mod in ("text", "vision", "audio"):
             w = float(env_weights.get(mod, 0.0))
-            if w <= eps:
-                continue
             c = modalities[mod]
-            if c <= eps:
-                continue
-            active.append((mod, c * 100.0, w))
-        if not active:
-            return 0.0
-        tw = sum(w for _, _, w in active)
-        if tw <= eps:
-            return 0.0
-        fused = sum(score * (w / tw) for _, score, w in active)
-        return round(min(100.0, max(0.0, fused)), 2)
+            total += c * 100.0 * w
+        return round(min(100.0, max(0.0, total)), 2)
     
     def get_environment_info(self, call_id: str) -> dict:
         """获取环境信息（用于前端展示）"""

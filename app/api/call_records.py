@@ -213,6 +213,8 @@ async def get_call_record_detail(
 
 @router.get("/family-records", response_model=ResponseModel)
 async def get_family_call_records(
+    family_id: Optional[int] = Query(None, description="家庭组ID（管理员可指定）"),
+    user_id: Optional[int] = Query(None, description="家庭成员用户ID（可选）"),
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
     current_user_id: int = Depends(get_current_user_id),
@@ -223,26 +225,72 @@ async def get_family_call_records(
     
     **数据隔离**: 只能查看同一家庭组成员的记录
     """
+    from app.models.family_group import FamilyAdmin
+
     # 查询当前用户
     user_result = await db.execute(
         select(User).where(User.user_id == current_user_id)
     )
     current_user = user_result.scalar_one_or_none()
-    
-    if not current_user or not current_user.family_id:
+
+    if not current_user:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="用户不存在")
+
+    # 查询当前用户管理的家庭组（管理员场景）
+    admin_families_result = await db.execute(
+        select(FamilyAdmin.family_id).where(FamilyAdmin.user_id == current_user_id)
+    )
+    managed_family_ids = [row[0] for row in admin_families_result.all()]
+
+    target_family_id: Optional[int] = None
+
+    # 普通成员：优先使用自己的 family_id
+    if current_user.family_id:
+        target_family_id = current_user.family_id
+        if family_id is not None and family_id != target_family_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="无权查看该家庭组的通话记录"
+            )
+    # 管理员：从其管理的家庭组中选择
+    elif managed_family_ids:
+        if family_id is None:
+            if len(managed_family_ids) == 1:
+                target_family_id = managed_family_ids[0]
+            else:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="您管理多个家庭组，请指定 family_id"
+                )
+        else:
+            if family_id not in managed_family_ids:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="无权查看该家庭组的通话记录"
+                )
+            target_family_id = family_id
+    else:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="您还未加入任何家庭组"
         )
-    
-    # 查询家庭组所有成员ID
+
+    # 查询目标家庭组所有成员ID
     family_users_result = await db.execute(
-        select(User.user_id).where(User.family_id == current_user.family_id)
+        select(User.user_id).where(User.family_id == target_family_id)
     )
     family_user_ids = [row[0] for row in family_users_result.fetchall()]
-    
-    # 查询家庭组成员的通话记录
+
+    if user_id is not None and user_id not in family_user_ids:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="目标用户不在该家庭组中"
+        )
+
+    # 查询家庭组成员的通话记录（可按单个成员过滤）
     query = select(CallRecord).where(CallRecord.user_id.in_(family_user_ids))
+    if user_id is not None:
+        query = query.where(CallRecord.user_id == user_id)
     query = query.order_by(CallRecord.created_at.desc())
     query = query.offset((page - 1) * page_size).limit(page_size)
     
@@ -250,8 +298,11 @@ async def get_family_call_records(
     records = result.scalars().all()
     
     # 统计总数
+    count_query = select(func.count()).select_from(CallRecord).where(CallRecord.user_id.in_(family_user_ids))
+    if user_id is not None:
+        count_query = count_query.where(CallRecord.user_id == user_id)
     count_result = await db.execute(
-        select(func.count()).select_from(CallRecord).where(CallRecord.user_id.in_(family_user_ids))
+        count_query
     )
     total = count_result.scalar() or 0
     
@@ -278,7 +329,9 @@ async def get_family_call_records(
                 "page_size": page_size,
                 "total": total,
                 "total_pages": (total + page_size - 1) // page_size
-            }
+            },
+            "family_id": target_family_id,
+            "user_id": user_id
         }
     )
 

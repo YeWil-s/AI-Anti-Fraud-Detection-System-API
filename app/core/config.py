@@ -110,6 +110,11 @@ class Settings(BaseSettings):
     # 智谱AI GLM-4V-Flash 
     ZHIPU_API_KEY: str = ""
     ZHIPU_BASE_URL: str = "https://open.bigmodel.cn/api/paas/v4"
+
+    # 图片 OCR 优化配置
+    OCR_IMAGE_MAX_SIDE: int = 1280
+    OCR_IMAGE_JPEG_QUALITY: int = 70
+    OCR_UPLOAD_MIN_INTERVAL_SECONDS: float = 2.0
     
     # Pydantic V2 规范的配置写法：忽略额外变量，读取 .env
     model_config = SettingsConfigDict(

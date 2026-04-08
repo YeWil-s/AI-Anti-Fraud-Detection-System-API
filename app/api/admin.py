@@ -23,6 +23,7 @@ from app.schemas.admin import (
     CaseUploadRequest, DashboardStats, TrendData
 )
 from app.core.logger import get_logger
+from app.services.llm_service import llm_service
 
 router = APIRouter()
 logger = get_logger(__name__)
@@ -519,6 +520,33 @@ async def upload_case(
         raise HTTPException(status_code=500, detail=f"案例上传失败: {str(e)}")
 
 
+@router.post("/cases/suggest-fields", summary="LLM建议案例字段")
+async def suggest_case_fields(payload: dict):
+    """根据案例内容让 LLM 给出字段建议，供前端一键填充。"""
+    content = (payload or {}).get("content", "")
+    if not content or not str(content).strip():
+        raise HTTPException(status_code=400, detail="content 不能为空")
+
+    result = await llm_service.analyze_text_risk(
+        user_input=str(content),
+        chat_history=str(content),
+        user_profile="管理端案例上传"
+    )
+
+    risk_map = {"fake": "高危", "suspicious": "中危", "safe": "低危"}
+    fraud_type = result.get("fraud_type") or "其他"
+    return {
+        "fraud_type": fraud_type,
+        "modality": "text",
+        "risk_level": risk_map.get(result.get("risk_level"), "中危"),
+        "content": str(content).strip(),
+        "source": "LLM助手建议",
+        "tags": [t for t in ["LLM建议", fraud_type] if t],
+        "advice": result.get("advice", ""),
+        "analysis": result.get("analysis", "")
+    }
+
+
 @router.get("/cases/pending", summary="获取待学习案例列表")
 async def get_pending_cases():
     """获取所有待学习的案例文件列表"""
@@ -718,6 +746,38 @@ async def get_recent_detections(
         })
     
     return detections
+
+
+@router.get("/calls/recent-summaries", summary="获取最近通话记录与建议")
+async def get_recent_call_summaries(
+    limit: int = Query(6, ge=1, le=30),
+    db: AsyncSession = Depends(get_db)
+):
+    """返回最近几条 call_record 记录，含检测结果与建议。"""
+    result = await db.execute(
+        select(CallRecord)
+        .order_by(desc(CallRecord.start_time), desc(CallRecord.created_at))
+        .limit(limit)
+    )
+
+    records = []
+    for call in result.scalars().all():
+        detected_result = call.detected_result.value if call.detected_result else "safe"
+        # 仅基于 call_record 的检测结果给出展示分，不依赖 ai_detection_log
+        score_map = {"fake": 90, "suspicious": 60, "safe": 20}
+        records.append({
+            "call_id": call.call_id,
+            "caller_number": call.caller_number or call.target_name or "未知",
+            "detected_result": detected_result,
+            "risk_score": score_map.get(detected_result, 0),
+            "analysis": call.analysis or "",
+            "advice": call.advice or "建议保持警惕，勿转账、勿透露验证码。",
+            "created_at": call.start_time.isoformat() if call.start_time else (
+                call.created_at.isoformat() if call.created_at else None
+            )
+        })
+
+    return records
 
 
 # =======================

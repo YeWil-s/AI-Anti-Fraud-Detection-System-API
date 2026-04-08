@@ -14,6 +14,7 @@ import base64
 import io
 import time
 import numpy as np
+from contextlib import contextmanager
 from typing import Dict, List, Union, Optional, Tuple
 from datetime import datetime, timedelta
 from asgiref.sync import async_to_sync
@@ -45,6 +46,7 @@ from app.services.mdp_defense.mdp_types import DefenseAction, MDPObservation, MD
 from app.services.mdp_defense.reward_builder import reward_builder
 from app.services.image_ocr_service import image_ocr_service
 from app.core.redis import get_redis
+from app.core.defense_levels import get_display_mode
 
 # 初始化模块级 logger
 logger = get_logger(__name__)
@@ -63,8 +65,120 @@ def get_redis_pool():
     return _redis_pool
 
 
+@contextmanager
+def _chat_messages_sequence_lock(call_id: int):
+    """
+    同一 call_id 下并发执行 detect_text / OCR 写 chat_messages 时，
+    先读 MAX(sequence) 再 INSERT 容易与另一事务形成锁序环，触发 1213 Deadlock。
+    用 Redis 锁串行化序号分配，避免事务被整单回滚导致 fusion 不落库、WS 不推送。
+    """
+    r = get_redis_pool()
+    lock = r.lock(
+        f"lock:chat_messages:{call_id}",
+        timeout=120,
+        blocking_timeout=60,
+    )
+    with lock:
+        yield
+
+
 def _json_dumps(data) -> str:
     return json.dumps(data or {}, ensure_ascii=False)
+
+
+# 与 app/models/ai_detection_log.py 中 String(n) 一致，避免 LLM 长文本导致 1406 Data too long
+def _clip_db_varchar(value, max_len: int):
+    if value is None:
+        return None
+    s = str(value).strip()
+    return s if len(s) <= max_len else s[:max_len]
+
+
+# 本地 ONNX 文本置信度超过该阈值时，在 LLM/融合之前抢发一条简易 alert（提升时效）
+ONNX_EARLY_ALERT_CONF_THRESHOLD = 0.9
+# 同通话抢跑 alert 冷却，避免每条消息都弹
+EARLY_ONNX_ALERT_COOLDOWN_SEC = 45
+# ONNX 抢跑 TTS 与融合 LLM TTS 共用 Redis 槽位（mdp:tts_cooldown），避免重复播报
+EARLY_ONNX_TTS_COOLDOWN_SEC = 60
+
+
+def _try_acquire_tts_cooldown(call_id: int, cooldown_sec: int) -> bool:
+    """
+    同一通话任意来源的 TTS（ONNX 抢跑 / 融合 LLM）共享冷却窗口。
+    使用 SET NX，成功返回 True 表示本窗口内可播报一次。
+    """
+    try:
+        r = get_redis_pool()
+        sec = max(10, min(120, int(cooldown_sec)))
+        key = f"mdp:tts_cooldown:{call_id}"
+        return bool(r.set(key, "1", ex=sec, nx=True))
+    except Exception as e:
+        logger.warning(f"tts cooldown acquire failed: {e}")
+        return False
+
+
+def _publish_early_onnx_text_alert(
+    user_id: int, call_id: int, onnx_text_conf: float, role_type: str = ""
+) -> None:
+    """
+    在 ONNX 文本快筛之后、LLM 之前发布简易 alert，不等待事务 commit。
+    与融合后 alert 共用 ws_payload 字段结构，data.source=onnx_fast 便于前端区分。
+    对老人/儿童画像在 LLM 之前抢发模板 TTS（融合阶段若再触发会因冷却跳过，避免重复）。
+    """
+    try:
+        r = get_redis_pool()
+        gate_key = f"call:{call_id}:early_onnx_alert_gate"
+        if not r.set(gate_key, "1", ex=EARLY_ONNX_ALERT_COOLDOWN_SEC, nx=True):
+            return
+        msg = (
+            f"本地文本模型判定该段内容风险较高（置信度 {onnx_text_conf:.0%}），请提高警惕；"
+            "完整研判稍后推送。"
+        )
+        _alert_data = {
+            "title": "文本风险预警",
+            "message": msg,
+            "risk_level": "high",
+            "confidence": round(float(onnx_text_conf), 4),
+            "call_id": call_id,
+            "timestamp": datetime.now().isoformat(),
+            "display_mode": get_display_mode("high"),
+            "source": "onnx_fast",
+        }
+        notification_service.redis.publish(
+            "fraud_alerts",
+            json.dumps(
+                {"user_id": user_id, "payload": {"type": "alert", "data": _alert_data}},
+                ensure_ascii=False,
+            ),
+        )
+        logger.info(
+            f"[WS] ONNX 抢跑 alert: user={user_id}, call={call_id}, onnx_text_conf={onnx_text_conf:.3f}"
+        )
+
+        rt = (role_type or "").strip()
+        if rt not in ("老人", "儿童"):
+            return
+        if not _try_acquire_tts_cooldown(call_id, EARLY_ONNX_TTS_COOLDOWN_SEC):
+            return
+        lvl = _get_published_defense_level(call_id)
+        tts_text = (
+            "注意，系统检测到对方话术疑似诈骗风险，请不要转账或透露验证码，完整研判马上就到。"
+        )
+        publish_control_command(
+            user_id,
+            {
+                "type": "control",
+                "action": "tts_speak",
+                "target_level": lvl,
+                "tts_priority": "high",
+                "tts_text": tts_text,
+            },
+        )
+        logger.info(
+            f"[WS] ONNX 抢跑 TTS: user={user_id}, call={call_id}, role={rt}, level={lvl}"
+        )
+    except Exception as e:
+        logger.warning(f"early onnx alert publish failed: {e}")
 
 
 def _published_defense_redis_key(call_id: int) -> str:
@@ -128,6 +242,9 @@ async def _finalize_previous_mdp_event(
             MDPDecisionEvent.label_status == "open",
         )
         .order_by(MDPDecisionEvent.step_index.desc(), MDPDecisionEvent.event_id.desc())
+        # 并发场景下避免多个任务同时更新同一条 open 事件导致死锁。
+        # 被其它事务持有锁时直接跳过本次回填，下一次文本任务会继续尝试补齐。
+        .with_for_update(skip_locked=True)
         .limit(1)
     )
     previous_event = result.scalar_one_or_none()
@@ -209,10 +326,10 @@ async def _create_mdp_decision_event(
     return event
 
 def publish_realtime_score(user_id: int, call_id: int, detection_type: str, is_risk: bool, confidence: float):
-    """向前端 WebSocket 推送各模态置信度；总分为环境权重下的预览融合分（非 LLM 全量融合）。
+    """向前端 WebSocket 推送各模态置信度；总分为预览融合分（非 LLM 全量融合）。
 
     overall_score 使用 environment_fusion_engine.calculate_preview_fused_score：
-    仅对 Redis 中已有且环境权重>0 的模态归一化加权，避免等于 max 单模态。
+    各模态 0–100 分与当前场景环境权重（ENVIRONMENT_WEIGHTS）相乘后求和，不在活跃模态上二次归一化。
     """
     try:
         r = get_redis_pool()
@@ -433,9 +550,9 @@ def detect_audio_task(self, audio_base64: str, user_id: int, call_id: int) -> Di
                     detection_type="audio",
                     voice_confidence=confidence,
                     overall_score=confidence * 100,
-                    evidence_snapshot=evidence_url,
+                    evidence_snapshot=_clip_db_varchar(evidence_url, 500),
                     time_offset=time_offset,
-                    model_version=result.get('model_version', 'unknown')
+                    model_version=_clip_db_varchar(result.get("model_version", "unknown"), 50),
                 )
                 db.add(ai_log)
                 await db.commit()
@@ -577,8 +694,10 @@ def detect_video_task(self, frame_data: list, user_id: int, call_id: int) -> Dic
                         video_confidence=raw_conf,
                         overall_score=raw_conf * 100,
                         time_offset=time_offset,
-                        evidence_snapshot=evidence_url,
-                        model_version=raw_result.get("model_version", "unknown"),
+                        evidence_snapshot=_clip_db_varchar(evidence_url, 500),
+                        model_version=_clip_db_varchar(
+                            raw_result.get("model_version", "unknown"), 50
+                        ),
                     )
                     db.add(ai_log)
                     await db.commit()
@@ -657,22 +776,23 @@ def detect_text_task(
                     await memory_service.add_message(call_id, text)
 
                     # 每次收到前端文本都持久化到 chat_messages，避免被后续分支提前 return 跳过
-                    seq_result = await db.execute(
-                        select(ChatMessage.sequence)
-                        .where(ChatMessage.call_id == call_id)
-                        .order_by(ChatMessage.sequence.desc(), ChatMessage.message_id.desc())
-                        .limit(1)
-                    )
-                    last_seq = seq_result.scalar_one_or_none() or 0
-                    current_sequence = last_seq + 1
-                    msg = ChatMessage(
-                        call_id=call_id,
-                        sequence=current_sequence,
-                        speaker="other",
-                        content=text[:1000] if len(text) > 1000 else text
-                    )
-                    db.add(msg)
-                    await db.flush()
+                    with _chat_messages_sequence_lock(call_id):
+                        seq_result = await db.execute(
+                            select(ChatMessage.sequence)
+                            .where(ChatMessage.call_id == call_id)
+                            .order_by(ChatMessage.sequence.desc(), ChatMessage.message_id.desc())
+                            .limit(1)
+                        )
+                        last_seq = seq_result.scalar_one_or_none() or 0
+                        current_sequence = last_seq + 1
+                        msg = ChatMessage(
+                            call_id=call_id,
+                            sequence=current_sequence,
+                            speaker="other",
+                            content=text[:1000] if len(text) > 1000 else text
+                        )
+                        db.add(msg)
+                        await db.flush()
 
                 now = datetime.now()
                 call_start_time = record.start_time if record and hasattr(record, 'start_time') and record.start_time else now
@@ -730,9 +850,11 @@ def detect_text_task(
                             detected_text=detected_text,
                             detected_keywords=sensitive_keywords,
                             match_script=None,
-                            intent="onnx_safe_skip",
+                            intent=_clip_db_varchar("onnx_safe_skip", 100),
                             time_offset=time_offset,
-                            model_version=f"onnx-{text_result.get('model_type', 'unknown')}"
+                            model_version=_clip_db_varchar(
+                                f"onnx-{text_result.get('model_type', 'unknown')}", 50
+                            ),
                         )
                         db.add(ai_log)
                         await db.flush()
@@ -742,23 +864,25 @@ def detect_text_task(
                         return {"status": "success", "result": {"is_fraud": False, "risk_level": "safe", "source": "onnx"}}
                 except Exception as e:
                     logger.error(f"ONNX 文本快筛异常: {e}")
-                    text_conf = 0.95 if force_llm else 0.5 
+                    text_conf = 0.95 if force_llm else 0.5
+
+                # 用户画像（需在 ONNX 抢跑 alert/TTS 之前加载；LLM 与 MDP 共用）
+                user_stmt = select(User).where(User.user_id == user_id)
+                user_result = await db.execute(user_stmt)
+                user = user_result.scalar_one_or_none()
+
+                profile_parts = []
+                if user:
+                    if getattr(user, "role_type", None):
+                        profile_parts.append(f"身份：{user.role_type}")
+                    if getattr(user, "profession", None):
+                        profile_parts.append(f"职业：{user.profession}")
+                user_profile_str = "，".join(profile_parts) if profile_parts else "普通人群"
 
                 # 2. 准备状态机所需的上下文数据
                 platform_raw = getattr(record, 'platform', 'PHONE') if record else 'PHONE'
                 platform_str = platform_raw.name if hasattr(platform_raw, 'name') else str(platform_raw)
                 is_video_call = "video" in platform_str.lower() or "视频" in platform_str.lower()
-
-                # 用户画像
-                user_stmt = select(User).where(User.user_id == user_id)
-                user_result = await db.execute(user_stmt)
-                user = user_result.scalar_one_or_none()
-                
-                profile_parts = []
-                if user:
-                    if getattr(user, 'role_type', None): profile_parts.append(f"身份：{user.role_type}")
-                    if getattr(user, 'profession', None): profile_parts.append(f"职业：{user.profession}")
-                user_profile_str = "，".join(profile_parts) if profile_parts else "普通人群"
 
                 # 从黑板拉取多模态数据
                 r = get_redis_pool()
@@ -777,6 +901,23 @@ def detect_text_task(
                 if video_high_risk and text_conf < 0.5:
                     text_conf = max(text_conf, 0.5)
                     logger.warning(f"视频高危标志触发，提升文本置信度至 {text_conf:.2f}")
+
+                # 将当前“本地文本置信度”（含音视频标志加权）先写入黑板，避免 LLM 期间前端长期显示 0%
+                try:
+                    r.setex(f"call:{call_id}:latest_text_conf", 3600, str(float(text_conf)))
+                except Exception as e:
+                    logger.warning(f"latest_text_conf redis: {e}")
+
+                # 本地 ONNX 文本置信度已很高：在 LLM/融合完成前先推一条简易 alert（不阻塞后续流程）
+                # 发送时机放在音视频高危标志加权之后，确保与后续融合输入一致
+                onnx_text_conf = float(text_conf)
+                if onnx_text_conf >= ONNX_EARLY_ALERT_CONF_THRESHOLD:
+                    _publish_early_onnx_text_alert(
+                        user_id,
+                        call_id,
+                        onnx_text_conf,
+                        role_type=getattr(user, "role_type", None) or "",
+                    )
                 
                 # 获取环境信息
                 env_info = environment_fusion_engine.get_environment_info(str(call_id))
@@ -867,10 +1008,12 @@ def detect_text_task(
                     overall_score=fused_score,           # 得出的分数
                     detected_text=detected_text,         # 检测到的完整文本
                     detected_keywords=sensitive_keywords, # 敏感关键词
-                    match_script=llm_result.get('match_script', None),  # 匹配的剧本
-                    intent=llm_result.get('intent', None),              # 识别的意图
+                    match_script=_clip_db_varchar(llm_result.get("match_script"), 100),
+                    intent=_clip_db_varchar(llm_result.get("intent"), 100),
                     time_offset=time_offset,
-                    model_version=f"fusion-mdp-v1-{text_result.get('model_type', 'unknown')}"
+                    model_version=_clip_db_varchar(
+                        f"fusion-mdp-v1-{text_result.get('model_type', 'unknown')}", 50
+                    ),
                 )
                 db.add(ai_log)
                 await db.flush()
@@ -1003,7 +1146,28 @@ def detect_text_task(
                     msg_dr = {"user_id": uid, "payload": {"type": "detection_result", "data": _data_base}}
                     rds.publish("fraud_alerts", json.dumps(msg_dr, ensure_ascii=False))
                     if _is_high_risk_for_ui:
-                        msg_alert = {"user_id": uid, "payload": {"type": "alert", "data": _data_base}}
+                        # alert 与 notification_service.handle_detection_result 的 ws_payload 对齐，
+                        # 便于客户端一套 UI；融合数值仍在 detection_result 中。
+                        if _af >= 2:
+                            _arisk = "critical"
+                            _atitle = "极度高危预警"
+                        elif _af >= 1:
+                            _arisk = "medium"
+                            _atitle = "风险提示"
+                        else:
+                            _arisk = "high"
+                            _atitle = "高危风险提醒"
+                        _amsg = (_adv or "").strip() or (ui_message or "").strip() or "检测到诈骗风险，请提高警惕！"
+                        _alert_data = {
+                            "title": _atitle,
+                            "message": _amsg,
+                            "risk_level": _arisk,
+                            "confidence": round(_fs / 100.0, 4),
+                            "call_id": _cid,
+                            "timestamp": datetime.now().isoformat(),
+                            "display_mode": get_display_mode(_arisk),
+                        }
+                        msg_alert = {"user_id": uid, "payload": {"type": "alert", "data": _alert_data}}
                         rds.publish("fraud_alerts", json.dumps(msg_alert, ensure_ascii=False))
                         logger.info(
                             f"[WS] 融合高危，已发布 detection_result+alert: user={uid}, call={_cid}, "
@@ -1016,13 +1180,8 @@ def detect_text_task(
                     if not _should_push_tts:
                         return
 
-                    # 限制同一通话同一等级的重复播报
-                    r = get_redis_pool()
-                    redis_key = f"mdp:published_tts:{call_id}:{target_level}"
-                    if r.get(redis_key):
+                    if not _try_acquire_tts_cooldown(_cid, _tts_cooldown_seconds):
                         return
-
-                    r.setex(redis_key, _tts_cooldown_seconds, "1")
 
                     payload_tts = {
                         "type": "control",
@@ -1064,8 +1223,10 @@ def detect_text_task(
                 }
                 
             except Exception as e:
+                # 这里必须向外抛出，让 TransactionContext 进入 rollback 分支。
+                # 若直接 return，事务上下文会尝试 commit，触发 PendingRollbackError 噪音。
                 logger.error(f"MDP Fusion Command Center failed: {e}", exc_info=True)
-                return {"status": "error", "message": str(e), "call_id": call_id}
+                raise
         
         # 事务已成功 commit，执行外部服务调用（Redis 发布、WebSocket 推送等）
         # 这些操作失败不会回滚数据库
@@ -1153,37 +1314,38 @@ async def _persist_ocr_new_lines_to_chat_messages(
     """将截图 OCR 增量行逐条写入 chat_messages，并同步到 Redis 短期记忆。"""
     if not new_lines:
         return 0
-    seq_result = await db.execute(
-        select(ChatMessage.sequence)
-        .where(ChatMessage.call_id == call_id)
-        .order_by(ChatMessage.sequence.desc(), ChatMessage.message_id.desc())
-        .limit(1)
-    )
-    last_seq = seq_result.scalar_one_or_none() or 0
-    seq = last_seq
-    n = 0
-    for raw_line in new_lines:
-        parsed = _parse_ocr_line_to_speaker_content(raw_line)
-        if not parsed:
-            continue
-        speaker, content = parsed
-        if not (content or "").strip():
-            continue
-        seq += 1
-        db.add(
-            ChatMessage(
-                call_id=call_id,
-                sequence=seq,
-                speaker=speaker,
-                content=content,
-            )
+    with _chat_messages_sequence_lock(call_id):
+        seq_result = await db.execute(
+            select(ChatMessage.sequence)
+            .where(ChatMessage.call_id == call_id)
+            .order_by(ChatMessage.sequence.desc(), ChatMessage.message_id.desc())
+            .limit(1)
         )
-        mem_line = raw_line.strip()[:1000]
-        if mem_line:
-            await memory_service.add_message(call_id, mem_line)
-        n += 1
-    if n:
-        await db.flush()
+        last_seq = seq_result.scalar_one_or_none() or 0
+        seq = last_seq
+        n = 0
+        for raw_line in new_lines:
+            parsed = _parse_ocr_line_to_speaker_content(raw_line)
+            if not parsed:
+                continue
+            speaker, content = parsed
+            if not (content or "").strip():
+                continue
+            seq += 1
+            db.add(
+                ChatMessage(
+                    call_id=call_id,
+                    sequence=seq,
+                    speaker=speaker,
+                    content=content,
+                )
+            )
+            mem_line = raw_line.strip()[:1000]
+            if mem_line:
+                await memory_service.add_message(call_id, mem_line)
+            n += 1
+        if n:
+            await db.flush()
     return n
 
 
@@ -1400,9 +1562,10 @@ def detect_image_task(self, image_base64: str, user_id: int, call_id: int) -> Di
                 detected_platform = _PLATFORM_MAP.get(platform_str, CallPlatform.OTHER)
 
                 # 使用单列 UPDATE，避免 ORM 在长时间 OCR 后提交时把并发写入的 end_time 覆盖回 NULL
-                # （识别为 wechat/phone 时常会改 platform 并 commit；识别为 other 时可能不改任何列，故不易触发）
+                # 仅当平台仍为占位（OTHER/None）时用 OCR 写回；PHONE 等已由业务/start 确定，不再被截图覆盖。
+                # wechat/qq/video_call 同样不写回 platform，避免误改用户所选。
                 values = {}
-                if record.platform == CallPlatform.PHONE or record.platform is None:
+                if record.platform in (CallPlatform.OTHER, None):
                     values["platform"] = detected_platform
                 if not record.caller_number and caller_number:
                     values["caller_number"] = caller_number
@@ -1430,6 +1593,15 @@ def detect_image_task(self, image_base64: str, user_id: int, call_id: int) -> Di
                         is_text_chat=is_text_chat,
                     )
                     env_info = environment_fusion_engine.get_environment_info(str(call_id))
+                    # 记录环境类型到 Redis，供 upload/image 自动走增量 OCR 分流。
+                    try:
+                        r.setex(
+                            f"call:{call_id}:env_type",
+                            6 * 3600,
+                            env_info.get("environment_type", "unknown"),
+                        )
+                    except Exception as redis_e:
+                        logger.warning(f"写入 env_type 失败: {redis_e}")
                     payload = {
                         "type": "environment_detected",
                         "data": {

@@ -51,6 +51,7 @@ export default {
     // 案例上传与管理 (新增)
     // =======================
     uploadCase: (data) => api.post('/admin/cases/upload', data),
+    suggestCaseFields: (content) => api.post('/admin/cases/suggest-fields', { content }),
     getPendingCases: () => api.get('/admin/cases/pending'),
     getLearnedCases: () => api.get('/admin/cases/learned'),
     getPendingCaseDetail: (filename) => api.get(`/admin/cases/pending/${filename}`),
@@ -62,6 +63,7 @@ export default {
     getSystemLogs: (params = {}) => api.get('/admin/system/logs', { params }),
     getSystemHealth: () => api.get('/admin/system/health'),
     getRecentDetections: (limit = 20) => api.get('/admin/detection/recent', { params: { limit } }),
+    getRecentCallSummaries: (limit = 6) => api.get('/admin/calls/recent-summaries', { params: { limit } }),
     
     // =======================
     // 用户管理

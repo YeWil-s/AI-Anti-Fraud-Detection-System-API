@@ -296,7 +296,7 @@ export default {
         async loadFamilies() {
             try {
                 const res = await api.getFamilyGroups();
-                this.families = res.data?.items || res || [];
+                this.families = res.items || [];
                 this.filteredFamilies = this.families;
             } catch (error) {
                 console.error('加载家庭组失败:', error);
@@ -307,7 +307,7 @@ export default {
         async loadStats() {
             try {
                 const res = await api.getFamilyStats?.() || {};
-                this.stats = res.data || res || {};
+                this.stats = res || {};
             } catch (error) {
                 this.stats = {};
             }
@@ -342,10 +342,10 @@ export default {
         },
         async viewFamilyDetail(row) {
             try {
-                const res = await api.getFamilyMembers(row.id);
+                const res = await api.getFamilyGroupMembers(row.id);
                 this.currentFamily = {
                     ...row,
-                    members: res.data?.members || []
+                    members: res.members || []
                 };
                 this.detailVisible = true;
             } catch (error) {
@@ -354,10 +354,10 @@ export default {
         },
         async manageMembers(row) {
             try {
-                const res = await api.getFamilyMembers(row.id);
+                const res = await api.getFamilyGroupMembers(row.id);
                 this.currentFamily = {
                     ...row,
-                    members: res.data?.members || []
+                    members: res.members || []
                 };
                 this.membersVisible = true;
             } catch (error) {

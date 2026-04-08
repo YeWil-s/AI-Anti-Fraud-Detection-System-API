@@ -7,6 +7,7 @@ from typing import List, Optional
 import asyncio
 import json
 from datetime import datetime
+from io import BytesIO
 
 # 导入日志
 from app.core.logger import get_logger
@@ -21,7 +22,8 @@ from app.models.call_record import CallRecord
 from app.schemas import ResponseModel
 from app.core.config import settings
 
-from app.core.redis import get_all_user_preferences
+from app.core.redis import get_all_user_preferences, get_redis
+from PIL import Image
 
 # 导入检测任务
 from app.tasks.detection_tasks import (
@@ -35,6 +37,101 @@ from app.tasks.detection_tasks import (
 
 router = APIRouter(prefix="/api/detection", tags=["实时检测"])
 logger = get_logger(__name__)
+
+async def _can_dispatch_audio_task(user_id: int, call_id: int) -> bool:
+    """
+    同一用户音频任务节流：
+    - 最小间隔窗口内仅允许一次 detect_audio_task 入队
+    - 若文本任务刚刚入队，则短暂抑制音频任务，优先文本链路
+    """
+    redis = await get_redis()
+    audio_interval = max(1, int(getattr(settings, "AUDIO_TASK_MIN_INTERVAL_SECONDS", 2)))
+    text_preempt_window = max(1, int(getattr(settings, "TEXT_PREEMPT_AUDIO_SECONDS", 1)))
+
+    # 文本任务优先窗口：若命中则暂不派发音频任务
+    text_preempt_key = f"user:{user_id}:call:{call_id}:text_preempt_audio"
+    if await redis.get(text_preempt_key):
+        return False
+
+    # 音频最小间隔节流
+    audio_guard_key = f"user:{user_id}:call:{call_id}:audio_task_guard"
+    ok = await redis.set(audio_guard_key, "1", ex=audio_interval, nx=True)
+    return bool(ok)
+
+
+async def _mark_text_preempt_audio(user_id: int, call_id: int) -> None:
+    """文本任务入队时，短时标记音频抑制窗口。"""
+    redis = await get_redis()
+    text_preempt_window = max(1, int(getattr(settings, "TEXT_PREEMPT_AUDIO_SECONDS", 1)))
+    text_preempt_key = f"user:{user_id}:call:{call_id}:text_preempt_audio"
+    await redis.set(text_preempt_key, "1", ex=text_preempt_window)
+
+
+def _compress_image_for_ocr(
+    content: bytes, max_side: int, jpeg_quality: int
+) -> tuple[bytes, str]:
+    """
+    将图片压缩为 OCR 友好的 JPEG，减少上传与多模态推理耗时。
+    返回: (压缩后的字节, content_type)
+    """
+    try:
+        with Image.open(BytesIO(content)) as img:
+            # 统一到 RGB，避免 PNG/WebP 的透明通道导致编码问题
+            if img.mode != "RGB":
+                img = img.convert("RGB")
+
+            w, h = img.size
+            longest = max(w, h)
+            if longest > max_side > 0:
+                ratio = max_side / float(longest)
+                new_size = (max(1, int(w * ratio)), max(1, int(h * ratio)))
+                img = img.resize(new_size, Image.Resampling.LANCZOS)
+
+            out = BytesIO()
+            img.save(
+                out,
+                format="JPEG",
+                quality=max(40, min(int(jpeg_quality), 95)),
+                optimize=True,
+            )
+            return out.getvalue(), "image/jpeg"
+    except Exception as e:
+        logger.warning(f"图片压缩失败，回退原图: {e}")
+        return content, "image/jpeg"
+
+
+async def _should_route_dialogue_only(
+    call_id: int, requested_dialogue_only: bool
+) -> bool:
+    """
+    优先使用客户端参数；若未指定 dialogue_only，则根据 Redis 中的环境识别状态自动分流。
+    """
+    if requested_dialogue_only:
+        return True
+
+    try:
+        redis = await get_redis()
+        env_type = await redis.get(f"call:{call_id}:env_type")
+        return bool(env_type)
+    except Exception as e:
+        logger.warning(f"读取环境识别状态失败，按默认流程处理: {e}")
+        return False
+
+
+async def _enforce_image_upload_rate_limit(call_id: int, interval_seconds: float) -> None:
+    """按 call_id 进行图片上传限流，避免 OCR 任务排队导致尾延迟放大。"""
+    if interval_seconds <= 0:
+        return
+
+    redis = await get_redis()
+    key = f"call:{call_id}:image_upload_guard"
+    # set nx ex: 窗口内只能成功一次
+    ok = await redis.set(key, "1", ex=max(1, int(interval_seconds)), nx=True)
+    if not ok:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=f"截图上传过于频繁，请至少间隔 {interval_seconds:.1f}s",
+        )
 
 
 async def _fallback_end_call_record(call_id: int) -> None:
@@ -109,8 +206,9 @@ async def websocket_endpoint(
                 # --- A. 音频处理 ---
                 if msg_type == "audio":
                     if payload:
-                        # 异步投递任务到 Celery
-                        detect_audio_task.delay(payload, user_id, call_id)
+                        # 异步投递任务到 Celery（带用户级时间锁 + 文本优先抑制）
+                        if await _can_dispatch_audio_task(user_id, call_id):
+                            detect_audio_task.delay(payload, user_id, call_id)
                         
                         # 回复 ACK
                         await websocket.send_json({
@@ -156,6 +254,8 @@ async def websocket_endpoint(
                     
                     if text_content and len(text_content.strip()) > 1:
                         logger.info(f"Received text (User: {user_id}): {text_content[:20]}...")
+                        # 文本任务抢跑：短时间抑制音频任务派发
+                        await _mark_text_preempt_audio(user_id, call_id)
                         detect_text_task.delay(text_content, user_id, call_id)
                         
                         # 回复 ACK
@@ -303,17 +403,31 @@ async def upload_image(
             detail="图片大小不能超过10MB"
         )
 
+    # 限流上传频率（同一通话）
+    await _enforce_image_upload_rate_limit(
+        call_id, float(getattr(settings, "OCR_UPLOAD_MIN_INTERVAL_SECONDS", 2.0))
+    )
+
+    # 服务端压缩，降低多模态接口延迟
+    compressed_content, content_type = _compress_image_for_ocr(
+        content=content,
+        max_side=int(getattr(settings, "OCR_IMAGE_MAX_SIDE", 1280)),
+        jpeg_quality=int(getattr(settings, "OCR_IMAGE_JPEG_QUALITY", 70)),
+    )
+
     # 上传到MinIO存储
     file_url = await upload_to_minio(
-        content,
+        compressed_content,
         f"image/{current_user_id}/{file.filename}",
-        content_type=file.content_type,
+        content_type=content_type,
     )
 
     import base64
 
-    image_base64 = base64.b64encode(content).decode("utf-8")
-    if dialogue_only:
+    image_base64 = base64.b64encode(compressed_content).decode("utf-8")
+    route_dialogue_only = await _should_route_dialogue_only(call_id, dialogue_only)
+
+    if route_dialogue_only:
         task = detect_image_dialogue_task.delay(image_base64, current_user_id, call_id)
         msg = "图片上传成功，正在进行增量聊天 OCR（已跳过环境分类）"
     else:
@@ -326,8 +440,8 @@ async def upload_image(
         data={
             "url": file_url,
             "filename": file.filename,
-            "size": len(content),
+            "size": len(compressed_content),
             "task_id": task.id,
-            "dialogue_only": dialogue_only,
+            "dialogue_only": route_dialogue_only,
         },
     )

@@ -23,6 +23,9 @@ celery_app = Celery(
 )
 
 # 配置Celery
+# Windows 上 billiard 多进程池在子进程回收时易出现句柄/权限错误；不在此平台限制每子进程任务数。
+_worker_max_tasks_per_child = None if sys.platform == "win32" else 200
+
 celery_app.conf.update(
     task_serializer="json",
     accept_content=["json"],
@@ -31,7 +34,7 @@ celery_app.conf.update(
     enable_utc=False,
     # 任务过期时间
     task_time_limit=1800,  # 30分钟
-    worker_max_tasks_per_child=200,  # 防止内存泄漏
+    worker_max_tasks_per_child=_worker_max_tasks_per_child,  # 非 Windows：防止内存泄漏
 )
 
 # 自动发现任务模块
