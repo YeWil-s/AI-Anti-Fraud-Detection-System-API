@@ -1,10 +1,12 @@
 """
 任务管理API路由
 """
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException, status
 from app.core.security import get_current_user_id
 from app.tasks.detection_tasks import detect_audio_task, detect_video_task, detect_text_task, get_task_status
 from app.schemas import ResponseModel
+from app.core.detection_guards import env_type_is_text_chat, is_env_recognition_ready
+from app.core.config import settings
 from typing import Dict
 
 from pydantic import BaseModel
@@ -13,13 +15,13 @@ from typing import List
 
 class AudioDetectionRequest(BaseModel):
     """音频检测请求"""
-    audio_features: List[List[float]]
+    audio_base64: str
     call_id: int
 
 
 class VideoDetectionRequest(BaseModel):
     """视频检测请求"""
-    frame_data: List[List[int]]
+    frame_data: List[str]
     call_id: int
 
 
@@ -43,7 +45,20 @@ async def submit_audio_detection_task(
     Args:
         request: 音频检测请求数据
     """
-    task = detect_audio_task.delay(request.audio_features, current_user_id, request.call_id)
+    if not await is_env_recognition_ready(request.call_id):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="请先完成截图环境识别",
+        )
+    if await env_type_is_text_chat(request.call_id):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="文字聊天场景不执行语音检测",
+        )
+    task = detect_audio_task.apply_async(
+        args=[request.audio_base64, current_user_id, request.call_id],
+        priority=settings.CELERY_PRIORITY_AUDIO,
+    )
     
     return ResponseModel(
         code=200,
@@ -66,7 +81,15 @@ async def submit_video_detection_task(
     Args:
         request: 视频检测请求数据
     """
-    task = detect_video_task.delay(request.frame_data, current_user_id, request.call_id)
+    if not await is_env_recognition_ready(request.call_id):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="请先完成截图环境识别",
+        )
+    task = detect_video_task.apply_async(
+        args=[request.frame_data, current_user_id, request.call_id],
+        priority=settings.CELERY_PRIORITY_VIDEO,
+    )
     
     return ResponseModel(
         code=200,
@@ -89,7 +112,15 @@ async def submit_text_detection_task(
     Args:
         request: 文本检测请求数据
     """
-    task = detect_text_task.delay(request.text, current_user_id, request.call_id)
+    if not await is_env_recognition_ready(request.call_id):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="请先完成截图环境识别",
+        )
+    task = detect_text_task.apply_async(
+        args=[request.text, current_user_id, request.call_id],
+        priority=settings.CELERY_PRIORITY_TEXT,
+    )
     
     return ResponseModel(
         code=200,

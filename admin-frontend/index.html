@@ -3,41 +3,74 @@
 <head>
     <meta charset="UTF-8">
     <title>AI 反诈防御系统 - 管理后台</title>
-    <link href="https://cdn.bootcdn.net/ajax/libs/element-plus/2.5.3/index.min.css" rel="stylesheet">
-    <link href="https://cdn.bootcdn.net/ajax/libs/remixicon/4.1.0/remixicon.css" rel="stylesheet">
+    <!-- 安全头部 (X-Frame-Options 应通过服务器HTTP响应头设置，不在meta标签中使用) -->
+    <meta http-equiv="X-Content-Type-Options" content="nosniff">
+    <!-- 本地CSS资源 -->
+    <link href="./lib/element-plus.index.min.css" rel="stylesheet">
+    <!-- 本地图标字体资源 -->
+    <link href="./lib/remixicon.css" rel="stylesheet">
     <link href="./css/style.css" rel="stylesheet">
+    <!-- 添加加载动画样式 -->
+    <style>
+        #loading-mask {
+            position: fixed;
+            top: 0; left: 0; right: 0; bottom: 0;
+            background: #1f2937;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            z-index: 9999;
+            transition: opacity 0.3s;
+        }
+        #loading-mask.hidden { opacity: 0; pointer-events: none; }
+        .loading-spinner {
+            width: 50px; height: 50px;
+            border: 3px solid #374151;
+            border-top-color: #4f46e5;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+        }
+        @keyframes spin { to { transform: rotate(360deg); } }
+        .loading-text {
+            color: #9ca3af;
+            margin-top: 15px;
+            font-size: 14px;
+        }
+    </style>
 </head>
 <body>
-    <div id="app">
-        <el-container class="app-wrapper">
-            <el-aside width="220px" class="sidebar">
-                <div class="logo"><i class="ri-shield-check-fill"></i> AI Sentinel</div>
-                <el-menu :default-active="activePath" router background-color="#1f2937" text-color="#9ca3af" active-text-color="#fff">
-                    <el-menu-item index="/"><i class="ri-dashboard-line"></i> <span style="margin-left:8px">仪表盘</span></el-menu-item>
-                    <el-menu-item index="/rules"><i class="ri-list-settings-line"></i> <span style="margin-left:8px">关键词规则</span></el-menu-item>
-                    <el-menu-item index="/blacklist"><i class="ri-spam-line"></i> <span style="margin-left:8px">黑名单管理</span></el-menu-item>
-                    <el-menu-item index="/case-learning"><i class="ri-brain-line"></i><span style="margin-left:8px">自适应进化</span></el-menu-item>
-                    <el-menu-item index="/test"><i class="ri-test-tube-line"></i> <span style="margin-left:8px">测试实验室</span></el-menu-item>
-                </el-menu>
-            </el-aside>
-            <el-container>
-                <el-header class="header">
-                    <div class="breadcrumb">管理控制台 / {{ currentRouteName }}</div>
-                    <el-tag type="success" size="small">API 连接状态: 在线</el-tag>
-                </el-header>
-                <el-main>
-                    <router-view></router-view>
-                </el-main>
-            </el-container>
-        </el-container>
+    <!-- 加载动画 -->
+    <div id="loading-mask">
+        <div style="text-align: center;">
+            <div class="loading-spinner"></div>
+            <div class="loading-text">系统加载中...</div>
+        </div>
     </div>
 
-    <script src="https://cdn.bootcdn.net/ajax/libs/vue/3.4.15/vue.global.prod.min.js"></script>
-    <script src="https://cdn.bootcdn.net/ajax/libs/vue-router/4.2.5/vue-router.global.prod.min.js"></script>
-    <script src="https://cdn.bootcdn.net/ajax/libs/axios/1.6.5/axios.min.js"></script>
-    <script src="https://cdn.bootcdn.net/ajax/libs/element-plus/2.5.3/index.full.min.js"></script>
-    <script src="https://cdn.bootcdn.net/ajax/libs/echarts/5.4.3/echarts.min.js"></script>
+    <div id="app" style="display: none;">
+        <router-view></router-view>
+    </div>
+
+    <script>window.__ADMIN_API_BASE__ = 'http://shuode.nat100.top/api';</script>
+
+    <!-- 本地JS资源 -->
+    <script src="./lib/vue.global.prod.min.js"></script>
+    <script src="./lib/vue-router.global.prod.min.js"></script>
+    <script src="./lib/axios.min.js"></script>
+    <script src="./lib/element-plus.index.full.min.js"></script>
+    <!-- ECharts同步加载，确保图表初始化时可用 -->
+    <script src="./lib/echarts.min.js"></script>
     
     <script type="module" src="./js/main.js"></script>
+    
+    <!-- 页面加载完成后隐藏loading -->
+    <script>
+        window.addEventListener('load', function() {
+            setTimeout(function() {
+                document.getElementById('loading-mask').classList.add('hidden');
+                document.getElementById('app').style.display = 'block';
+            }, 100);
+        });
+    </script>
 </body>
 </html>

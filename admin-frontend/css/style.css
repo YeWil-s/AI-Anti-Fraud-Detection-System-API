@@ -6,13 +6,236 @@ body { margin: 0; font-family: 'PingFang SC', sans-serif; background: #f3f4f6; }
 .logo i { margin-right: 8px; color: #4f46e5; font-size: 24px; }
 .el-menu { border-right: none; }
 .header { background: #fff; border-bottom: 1px solid #e5e7eb; display: flex; align-items: center; justify-content: space-between; height: var(--header-height); padding: 0 20px; }
-.page-card { background: #fff; border-radius: 8px; padding: 20px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); min-height: calc(100vh - 140px); }
+.page-card { background: #fff; border-radius: 8px; padding: 20px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
 .page-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; }
 .page-title { font-size: 18px; font-weight: 600; color: #111827; }
-/* 统计卡片样式 */
+
+/* 统计卡片样式 - 增强版 */
 .stat-row { margin-bottom: 20px; }
-.stat-card { background: #fff; padding: 20px; border-radius: 8px; display: flex; align-items: center; gap: 15px; box-shadow: 0 1px 3px rgba(0,0,0,0.05); transition: transform 0.2s; }
-.stat-card:hover { transform: translateY(-2px); box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
-.stat-icon { width: 50px; height: 50px; border-radius: 12px; display: flex; align-items: center; justify-content: center; font-size: 24px; }
-.stat-info .num { font-size: 24px; font-weight: bold; color: #1f2937; }
-.stat-info .label { color: #6b7280; font-size: 13px; }
+.stat-card { 
+    background: #fff; 
+    padding: 20px; 
+    border-radius: 12px; 
+    display: flex; 
+    align-items: center; 
+    gap: 15px; 
+    box-shadow: 0 2px 8px rgba(0,0,0,0.06); 
+    transition: all 0.3s ease;
+    position: relative;
+    overflow: hidden;
+}
+.stat-card:hover { 
+    transform: translateY(-3px); 
+    box-shadow: 0 8px 16px rgba(0,0,0,0.12); 
+}
+.stat-card::before {
+    content: '';
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 4px;
+    height: 100%;
+    background: linear-gradient(180deg, #4f46e5 0%, #7c3aed 100%);
+}
+.stat-icon { 
+    width: 52px; 
+    height: 52px; 
+    border-radius: 14px; 
+    display: flex; 
+    align-items: center; 
+    justify-content: center; 
+    font-size: 26px;
+    transition: transform 0.3s;
+}
+.stat-card:hover .stat-icon {
+    transform: scale(1.1);
+}
+.stat-info { flex: 1; }
+.stat-info .num { 
+    font-size: 28px; 
+    font-weight: bold; 
+    color: #1f2937;
+    line-height: 1.2;
+}
+.stat-info .label { 
+    color: #6b7280; 
+    font-size: 13px; 
+    margin-top: 4px;
+}
+.stat-info .trend {
+    margin-top: 8px;
+}
+
+/* 渐变卡片特殊样式 */
+.stat-card.stat-card-gradient-purple {
+    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+}
+.stat-card.stat-card-gradient-pink {
+    background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
+}
+.stat-card.stat-card-gradient-blue {
+    background: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%);
+}
+.stat-card.stat-card-gradient-green {
+    background: linear-gradient(135deg, #43e97b 0%, #38f9d7 100%);
+}
+.stat-card.stat-card-gradient-red {
+    background: linear-gradient(135deg, #ff6b6b 0%, #ee5a6f 100%);
+}
+.stat-card[class*="stat-card-gradient"] .stat-info .num,
+.stat-card[class*="stat-card-gradient"] .stat-info .label {
+    color: white;
+}
+.stat-card[class*="stat-card-gradient"]::before {
+    display: none;
+}
+
+/* 表格样式优化 */
+.el-table {
+    border-radius: 8px;
+    overflow: hidden;
+}
+.el-table th {
+    background-color: #f8fafc !important;
+    font-weight: 600;
+}
+
+/* 标签页样式 */
+.el-tabs--border-card {
+    border-radius: 8px;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.06);
+}
+.el-tabs--border-card > .el-tabs__header {
+    border-radius: 8px 8px 0 0;
+}
+
+/* 表单样式 */
+.el-form-item__label {
+    font-weight: 500;
+}
+
+/* 进度条样式 */
+.el-progress-bar__outer {
+    border-radius: 10px;
+}
+.el-progress-bar__inner {
+    border-radius: 10px;
+}
+
+/* 对话框样式 */
+.el-dialog {
+    border-radius: 12px;
+}
+.el-dialog__header {
+    border-bottom: 1px solid #e5e7eb;
+    padding: 20px;
+}
+.el-dialog__body {
+    padding: 20px;
+}
+
+/* 描述列表样式 */
+.el-descriptions__label {
+    background-color: #f8fafc !important;
+    font-weight: 500;
+}
+
+/* 统计数字样式 */
+.el-statistic__number {
+    font-size: 32px;
+    font-weight: bold;
+    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    -webkit-background-clip: text;
+    background-clip: text;
+    -webkit-text-fill-color: transparent;
+}
+.el-statistic__title {
+    color: #6b7280;
+    font-size: 14px;
+}
+
+/* ==================== 响应式设计 ==================== */
+
+/* 平板适配 */
+@media (max-width: 1024px) {
+    .el-aside.sidebar {
+        width: 200px !important;
+    }
+    .stat-row .el-col {
+        flex: 0 0 50%;
+        max-width: 50%;
+    }
+}
+
+/* 管理员登录页 */
+.admin-login-wrap {
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: linear-gradient(145deg, #1f2937 0%, #312e81 50%, #1e1b4b 100%);
+    padding: 24px;
+}
+.admin-login-card {
+    width: 100%;
+    max-width: 400px;
+    background: #fff;
+    border-radius: 12px;
+    padding: 32px 28px 36px;
+    box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.35);
+}
+.admin-login-title {
+    font-size: 22px;
+    font-weight: 700;
+    color: #111827;
+    text-align: center;
+    margin-bottom: 8px;
+}
+.admin-login-title i {
+    margin-right: 8px;
+    color: #4f46e5;
+    vertical-align: middle;
+}
+.admin-login-sub {
+    font-size: 13px;
+    color: #6b7280;
+    text-align: center;
+    margin: 0 0 16px;
+}
+.admin-login-tabs.el-tabs {
+    --el-tabs-header-height: 44px;
+}
+.admin-login-tabs .el-tabs__header {
+    margin-bottom: 0;
+}
+
+/* 手机适配 */
+@media (max-width: 768px) {
+    .el-aside.sidebar {
+        display: none; /* 或改为抽屉式 */
+    }
+    .el-main {
+        margin-left: 0;
+        padding: 10px;
+    }
+    .stat-row .el-col {
+        flex: 0 0 100%;
+        max-width: 100%;
+    }
+    .page-card {
+        padding: 15px;
+    }
+    /* 图表容器单列显示 */
+    .el-row[style*="gap"] {
+        flex-direction: column;
+    }
+    /* 表格横向滚动 */
+    .el-table {
+        overflow-x: auto;
+    }
+    /* 对话框全屏 */
+    .el-dialog {
+        width: 95% !important;
+        margin: 5vh auto !important;
+    }
+}

@@ -1,7 +1,7 @@
 """
 通话记录模型
 """
-from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, Enum as SQLEnum
+from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, Enum as SQLEnum, Text
 from sqlalchemy.sql import func
 from app.db.database import Base
 import enum
@@ -9,7 +9,7 @@ import enum
 class CallPlatform(str, enum.Enum):
     PHONE = "phone"      # 传统电话
     WECHAT = "wechat"    # 微信音频
-    VIDEO_CALL = "video_call" # [新增] 视频通话
+    VIDEO_CALL = "video_call" # 视频通话
     QQ = "qq"            # QQ
     OTHER = "other"
 
@@ -32,12 +32,18 @@ class CallRecord(Base):
     start_time = Column(DateTime(timezone=True), nullable=False, comment="通话开始时间")
     end_time = Column(DateTime(timezone=True), nullable=True, comment="通话结束时间")
     duration = Column(Integer, default=0, comment="通话时长(秒)")
-    
+    analysis = Column(Text, nullable=True, comment="大模型对通话内容的完整分析")
+    advice = Column(Text, nullable=True, comment="大模型针对用户画像给出的专属防骗建议")
+
     detected_result = Column(
         SQLEnum(DetectionResult),
         default=DetectionResult.SAFE,
         comment="检测结果(safe/suspicious/fake)"
     )
+    
+    # 诈骗类型（由LLM分析或管理员标注）
+    fraud_type = Column(String(50), nullable=True, comment="诈骗类型")
+    match_script = Column(String(100), nullable=True, comment="匹配的主要诈骗剧本")
     
     # [新增/修改] 媒体存储字段
     audio_url = Column(String(500), nullable=True, comment="录音文件URL")

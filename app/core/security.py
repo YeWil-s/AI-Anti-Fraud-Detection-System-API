@@ -96,3 +96,39 @@ async def get_current_user_id(
             detail="令牌中的用户ID无效",
             headers={"WWW-Authenticate": "Bearer"},
         )
+
+
+async def get_current_admin_id(
+    credentials: HTTPAuthorizationCredentials = Depends(security)
+) -> int:
+    """从 JWT 中解析管理员 ID（令牌须含 typ=admin）"""
+    token = credentials.credentials
+    payload = decode_access_token(token)
+    if payload is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="无效的认证令牌",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    if payload.get("typ") != "admin":
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="需要管理员认证",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    admin_id = payload.get("sub")
+    if admin_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="令牌格式错误",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    try:
+        return int(admin_id)
+    except ValueError:
+        logger.warning(f"Invalid admin_id in token: {admin_id}")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="令牌中的管理员ID无效",
+            headers={"WWW-Authenticate": "Bearer"},
+        )

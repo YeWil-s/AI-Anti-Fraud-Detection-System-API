@@ -46,7 +46,10 @@ logs/
 models/*.pth
 models/*.pt
 models/*.onnx
-models/
+models/*.data
+models/ml
+models/*.txt
+
 
 # Uploads
 uploads/
@@ -62,3 +65,15 @@ chroma_data/
 [0-9a-f]*-[0-9a-f]*-[0-9a-f]*-[0-9a-f]*-[0-9a-f]*/
 
 tests/
+data/competition_cases/
+
+dataset/
+data/
+.qoder/
+check_app.py
+test*
+
+/models/
+scripts/
+ai_anti_fraud_detection_system_frontend/
+B260322003aasist_speechfake/

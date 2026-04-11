@@ -7,6 +7,7 @@ import asyncio
 from datetime import datetime
 from app.core.redis import set_user_preference
 from app.core.logger import get_logger
+from app.core.time_utils import now_bj
 
 # 初始化模块级 logger
 logger = get_logger(__name__)
@@ -27,7 +28,7 @@ class ConnectionManager:
         """接受新连接"""
         await websocket.accept()
         self.active_connections[user_id] = websocket
-        self.connection_times[user_id] = datetime.now()
+        self.connection_times[user_id] = now_bj()
         # 初始防御等级为 Level 0 (安全/待机)
         self.user_levels[user_id] = 0
         # 记录当前在线人数
@@ -59,7 +60,7 @@ class ConnectionManager:
                 "type": "level_sync",
                 "level": level,  # 0, 1, 2
                 "config": config or {}, 
-                "timestamp": datetime.now().isoformat()
+                "timestamp": now_bj().isoformat()
             }
             try:
                 await self.send_personal_message(message, user_id)
@@ -141,7 +142,7 @@ class ConnectionManager:
                     # 发送心跳ping
                     await websocket.send_json({
                         "type": "heartbeat",
-                        "timestamp": datetime.now().isoformat()
+                        "timestamp": now_bj().isoformat()
                     })
                 except Exception:
                     logger.debug(f"Heartbeat failed for user {user_id}, marking for cleanup")

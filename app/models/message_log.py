@@ -10,7 +10,7 @@ class MessageLog(Base):
     __tablename__ = "message_logs"
     
     id = Column(Integer, primary_key=True, index=True, autoincrement=True)
-    user_id = Column(Integer, ForeignKey("users.user_id"), nullable=False, index=True, comment="接收用户")
+    user_id = Column(Integer, ForeignKey("users.user_id", ondelete="CASCADE"), nullable=False, index=True, comment="接收用户")
     call_id = Column(Integer, nullable=True, index=True, comment="关联通话ID")
     
     # 消息类型: alert(警告), info(提示), system(系统)

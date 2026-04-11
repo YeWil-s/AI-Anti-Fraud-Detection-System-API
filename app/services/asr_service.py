@@ -11,8 +11,7 @@ logger = get_logger(__name__)
 
 class ASRService:
     def __init__(self):
-        logger.info("🤖 正在初始化本地 ASR 语音识别引擎 (Whisper-Tiny)...")
-        # 首次运行会自动下载 tiny 模型，后续直接从缓存加载
+        logger.info(" 正在初始化本地 ASR 语音识别引擎 (Whisper-Tiny)...")
         self.model = WhisperModel("tiny", device="cpu", compute_type="int8")
 
     async def transcribe_audio_file(self, file_path: str) -> str:

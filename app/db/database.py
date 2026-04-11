@@ -6,6 +6,7 @@ from sqlalchemy.orm import declarative_base
 from sqlalchemy.pool import NullPool 
 from app.core.config import settings
 from app.core.logger import get_logger
+from fastapi import HTTPException
 import sys
 # 初始化模块级 logger
 logger = get_logger(__name__)
@@ -38,6 +39,10 @@ async def get_db():
         try:
             yield session
             await session.commit()
+        except HTTPException:
+            # 业务层 4xx/3xx 控制流，不应记为数据库故障
+            await session.rollback()
+            raise
         except Exception as e:
             # 发生异常回滚前，记录具体的数据库错误堆栈
             logger.error(f"Database transaction failed, rolling back: {e}", exc_info=True)
@@ -50,6 +55,8 @@ async def get_db():
 async def init_db():
     """初始化数据库"""
     try:
+        # 确保所有模型在 create_all 前完成注册
+        import app.models  # noqa: F401
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
         logger.info("Database schema initialized successfully")

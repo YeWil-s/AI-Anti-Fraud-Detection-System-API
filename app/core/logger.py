@@ -11,6 +11,7 @@ import contextvars
 from logging.handlers import TimedRotatingFileHandler
 from typing import Union
 from datetime import datetime
+from app.core.time_utils import BEIJING_TZ
 
 # 1. 定义上下文变量 (ContextVars)
 request_id_ctx = contextvars.ContextVar("request_id", default="-")
@@ -24,7 +25,7 @@ class StructuredJsonFormatter(logging.Formatter):
     """
     def format(self, record):
         log_record = {
-            "timestamp": datetime.fromtimestamp(record.created).isoformat(),
+            "timestamp": datetime.fromtimestamp(record.created, BEIJING_TZ).isoformat(),
             "level": record.levelname,
             "logger": record.name,
             "line": record.lineno,

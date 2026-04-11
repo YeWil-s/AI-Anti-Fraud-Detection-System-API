@@ -15,6 +15,7 @@ from app.db.database import AsyncSessionLocal
 from app.models.ai_detection_log import AIDetectionLog
 from app.models.message_log import MessageLog
 from app.core.logger import get_logger
+from app.core.time_utils import now_bj
 
 # 引入我们的向量数据库服务
 from app.services.vector_db_service import vector_service
@@ -39,7 +40,7 @@ def clean_old_logs_task(days_to_keep: int = 30):
     async def _process():
         async with AsyncSessionLocal() as db:
             try:
-                cutoff_date = datetime.now() - timedelta(days=days_to_keep)
+                cutoff_date = now_bj() - timedelta(days=days_to_keep)
                 
                 # 1. 清理 AI 检测流水日志 
                 result_ai = await db.execute(
@@ -118,7 +119,7 @@ def auto_learn_new_cases_task():
                     "modality": case.get("modality", "text"),
                     "risk_level": case.get("risk_level", "高危"),
                     "source": case.get("source", f"文件核实录入_{filename}"),
-                    "learned_at": datetime.now().isoformat()
+                    "learned_at": now_bj().isoformat()
                 })
                 ids.append(f"auto_learn_{uuid.uuid4().hex[:8]}")
 
@@ -132,7 +133,7 @@ def auto_learn_new_cases_task():
                 total_learned += len(documents)
 
             # 5. 处理成功后，将文件归档到 learned_cases 目录，防止重复学习
-            timestamp_str = datetime.now().strftime('%Y%m%d_%H%M%S')
+            timestamp_str = now_bj().strftime('%Y%m%d_%H%M%S')
             target_path = os.path.join(LEARNED_DIR, f"learned_{timestamp_str}_{filename}")
             shutil.move(file_path, target_path)
             
