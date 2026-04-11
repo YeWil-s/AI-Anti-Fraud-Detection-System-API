@@ -3,7 +3,7 @@
 """
 from fastapi import APIRouter, Depends, HTTPException, status, Query,BackgroundTasks
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, and_, func
+from sqlalchemy import select, and_, or_, func
 from typing import Optional
 from datetime import datetime  
 from pydantic import BaseModel
@@ -21,9 +21,147 @@ from app.services.memory_service import memory_service
 from app.services.llm_service import llm_service
 from app.services.risk_fusion_engine import fusion_engine_v2, environment_fusion_engine
 from app.core.logger import get_logger
+from app.core.time_utils import now_bj, isoformat_bj
 
 logger = get_logger(__name__)
 router = APIRouter(prefix="/api/call-records", tags=["通话记录"])
+
+
+def _safe_duration_seconds(end_time: datetime, start_time: Optional[datetime]) -> int:
+    """兼容 naive/aware 混用，安全计算通话时长。"""
+    if not start_time:
+        return 0
+    end = end_time
+    start = start_time
+    if start.tzinfo and not end.tzinfo:
+        end = end.replace(tzinfo=start.tzinfo)
+    elif not start.tzinfo and end.tzinfo:
+        start = start.replace(tzinfo=end.tzinfo)
+    duration = int((end - start).total_seconds())
+    return duration if duration > 0 else 0
+
+
+async def _require_family_admin_for_member(
+    db: AsyncSession,
+    admin_user_id: int,
+    member: Optional[User],
+    *,
+    no_member_detail: str = "目标用户未加入家庭组",
+    not_admin_detail: str = "您不是该家庭组的管理员",
+) -> None:
+    """
+    监护人仅在 family_admins 登记；普通成员在 users.family_id 登记所属家庭。
+    不依赖操作者的 users.family_id 或 users.is_admin。
+    """
+    from app.models.family_group import FamilyAdmin
+
+    if not member or not member.family_id:
+        raise HTTPException(status_code=403, detail=no_member_detail)
+    r = await db.execute(
+        select(FamilyAdmin.id).where(
+            and_(
+                FamilyAdmin.user_id == admin_user_id,
+                FamilyAdmin.family_id == member.family_id,
+            )
+        ).limit(1)
+    )
+    if r.scalar_one_or_none() is None:
+        raise HTTPException(status_code=403, detail=not_admin_detail)
+
+
+# 监护人查看被监护人通话时，仅允许「可疑 / 高危(欺诈)」两类
+WARD_RISK_RESULTS = (DetectionResult.SUSPICIOUS, DetectionResult.FAKE)
+
+# 监护人代查列表中提示：可展示分析与建议，其余通话隐私依用户协议不提供
+CALL_PRIVACY_USER_AGREEMENT_NOTICE = (
+    "根据《用户协议》及隐私保护约定，监护人不得查看被监护人通话中的对方号码、昵称、录音及对话原文等隐私信息；"
+    "下列风险分析与防护建议为允许展示范围，仅供参考。"
+)
+
+# 监护人请求对话/审计/时间轴/证据等接口时的拒绝说明（与列表中的 privacy_notice 一致）
+CALL_PRIVACY_FORBIDDEN_DETAIL = (
+    "根据用户协议，监护人不得查看该项通话隐私（含对话原文、审计明细、检测时间轴与证据截图等）；"
+    "请在列表中查看已提供的风险分析与防护建议。"
+)
+
+
+async def _is_family_admin_for_family(db: AsyncSession, user_id: int, family_id: int) -> bool:
+    from app.models.family_group import FamilyAdmin
+
+    r = await db.execute(
+        select(FamilyAdmin.id).where(
+            and_(FamilyAdmin.user_id == user_id, FamilyAdmin.family_id == family_id)
+        ).limit(1)
+    )
+    return r.scalar_one_or_none() is not None
+
+
+def _my_record_item_dict(r: CallRecord, *, admin_ward_view: bool) -> dict:
+    """
+    列表项。
+    监护人代查：依用户协议仅可返回风险分析与建议；不返回对方号码、昵称、录音等通话隐私。
+    """
+    if admin_ward_view:
+        return {
+            "call_id": r.call_id,
+            "platform": r.platform.value if r.platform else "phone",
+            "start_time": isoformat_bj(r.start_time),
+            "end_time": isoformat_bj(r.end_time),
+            "duration": r.duration,
+            "detected_result": r.detected_result.value if r.detected_result else None,
+            "fraud_type": r.fraud_type,
+            "match_script": r.match_script,
+            "created_at": isoformat_bj(r.created_at),
+            "analysis": r.analysis,
+            "advice": r.advice,
+            "privacy_notice": CALL_PRIVACY_USER_AGREEMENT_NOTICE,
+        }
+    return {
+        "call_id": r.call_id,
+        "platform": r.platform.value if r.platform else "phone",
+        "target_name": r.target_name,
+        "caller_number": r.caller_number,
+        "start_time": isoformat_bj(r.start_time),
+        "end_time": isoformat_bj(r.end_time),
+        "duration": r.duration,
+        "detected_result": r.detected_result.value if r.detected_result else None,
+        "fraud_type": r.fraud_type,
+        "match_script": r.match_script,
+        "created_at": isoformat_bj(r.created_at),
+        "audio_url": r.audio_url,
+        "analysis": r.analysis,
+        "advice": r.advice,
+    }
+
+
+def _family_record_item_dict(r: CallRecord, *, admin_ward_view: bool) -> dict:
+    if admin_ward_view:
+        return {
+            "call_id": r.call_id,
+            "user_id": r.user_id,
+            "start_time": isoformat_bj(r.start_time),
+            "duration": r.duration,
+            "detected_result": r.detected_result.value if r.detected_result else None,
+            "fraud_type": r.fraud_type,
+            "match_script": r.match_script,
+            "created_at": isoformat_bj(r.created_at),
+            "analysis": r.analysis,
+            "advice": r.advice,
+            "privacy_notice": CALL_PRIVACY_USER_AGREEMENT_NOTICE,
+        }
+    return {
+        "call_id": r.call_id,
+        "user_id": r.user_id,
+        "caller_number": r.caller_number,
+        "start_time": isoformat_bj(r.start_time),
+        "duration": r.duration,
+        "detected_result": r.detected_result.value if r.detected_result else None,
+        "fraud_type": r.fraud_type,
+        "match_script": r.match_script,
+        "created_at": isoformat_bj(r.created_at),
+        "analysis": r.analysis,
+        "advice": r.advice,
+    }
 
 
 @router.get("/my-records", response_model=ResponseModel)
@@ -37,84 +175,73 @@ async def get_my_call_records(
 ):
     """
     获取通话记录
-    
-    - 如果不传user_id：返回当前用户的通话记录
-    - 如果传user_id：验证权限后返回指定用户的通话记录（管理员可查看同家庭组成员）
+
+    - 不传 user_id：返回当前用户本人全部记录（可按 result_filter 筛选）
+    - 传 user_id 代查被监护人：仅返回可疑/欺诈类通话；依用户协议不返回号码、昵称、录音等隐私，可返回风险分析与建议
     """
-    from app.models.family_group import FamilyAdmin
-    
     # 确定要查询的目标用户ID
     target_user_id = user_id if user_id is not None else current_user_id
     
     # 如果查询的是其他用户的记录，需要验证权限
     if target_user_id != current_user_id:
-        # 1. 获取当前用户和目标用户的信息
-        current_user_result = await db.execute(
-            select(User).where(User.user_id == current_user_id)
-        )
-        current_user = current_user_result.scalar_one_or_none()
-        
         target_user_result = await db.execute(
             select(User).where(User.user_id == target_user_id)
         )
         target_user = target_user_result.scalar_one_or_none()
-        
+
         if not target_user:
             raise HTTPException(status_code=404, detail="目标用户不存在")
-        
-        # 2. 验证是否在同一家庭组
-        if not current_user or not current_user.family_id or current_user.family_id != target_user.family_id:
-            raise HTTPException(status_code=403, detail="无权查看该用户的通话记录")
-        
-        # 3. 验证当前用户是否是该家庭组的管理员
-        admin_result = await db.execute(
-            select(FamilyAdmin).where(
-                and_(
-                    FamilyAdmin.user_id == current_user_id,
-                    FamilyAdmin.family_id == current_user.family_id
-                )
-            )
+
+        await _require_family_admin_for_member(
+            db,
+            current_user_id,
+            target_user,
+            no_member_detail="无权查看该用户的通话记录",
+            not_admin_detail="只有管理员可以查看家庭成员的通话记录",
         )
-        if not admin_result.scalar_one_or_none():
-            raise HTTPException(status_code=403, detail="只有管理员可以查看家庭成员的通话记录")
-    
+
+    admin_ward_view = target_user_id != current_user_id
+
     # 查询通话记录
     query = select(CallRecord).where(CallRecord.user_id == target_user_id)
-    
-    if result_filter:
+
+    if admin_ward_view:
+        if result_filter is not None:
+            if result_filter not in WARD_RISK_RESULTS:
+                query = query.where(CallRecord.call_id == -1)
+            else:
+                query = query.where(CallRecord.detected_result == result_filter)
+        else:
+            query = query.where(CallRecord.detected_result.in_(WARD_RISK_RESULTS))
+    elif result_filter:
         query = query.where(CallRecord.detected_result == result_filter)
-    
+
     query = query.order_by(CallRecord.created_at.desc())
     query = query.offset((page - 1) * page_size).limit(page_size)
-    
+
     result = await db.execute(query)
     records = result.scalars().all()
-    
-    # 统计总数
-    count_result = await db.execute(
-        select(func.count()).select_from(CallRecord).where(CallRecord.user_id == target_user_id)
-    )
+
+    count_q = select(func.count()).select_from(CallRecord).where(CallRecord.user_id == target_user_id)
+    if admin_ward_view:
+        if result_filter is not None:
+            if result_filter not in WARD_RISK_RESULTS:
+                count_q = count_q.where(CallRecord.call_id == -1)
+            else:
+                count_q = count_q.where(CallRecord.detected_result == result_filter)
+        else:
+            count_q = count_q.where(CallRecord.detected_result.in_(WARD_RISK_RESULTS))
+    elif result_filter:
+        count_q = count_q.where(CallRecord.detected_result == result_filter)
+    count_result = await db.execute(count_q)
     total = count_result.scalar() or 0
-    
+
     return ResponseModel(
         code=200,
         message="查询成功",
         data={
             "records": [
-                {
-                    "call_id": r.call_id,
-                    "platform": r.platform.value if r.platform else "phone", # [新增] 返回平台
-                    "target_name": r.target_name,       # [新增] 返回昵称
-                    "caller_number": r.caller_number,
-                    "start_time": r.start_time.isoformat() if r.start_time else None,
-                    "end_time": r.end_time.isoformat() if r.end_time else None,
-                    "duration": r.duration,
-                    "detected_result": r.detected_result.value if r.detected_result else None,
-                    "audio_url": r.audio_url,
-                    "analysis": r.analysis, 
-                    "advice": r.advice,
-                    "created_at": r.created_at.isoformat() if r.created_at else None
-                }
+                _my_record_item_dict(r, admin_ward_view=admin_ward_view)
                 for r in records
             ],
             "pagination": {
@@ -147,7 +274,7 @@ async def start_call(
         # 如果是电话，存 caller_number；如果是微信/QQ，存 target_name
         caller_number=target_identifier if platform_enum == CallPlatform.PHONE else None,
         target_name=target_identifier if platform_enum != CallPlatform.PHONE else None,
-        start_time=datetime.now(),
+        start_time=now_bj(),
         detected_result=DetectionResult.SAFE
     )
     db.add(new_call)
@@ -191,14 +318,14 @@ async def get_call_record_detail(
                 "platform": record.platform.value if record.platform else "phone",
                 "target_name": record.target_name,
                 "caller_number": record.caller_number,
-                "start_time": record.start_time.isoformat() if record.start_time else None,
-                "end_time": record.end_time.isoformat() if record.end_time else None,
+                "start_time": isoformat_bj(record.start_time),
+                "end_time": isoformat_bj(record.end_time),
                 "duration": record.duration,
                 "detected_result": record.detected_result.value,
                 "audio_url": record.audio_url,
                 "analysis": record.analysis,  
                 "advice": record.advice,
-                "created_at": record.created_at.isoformat()
+                "created_at": isoformat_bj(record.created_at)
             },
             # 详情页通常需要更详细的AI数据
             "detection_log": {
@@ -222,8 +349,9 @@ async def get_family_call_records(
 ):
     """
     获取家庭组成员的通话记录
-    
-    **数据隔离**: 只能查看同一家庭组成员的记录
+
+    **数据隔离**: 只能查看同一家庭组成员的记录。
+    **监护人**：对他人通话仅返回可疑/欺诈类记录；依用户协议不返回号码等隐私，可返回风险分析与建议；本人通话不受影响。
     """
     from app.models.family_group import FamilyAdmin
 
@@ -287,41 +415,48 @@ async def get_family_call_records(
             detail="目标用户不在该家庭组中"
         )
 
+    is_admin = await _is_family_admin_for_family(db, current_user_id, target_family_id)
+
     # 查询家庭组成员的通话记录（可按单个成员过滤）
     query = select(CallRecord).where(CallRecord.user_id.in_(family_user_ids))
     if user_id is not None:
         query = query.where(CallRecord.user_id == user_id)
+    if is_admin:
+        # 监护人：仅看本人全部记录，或他人可疑/欺诈记录
+        query = query.where(
+            or_(
+                CallRecord.user_id == current_user_id,
+                CallRecord.detected_result.in_(WARD_RISK_RESULTS),
+            )
+        )
     query = query.order_by(CallRecord.created_at.desc())
     query = query.offset((page - 1) * page_size).limit(page_size)
-    
+
     result = await db.execute(query)
     records = result.scalars().all()
-    
-    # 统计总数
+
     count_query = select(func.count()).select_from(CallRecord).where(CallRecord.user_id.in_(family_user_ids))
     if user_id is not None:
         count_query = count_query.where(CallRecord.user_id == user_id)
-    count_result = await db.execute(
-        count_query
-    )
+    if is_admin:
+        count_query = count_query.where(
+            or_(
+                CallRecord.user_id == current_user_id,
+                CallRecord.detected_result.in_(WARD_RISK_RESULTS),
+            )
+        )
+    count_result = await db.execute(count_query)
     total = count_result.scalar() or 0
-    
+
     return ResponseModel(
         code=200,
         message="查询成功",
         data={
             "records": [
-                {
-                    "call_id": r.call_id,
-                    "user_id": r.user_id,
-                    "caller_number": r.caller_number,
-                    "start_time": r.start_time.isoformat() if r.start_time else None,
-                    "duration": r.duration,
-                    "detected_result": r.detected_result.value if r.detected_result else None,
-                    "analysis": r.analysis, 
-                    "advice": r.advice,
-                    "created_at": r.created_at.isoformat() if r.created_at else None
-                }
+                _family_record_item_dict(
+                    r,
+                    admin_ward_view=is_admin and r.user_id != current_user_id,
+                )
                 for r in records
             ],
             "pagination": {
@@ -407,9 +542,8 @@ async def end_call_record(
         )
     
     # 2. 更新结束时间和通话时长
-    record.end_time = datetime.now()
-    if record.start_time:
-        record.duration = int((record.end_time - record.start_time).total_seconds())
+    record.end_time = now_bj()
+    record.duration = _safe_duration_seconds(record.end_time, record.start_time)
         
     # 3. 更新完整的音视频文件和封面 URL
     if payload.audio_url:
@@ -499,15 +633,18 @@ async def get_call_audit_logs(
     if not record:
         raise HTTPException(status_code=404, detail="通话记录不存在")
 
-    # 2. 权限校验：本人或其家庭组管理员可看
-    user_result = await db.execute(select(User).where(User.user_id == current_user_id))
-    current_user = user_result.scalar_one_or_none()
-
+    # 2. 权限校验：本人或其家庭组监护人（FamilyAdmin）可看
     if record.user_id != current_user_id:
         owner_result = await db.execute(select(User).where(User.user_id == record.user_id))
         owner = owner_result.scalar_one_or_none()
-        if not owner or owner.family_id != current_user.family_id or not current_user.is_admin:
-            raise HTTPException(status_code=403, detail="无权查看该记录的审计日志")
+        await _require_family_admin_for_member(
+            db,
+            current_user_id,
+            owner,
+            no_member_detail="无权查看该记录的审计日志",
+            not_admin_detail="无权查看该记录的审计日志",
+        )
+        raise HTTPException(status_code=403, detail=CALL_PRIVACY_FORBIDDEN_DETAIL)
 
     # 3. 获取底层 AI 检测日志
     ai_logs_result = await db.execute(
@@ -535,7 +672,7 @@ async def get_call_audit_logs(
                 "text_content": log.detected_keywords,
             } for log in ai_logs],
             "alert_events": [{
-                "created_at": log.created_at.isoformat() if log.created_at else None,
+                "created_at": isoformat_bj(log.created_at),
                 "msg_type": log.msg_type,
                 "risk_level": log.risk_level,
                 "title": log.title,
@@ -557,17 +694,15 @@ async def report_call_to_admin(
     if not record:
         raise HTTPException(status_code=404, detail="通话记录不存在")
 
-    user_result = await db.execute(select(User).where(User.user_id == current_user_id))
-    current_user = user_result.scalar_one_or_none()
-
-    # 必须是管理员，且这条记录是自己家人的
-    if not current_user.is_admin:
-        raise HTTPException(status_code=403, detail="仅家庭组管理员可提交审查")
-
     owner_result = await db.execute(select(User).where(User.user_id == record.user_id))
     owner = owner_result.scalar_one_or_none()
-    if not owner or owner.family_id != current_user.family_id:
-        raise HTTPException(status_code=403, detail="只能提交家庭组成员的记录")
+    await _require_family_admin_for_member(
+        db,
+        current_user_id,
+        owner,
+        no_member_detail="只能提交家庭组成员的记录",
+        not_admin_detail="仅家庭组管理员可提交审查",
+    )
 
     # 2. 将检测结果标记为 FAKE (欺诈)，以便 admin.py 中的 get_fraud_cases 接口能捕获到
     record.detected_result = DetectionResult.FAKE
@@ -593,15 +728,19 @@ async def get_call_chat_history(
     if not record:
         raise HTTPException(status_code=404, detail="通话记录不存在")
     
-    # 权限校验：本人或家庭组管理员
+    # 权限校验：本人或家庭组监护人（FamilyAdmin）
     if record.user_id != current_user_id:
-        user_result = await db.execute(select(User).where(User.user_id == current_user_id))
-        current_user = user_result.scalar_one_or_none()
         owner_result = await db.execute(select(User).where(User.user_id == record.user_id))
         owner = owner_result.scalar_one_or_none()
-        if not owner or owner.family_id != current_user.family_id or not current_user.is_admin:
-            raise HTTPException(status_code=403, detail="无权查看该记录的对话历史")
-    
+        await _require_family_admin_for_member(
+            db,
+            current_user_id,
+            owner,
+            no_member_detail="无权查看该记录的对话历史",
+            not_admin_detail="无权查看该记录的对话历史",
+        )
+        raise HTTPException(status_code=403, detail=CALL_PRIVACY_FORBIDDEN_DETAIL)
+
     # 2. 从数据库获取对话历史（优先），Redis作为实时补充
     try:
         # 先尝试从数据库获取持久化的对话
@@ -618,7 +757,7 @@ async def get_call_chat_history(
                 "sequence": msg.sequence,
                 "speaker": msg.speaker,
                 "content": msg.content,
-                "timestamp": msg.timestamp.isoformat() if msg.timestamp else None
+                "timestamp": isoformat_bj(msg.timestamp)
             })
         
         # 如果数据库没有，尝试从Redis获取（实时通话中）
@@ -673,15 +812,19 @@ async def get_detection_timeline(
     if not record:
         raise HTTPException(status_code=404, detail="通话记录不存在")
     
-    # 权限校验
+    # 权限校验：本人或家庭组监护人（FamilyAdmin）
     if record.user_id != current_user_id:
-        user_result = await db.execute(select(User).where(User.user_id == current_user_id))
-        current_user = user_result.scalar_one_or_none()
         owner_result = await db.execute(select(User).where(User.user_id == record.user_id))
         owner = owner_result.scalar_one_or_none()
-        if not owner or owner.family_id != current_user.family_id or not current_user.is_admin:
-            raise HTTPException(status_code=403, detail="无权查看该记录的检测时间轴")
-    
+        await _require_family_admin_for_member(
+            db,
+            current_user_id,
+            owner,
+            no_member_detail="无权查看该记录的检测时间轴",
+            not_admin_detail="无权查看该记录的检测时间轴",
+        )
+        raise HTTPException(status_code=403, detail=CALL_PRIVACY_FORBIDDEN_DETAIL)
+
     # 2. 获取AI检测日志（按时间排序）
     ai_logs_result = await db.execute(
         select(AIDetectionLog)
@@ -695,7 +838,7 @@ async def get_detection_timeline(
     for log in ai_logs:
         timeline.append({
             "time_offset": log.time_offset,
-            "timestamp": log.created_at.isoformat() if log.created_at else None,
+            "timestamp": isoformat_bj(log.created_at),
             "modalities": {
                 "text": {
                     "confidence": log.text_confidence,
@@ -785,19 +928,23 @@ async def get_evidence_detail(
     record = record_result.scalar_one_or_none()
     
     if record.user_id != current_user_id:
-        user_result = await db.execute(select(User).where(User.user_id == current_user_id))
-        current_user = user_result.scalar_one_or_none()
         owner_result = await db.execute(select(User).where(User.user_id == record.user_id))
         owner = owner_result.scalar_one_or_none()
-        if not owner or owner.family_id != current_user.family_id or not current_user.is_admin:
-            raise HTTPException(status_code=403, detail="无权查看该证据")
-    
+        await _require_family_admin_for_member(
+            db,
+            current_user_id,
+            owner,
+            no_member_detail="无权查看该证据",
+            not_admin_detail="无权查看该证据",
+        )
+        raise HTTPException(status_code=403, detail=CALL_PRIVACY_FORBIDDEN_DETAIL)
+
     # 3. 构建证据详情
     evidence_detail = {
         "log_id": log.log_id,
         "call_id": log.call_id,
         "time_offset": log.time_offset,
-        "created_at": log.created_at.isoformat() if log.created_at else None,
+        "created_at": isoformat_bj(log.created_at),
         "detection_type": log.detection_type,
         "modalities": {
             "text": {
@@ -1009,7 +1156,7 @@ async def trigger_emergency_alert(
         )
     
     # 4. 构造紧急报警消息
-    timestamp = datetime.now().isoformat()
+    timestamp = now_bj().isoformat()
     alert_message = request.message or f"用户 {user.name or user.username} 触发了一键报警，可能正在遭遇诈骗！"
     
     emergency_payload = {

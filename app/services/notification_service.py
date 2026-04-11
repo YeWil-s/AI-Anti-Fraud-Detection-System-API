@@ -14,6 +14,7 @@ from app.models.message_log import MessageLog
 from app.models.user import User
 from app.core.config import settings
 from app.core.logger import get_logger
+from app.core.time_utils import now_bj
 from app.core.defense_levels import (
     get_display_mode,
     should_notify_guardian,
@@ -70,7 +71,7 @@ class NotificationService:
             为 False 时不向当前用户发 WebSocket（避免与 detect_text 融合后的 alert 重复弹窗），
             仍写入 MessageLog，仍可按策略通知监护人/邮件。
         """
-        timestamp = datetime.now().isoformat()
+        timestamp = now_bj().isoformat()
         
         # 1. 确定消息属性
         if is_risk:
@@ -138,7 +139,7 @@ class NotificationService:
             
         # 6. [邮件通知] 使用统一的防御等级判断是否发送邮件
         if is_risk and should_send_email(risk_level):
-            await self._notify_guardian_by_email(db, user_id, risk_level, details)
+            await self._notify_guardian_by_email(db, user_id, call_id, risk_level, details)
 
         return result_log
             
@@ -233,6 +234,7 @@ class NotificationService:
         self, 
         db: AsyncSession, 
         current_user_id: int, 
+        call_id: int,
         risk_level: str,
         details: str = ""
     ):
@@ -241,6 +243,19 @@ class NotificationService:
         
         已统一委托给 email_service.send_guardian_alert_by_family 处理
         """
+        # 同一通话仅允许发送一次邮件，避免流式检测/重试导致邮件风暴
+        dedupe_key = f"fraud:email:call:{call_id}"
+        try:
+            first_send = self.redis.set(dedupe_key, "1", nx=True, ex=24 * 60 * 60)
+        except Exception as e:
+            logger.warning(f"邮件去重锁写入失败(call_id={call_id}): {e}")
+            # 去重失败时继续发送，保证高危情况下不漏报
+            first_send = True
+
+        if not first_send:
+            logger.info(f"邮件已发送过，跳过重复发送: call_id={call_id}")
+            return
+
         await email_service.send_guardian_alert_by_family(
             db=db,
             user_id=current_user_id,

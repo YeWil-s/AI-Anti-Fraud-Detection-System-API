@@ -8,6 +8,7 @@ os.environ["ANONYMIZED_TELEMETRY"] = "false"
 os.environ["CHROMA_TELEMETRY"] = "false"
 os.environ["POSTHOG_DISABLED"] = "1"
 os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+os.environ["TZ"] = "Asia/Shanghai"
 sys.modules['chromadb.telemetry.posthog'] = MagicMock()
 sys.modules['posthog'] = MagicMock()
 
@@ -35,6 +36,14 @@ celery_app.conf.update(
     # 任务过期时间
     task_time_limit=1800,  # 30分钟
     worker_max_tasks_per_child=_worker_max_tasks_per_child,  # 非 Windows：防止内存泄漏
+    # Redis 优先级队列（文本 > 图像 > 音频=视频）
+    task_queue_max_priority=settings.CELERY_TASK_MAX_PRIORITY,
+    task_default_priority=settings.CELERY_PRIORITY_AUDIO,
+    broker_transport_options={
+        "queue_order_strategy": "priority",
+        "priority_steps": list(range(settings.CELERY_TASK_MAX_PRIORITY + 1)),
+        "sep": ":",
+    },
 )
 
 # 自动发现任务模块

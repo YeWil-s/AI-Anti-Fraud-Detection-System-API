@@ -48,47 +48,10 @@
     </div>
 
     <div id="app" style="display: none;">
-        <el-container class="app-wrapper">
-            <el-aside width="220px" class="sidebar">
-                <div class="logo"><i class="ri-shield-check-fill"></i> AI Sentinel</div>
-                <el-menu :default-active="activePath" router background-color="#1f2937" text-color="#9ca3af" active-text-color="#fff">
-                    <el-menu-item index="/">
-                        <i class="ri-dashboard-line"></i>
-                        <span style="margin-left:8px">监控仪表盘</span>
-                    </el-menu-item>
-                    <el-menu-item index="/rules">
-                        <i class="ri-list-settings-line"></i>
-                        <span style="margin-left:8px">关键词规则</span>
-                    </el-menu-item>
-                    <el-menu-item index="/blacklist">
-                        <i class="ri-spam-line"></i>
-                        <span style="margin-left:8px">黑名单管理</span>
-                    </el-menu-item>
-                    <el-menu-item index="/case-learning">
-                        <i class="ri-brain-line"></i>
-                        <span style="margin-left:8px">AI知识库</span>
-                    </el-menu-item>
-                    <el-menu-item index="/users">
-                        <i class="ri-user-settings-line"></i>
-                        <span style="margin-left:8px">用户管理</span>
-                    </el-menu-item>
-                    <el-menu-item index="/families">
-                        <i class="ri-home-heart-line"></i>
-                        <span style="margin-left:8px">家庭组管理</span>
-                    </el-menu-item>
-                </el-menu>
-            </el-aside>
-            <el-container>
-                <el-header class="header">
-                    <div class="breadcrumb">管理控制台 / {{ currentRouteName }}</div>
-                    <el-tag type="success" size="small">API 连接状态: 在线</el-tag>
-                </el-header>
-                <el-main>
-                    <router-view></router-view>
-                </el-main>
-            </el-container>
-        </el-container>
+        <router-view></router-view>
     </div>
+
+    <script>window.__ADMIN_API_BASE__ = 'http://shuode.nat100.top/api';</script>
 
     <!-- 本地JS资源 -->
     <script src="./lib/vue.global.prod.min.js"></script>

@@ -12,6 +12,7 @@ from app.models.user import User
 from app.models.call_record import CallRecord
 from app.models.education import KnowledgeItem, UserLearningRecord
 from app.core.logger import get_logger
+from app.core.time_utils import isoformat_bj
 
 logger = get_logger(__name__)
 
@@ -342,8 +343,8 @@ class EducationService:
                 "url": item.content_url,
                 "fraud_type": item.fraud_type,
                 "is_completed": bool(record.is_completed),
-                "learned_at": record.learned_at.isoformat() if record.learned_at else None,
-                "created_at": record.created_at.isoformat() if record.created_at else None,
+                "learned_at": isoformat_bj(record.learned_at),
+                "created_at": isoformat_bj(record.created_at),
             })
         return history
     

@@ -9,6 +9,7 @@ from app.core.security import get_current_user_id
 from app.db.database import get_db
 from app.models.message_log import MessageLog
 from app.schemas import ResponseModel
+from app.core.time_utils import isoformat_bj
 
 router = APIRouter(prefix="/api/messages", tags=["消息中心"])
 
@@ -40,7 +41,7 @@ async def get_my_messages(
             "title": m.title,
             "content": m.content,
             "is_read": m.is_read,
-            "created_at": m.created_at.isoformat() if m.created_at else None,
+            "created_at": isoformat_bj(m.created_at),
         }
         for m in items
     ]

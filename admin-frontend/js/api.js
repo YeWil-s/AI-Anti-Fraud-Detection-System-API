@@ -1,18 +1,45 @@
+import { API_BASE } from './api-config.js';
+
 const api = axios.create({
-    baseURL: 'http://localhost:8000/api',
+    baseURL: API_BASE,
     timeout: 10000
 });
 
-// 响应拦截
+api.interceptors.request.use(config => {
+    const url = config.url || '';
+    if (url.includes('/admin/login') || url.includes('/admin/register')) return config;
+    const token = localStorage.getItem('admin_token');
+    if (token && url.startsWith('/admin')) {
+        config.headers = config.headers || {};
+        config.headers.Authorization = `Bearer ${token}`;
+    }
+    return config;
+});
+
 api.interceptors.response.use(
     res => res.data,
     err => {
-        ElementPlus.ElMessage.error(err.response?.data?.detail || '请求失败，请检查后端服务');
+        const status = err.response?.status;
+        const reqUrl = err.config?.url || '';
+        if (status === 401) {
+            if (!reqUrl.includes('/admin/login') && !reqUrl.includes('/admin/register')) {
+                localStorage.removeItem('admin_token');
+                if (typeof location !== 'undefined' && !String(location.hash || '').includes('/login')) {
+                    location.hash = '#/login';
+                }
+            }
+            ElementPlus.ElMessage.error(err.response?.data?.detail || '未授权，请重新登录');
+        } else {
+            ElementPlus.ElMessage.error(err.response?.data?.detail || '请求失败，请检查后端服务');
+        }
         return Promise.reject(err);
     }
 );
 
 export default {
+    adminLogin: (username, password) => api.post('/admin/login', { username, password }),
+    adminRegister: (payload) => api.post('/admin/register', payload),
+
     // =======================
     // 仪表盘与统计
     // =======================
@@ -51,7 +78,8 @@ export default {
     // 案例上传与管理 (新增)
     // =======================
     uploadCase: (data) => api.post('/admin/cases/upload', data),
-    suggestCaseFields: (content) => api.post('/admin/cases/suggest-fields', { content }),
+    suggestCaseFields: (content) => api.post('/admin/cases/suggest-fields', { content }, { timeout: 45000 }),
+    rewriteCaseNarrative: (content) => api.post('/admin/cases/rewrite-narrative', { content }, { timeout: 45000 }),
     getPendingCases: () => api.get('/admin/cases/pending'),
     getLearnedCases: () => api.get('/admin/cases/learned'),
     getPendingCaseDetail: (filename) => api.get(`/admin/cases/pending/${filename}`),

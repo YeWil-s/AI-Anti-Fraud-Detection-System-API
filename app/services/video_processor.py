@@ -32,6 +32,9 @@ class VideoProcessor:
         self.sequence_length = sequence_length
         # 存储每个用户的视频帧缓冲 (存储的是 cropped face uint8 numpy array)
         self.frame_buffers: Dict[int, deque] = {}
+        # 观测：按用户统计 process_frame 状态与连续 skip
+        self.status_counters: Dict[int, Dict[str, int]] = {}
+        self.consecutive_skip_counts: Dict[int, int] = {}
         
         # MediaPipe Face Mesh：稠密关键点，适合正脸裁剪；侧脸/小脸/运动模糊时易漏检
         self.mp_face_mesh = mp.solutions.face_mesh
@@ -54,12 +57,16 @@ class VideoProcessor:
         处理单个视频帧: 解码 -> 人脸裁剪 -> 存入缓冲 -> (满) -> 返回Base64列表
         """
         try:
+            if user_id not in self.status_counters:
+                self.status_counters[user_id] = {"skip": 0, "buffering": 0, "ready": 0, "error": 0}
+
             # 1. 解码 Base64 -> Image
             frame_bytes = base64.b64decode(frame_data)
             nparr = np.frombuffer(frame_bytes, np.uint8)
             img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
             
             if img is None:
+                self.status_counters[user_id]["error"] += 1
                 logger.warning(f"Invalid frame data received (User: {user_id})")
                 return {"status": "error", "message": "Invalid frame data"}
             
@@ -68,6 +75,15 @@ class VideoProcessor:
             face_img = self._extract_face_image(img)
             
             if face_img is None:
+                self.status_counters[user_id]["skip"] += 1
+                self.consecutive_skip_counts[user_id] = self.consecutive_skip_counts.get(user_id, 0) + 1
+                skip_count = self.consecutive_skip_counts[user_id]
+                # 降低噪声：前几次和每 30 次输出一次
+                if skip_count <= 5 or skip_count % 30 == 0:
+                    logger.info(
+                        f"Video frame skipped (no face). user={user_id}, "
+                        f"consecutive_skip={skip_count}, total_skip={self.status_counters[user_id]['skip']}"
+                    )
                 return {
                     "status": "skip", 
                     "message": "No face detected",
@@ -79,11 +95,13 @@ class VideoProcessor:
                 self.frame_buffers[user_id] = deque(maxlen=self.sequence_length)
             
             self.frame_buffers[user_id].append(face_img)
+            self.consecutive_skip_counts[user_id] = 0
 
             # 4. 判断是否满足推理条件
             current_len = len(self.frame_buffers[user_id])
             
             if current_len == self.sequence_length:
+                self.status_counters[user_id]["ready"] += 1
                 # [优化关键] 缓冲区满，将 10 张人脸图片编码为 JPG Base64 列表
                 # 这样传给 Celery/Redis 的数据量极小 (从 6MB -> 200KB)
                 face_batch_base64 = []
@@ -92,6 +110,11 @@ class VideoProcessor:
                     face_resized = cv2.resize(face, settings.VIDEO_INPUT_SIZE, interpolation=cv2.INTER_AREA)
                     _, buffer = cv2.imencode(".jpg", face_resized, _VIDEO_JPEG_PARAMS)
                     face_batch_base64.append(base64.b64encode(buffer).decode("utf-8"))
+
+                logger.info(
+                    f"Video frame status=ready, user={user_id}, "
+                    f"ready_count={self.status_counters[user_id]['ready']}, seq_len={self.sequence_length}"
+                )
                 
                 return {
                     "status": "ready",
@@ -102,6 +125,12 @@ class VideoProcessor:
                 }
             
             # 缓冲区未满，继续积攒
+            self.status_counters[user_id]["buffering"] += 1
+            if current_len == 1 or current_len == self.sequence_length - 1:
+                logger.info(
+                    f"Video frame status=buffering, user={user_id}, current_len={current_len}, "
+                    f"target_len={self.sequence_length}, buffering_count={self.status_counters[user_id]['buffering']}"
+                )
             return {
                 "status": "buffering", 
                 "current_len": current_len,
@@ -110,6 +139,9 @@ class VideoProcessor:
             }
             
         except Exception as e:
+            if user_id not in self.status_counters:
+                self.status_counters[user_id] = {"skip": 0, "buffering": 0, "ready": 0, "error": 0}
+            self.status_counters[user_id]["error"] += 1
             logger.error(f"Process frame failed: {e}", exc_info=True)
             return {
                 "status": "error",
@@ -199,6 +231,9 @@ class VideoProcessor:
             img_bytes = base64.b64decode(b64_str)
             nparr = np.frombuffer(img_bytes, np.uint8)
             face_img = cv2.imdecode(nparr, cv2.IMREAD_COLOR) # BGR
+            if face_img is None:
+                logger.warning("Video preprocess: failed to decode face frame, skipping one frame")
+                continue
             
             # 2. Resize (再次确保尺寸正确)
             face_resized = cv2.resize(face_img, settings.VIDEO_INPUT_SIZE)
@@ -218,6 +253,8 @@ class VideoProcessor:
             processed_faces.append(face_chw)
             
         # 5. Stack -> (Seq, 3, H, W)
+        if not processed_faces:
+            raise ValueError("Video preprocess got no valid frames")
         seq_array = np.array(processed_faces)
         
         # 6. Add Batch Dim -> (1, Seq, 3, H, W)
@@ -270,3 +307,7 @@ class VideoProcessor:
     def clear_buffer(self, user_id: int):
         if user_id in self.frame_buffers:
             del self.frame_buffers[user_id]
+        if user_id in self.consecutive_skip_counts:
+            del self.consecutive_skip_counts[user_id]
+        if user_id in self.status_counters:
+            del self.status_counters[user_id]

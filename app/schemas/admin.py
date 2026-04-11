@@ -90,3 +90,30 @@ class BlacklistResponse(BlacklistBase):
 
     class Config:
         from_attributes = True
+
+
+class AdminLoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+class AdminRegisterRequest(BaseModel):
+    username: str
+    password: str
+    register_secret: str
+
+
+class AdminInfoBrief(BaseModel):
+    admin_id: int
+    username: str
+    role: str
+    name: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+
+class AdminTokenResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    admin: AdminInfoBrief

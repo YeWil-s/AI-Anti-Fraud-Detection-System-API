@@ -167,6 +167,48 @@ body { margin: 0; font-family: 'PingFang SC', sans-serif; background: #f3f4f6; }
     }
 }
 
+/* 管理员登录页 */
+.admin-login-wrap {
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: linear-gradient(145deg, #1f2937 0%, #312e81 50%, #1e1b4b 100%);
+    padding: 24px;
+}
+.admin-login-card {
+    width: 100%;
+    max-width: 400px;
+    background: #fff;
+    border-radius: 12px;
+    padding: 32px 28px 36px;
+    box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.35);
+}
+.admin-login-title {
+    font-size: 22px;
+    font-weight: 700;
+    color: #111827;
+    text-align: center;
+    margin-bottom: 8px;
+}
+.admin-login-title i {
+    margin-right: 8px;
+    color: #4f46e5;
+    vertical-align: middle;
+}
+.admin-login-sub {
+    font-size: 13px;
+    color: #6b7280;
+    text-align: center;
+    margin: 0 0 16px;
+}
+.admin-login-tabs.el-tabs {
+    --el-tabs-header-height: 44px;
+}
+.admin-login-tabs .el-tabs__header {
+    margin-bottom: 0;
+}
+
 /* 手机适配 */
 @media (max-width: 768px) {
     .el-aside.sidebar {

@@ -1,0 +1,16 @@
+.git
+.gitignore
+**/__pycache__
+**/*.pyc
+**/.pytest_cache
+venv
+.env
+.env.*
+!.env.example
+*.md
+!README.md
+admin-frontend/node_modules
+.pytest_cache
+.mypy_cache
+benchmark_*.json
+# models/ 目录需打入镜像（含 .pth / onnx 等），勿在此排除

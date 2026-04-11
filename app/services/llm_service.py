@@ -121,6 +121,7 @@ class LLMService:
                 "call_type": "普通文本对话",
                 "context": context,
                 "chat_history": chat_history,
+                "long_term_memory": "",
                 "user_input": user_input,
                 "audio_conf": "0.0000",
                 "text_conf": "0.0000",
@@ -652,4 +653,31 @@ class LLMService:
                 "analysis": "大模型全局复盘分析生成失败，请参考实时检测记录。",
                 "advice": "系统暂无额外建议。"
             }
+
+    async def rewrite_case_narrative(self, raw_text: str) -> str:
+        """
+        将检测原文改写为适合案例入库的叙事体，仅描述事件经过，不包含分数或技术指标。
+        """
+        text = (raw_text or "").strip()
+        if not text:
+            return ""
+
+        system_prompt = """你是反诈案例写作助手。请将输入内容改写为“案例描述”风格，要求：
+1. 只描述发生了什么，按时间或逻辑顺序叙述；
+2. 不要输出任何分数、置信度、概率、百分比、打分、模型名称或技术指标；
+3. 不要使用“系统判定/AI判断为xx分”等表达；
+4. 语言简洁客观，长度控制在120-220字；
+5. 直接输出最终文本，不要标题，不要列表，不要Markdown。"""
+
+        messages = [
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=f"请改写以下内容：\n{text}")
+        ]
+        try:
+            llm = self._create_llm()
+            response = await llm.ainvoke(messages)
+            return str(response.content or "").strip()
+        except Exception as e:
+            logger.error(f"案例改写失败: {e}", exc_info=True)
+            return text
 llm_service = LLMService()

@@ -4,6 +4,7 @@ import json
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Tuple
+from app.core.time_utils import now_bj
 
 
 class PolicyRepository:
@@ -30,10 +31,10 @@ class PolicyRepository:
         return data, "legacy-q-table"
 
     def save_policy(self, policy: Dict[str, int], metadata: Dict[str, Any] | None = None) -> str:
-        version = f"policy-{datetime.now().strftime('%Y%m%d%H%M%S')}"
+        version = f"policy-{now_bj().strftime('%Y%m%d%H%M%S')}"
         payload = {
             "version": version,
-            "created_at": datetime.now().isoformat(),
+            "created_at": now_bj().isoformat(),
             "state_schema_version": "v2",
             "policy": policy,
             "metadata": metadata or {},

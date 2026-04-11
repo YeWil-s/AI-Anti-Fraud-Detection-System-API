@@ -4,8 +4,9 @@ app/api/admin.py
 """
 import os
 import json
-from datetime import datetime, timedelta
-from fastapi import APIRouter, Depends, HTTPException, Query
+from secrets import compare_digest
+from datetime import datetime, timedelta, timezone
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, delete, desc
 from typing import List, Optional
@@ -20,12 +21,17 @@ from app.models.admin import Admin, AdminLog, SystemMonitor
 from app.schemas.admin import (
     RiskRuleCreate, RiskRuleUpdate, RiskRuleResponse,
     BlacklistCreate, BlacklistUpdate, BlacklistResponse,
-    CaseUploadRequest, DashboardStats, TrendData
+    CaseUploadRequest, DashboardStats, TrendData,
+    AdminLoginRequest, AdminRegisterRequest, AdminTokenResponse, AdminInfoBrief,
 )
+from app.core.config import settings
+from app.core.security import verify_password, get_password_hash, create_access_token, get_current_admin_id
 from app.core.logger import get_logger
+from app.core.time_utils import now_bj, isoformat_bj, BEIJING_TZ
 from app.services.llm_service import llm_service
 
-router = APIRouter()
+auth_router = APIRouter()
+protected_router = APIRouter(dependencies=[Depends(get_current_admin_id)])
 logger = get_logger(__name__)
 
 # 基础目录配置
@@ -33,10 +39,70 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__fil
 PENDING_DIR = os.path.join(BASE_DIR, "data", "pending_cases")
 LEARNED_DIR = os.path.join(BASE_DIR, "data", "learned_cases")
 
+
+@auth_router.post("/login", response_model=AdminTokenResponse, summary="管理员登录")
+async def admin_login(
+    body: AdminLoginRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(select(Admin).where(Admin.username == body.username))
+    admin = result.scalar_one_or_none()
+    if not admin or not verify_password(body.password, admin.password_hash):
+        raise HTTPException(status_code=401, detail="用户名或密码错误")
+    if not admin.is_active:
+        raise HTTPException(status_code=403, detail="账号已禁用")
+    admin.last_login = datetime.now(timezone.utc)
+    if request.client:
+        admin.login_ip = request.client.host
+    await db.commit()
+    await db.refresh(admin)
+    access_token = create_access_token(
+        {
+            "sub": str(admin.admin_id),
+            "typ": "admin",
+            "username": admin.username,
+            "role": admin.role or "admin",
+        }
+    )
+    return AdminTokenResponse(
+        access_token=access_token,
+        admin=AdminInfoBrief.model_validate(admin),
+    )
+
+
+@auth_router.post("/register", summary="管理员注册（需管理员密钥）")
+async def admin_register(body: AdminRegisterRequest, db: AsyncSession = Depends(get_db)):
+    try:
+        secret_ok = compare_digest(body.register_secret, settings.ADMIN_REGISTER_SECRET)
+    except ValueError:
+        secret_ok = False
+    if not secret_ok:
+        raise HTTPException(status_code=403, detail="管理员密钥错误")
+    username = (body.username or "").strip()
+    if len(username) < 2:
+        raise HTTPException(status_code=400, detail="用户名至少 2 个字符")
+    if len(body.password) < 6:
+        raise HTTPException(status_code=400, detail="密码至少 6 位")
+    result = await db.execute(select(Admin).where(Admin.username == username))
+    if result.scalar_one_or_none() is not None:
+        raise HTTPException(status_code=400, detail="用户名已存在")
+    admin = Admin(
+        username=username,
+        password_hash=get_password_hash(body.password),
+        role="admin",
+        is_active=True,
+    )
+    db.add(admin)
+    await db.commit()
+    await db.refresh(admin)
+    return {"message": "注册成功", "admin": AdminInfoBrief.model_validate(admin)}
+
+
 # =======================
 # 1. 仪表盘数据统计 (增强版)
 # =======================
-@router.get("/stats", summary="获取仪表盘统计数据")
+@protected_router.get("/stats", summary="获取仪表盘统计数据")
 async def get_admin_stats(db: AsyncSession = Depends(get_db)):
     # 1. 总用户数
     result = await db.execute(select(func.count(User.user_id)))
@@ -61,7 +127,7 @@ async def get_admin_stats(db: AsyncSession = Depends(get_db)):
     rule_count = result.scalar() or 0
     
     # 6. 今日新增用户
-    today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    today = now_bj().replace(hour=0, minute=0, second=0, microsecond=0)
     result = await db.execute(
         select(func.count(User.user_id)).where(User.created_at >= today)
     )
@@ -105,7 +171,7 @@ async def get_admin_stats(db: AsyncSession = Depends(get_db)):
     }
 
 
-@router.get("/stats/trends", summary="获取趋势数据")
+@protected_router.get("/stats/trends", summary="获取趋势数据")
 async def get_trend_stats(
     days: int = Query(7, ge=1, le=30),
     db: AsyncSession = Depends(get_db)
@@ -114,7 +180,7 @@ async def get_trend_stats(
     trends = []
     
     for i in range(days - 1, -1, -1):
-        date = datetime.now() - timedelta(days=i)
+        date = now_bj() - timedelta(days=i)
         date_start = date.replace(hour=0, minute=0, second=0, microsecond=0)
         date_end = date.replace(hour=23, minute=59, second=59, microsecond=999999)
         
@@ -153,7 +219,7 @@ async def get_trend_stats(
     return trends
 
 
-@router.get("/stats/fraud-types", summary="获取诈骗类型分布")
+@protected_router.get("/stats/fraud-types", summary="获取诈骗类型分布")
 async def get_fraud_type_stats(db: AsyncSession = Depends(get_db)):
     """获取诈骗类型分布统计 - 基于通话记录的fraud_type字段"""
     # 查询有明确诈骗类型的记录
@@ -180,10 +246,10 @@ async def get_fraud_type_stats(db: AsyncSession = Depends(get_db)):
     return type_stats
 
 
-@router.get("/stats/hourly", summary="获取24小时分布数据")
+@protected_router.get("/stats/hourly", summary="获取24小时分布数据")
 async def get_hourly_stats(db: AsyncSession = Depends(get_db)):
     """获取最近24小时的检测分布"""
-    last_24h = datetime.now() - timedelta(hours=24)
+    last_24h = now_bj() - timedelta(hours=24)
     
     result = await db.execute(
         select(
@@ -205,7 +271,7 @@ async def get_hourly_stats(db: AsyncSession = Depends(get_db)):
 # =======================
 # 2. 功能测试台 (异步重写)
 # =======================
-@router.post("/test/text_match", summary="测试文本规则匹配")
+@protected_router.post("/test/text_match", summary="测试文本规则匹配")
 async def test_text_rule_match(text: str, db: AsyncSession = Depends(get_db)):
     # 获取所有启用规则
     result = await db.execute(select(RiskRule).where(RiskRule.is_active == True))
@@ -238,12 +304,12 @@ async def test_text_rule_match(text: str, db: AsyncSession = Depends(get_db)):
 # =======================
 # 3. 风险规则管理 (异步 CRUD)
 # =======================
-@router.get("/rules", response_model=List[RiskRuleResponse])
+@protected_router.get("/rules", response_model=List[RiskRuleResponse])
 async def get_risk_rules(skip: int = 0, limit: int = 100, db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(RiskRule).offset(skip).limit(limit))
     return result.scalars().all()
 
-@router.post("/rules", response_model=RiskRuleResponse)
+@protected_router.post("/rules", response_model=RiskRuleResponse)
 async def create_risk_rule(rule: RiskRuleCreate, db: AsyncSession = Depends(get_db)):
     # 查重
     result = await db.execute(select(RiskRule).where(RiskRule.keyword == rule.keyword))
@@ -258,7 +324,7 @@ async def create_risk_rule(rule: RiskRuleCreate, db: AsyncSession = Depends(get_
     await db.refresh(db_rule)
     return db_rule
 
-@router.delete("/rules/{rule_id}")
+@protected_router.delete("/rules/{rule_id}")
 async def delete_risk_rule(rule_id: int, db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(RiskRule).where(RiskRule.rule_id == rule_id))
     db_rule = result.scalar_one_or_none()
@@ -273,12 +339,12 @@ async def delete_risk_rule(rule_id: int, db: AsyncSession = Depends(get_db)):
 # =======================
 # 4. 黑名单管理 (异步 CRUD)
 # =======================
-@router.get("/blacklist", response_model=List[BlacklistResponse])
+@protected_router.get("/blacklist", response_model=List[BlacklistResponse])
 async def get_blacklist(skip: int = 0, limit: int = 100, db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(NumberBlacklist).offset(skip).limit(limit))
     return result.scalars().all()
 
-@router.post("/blacklist", response_model=BlacklistResponse)
+@protected_router.post("/blacklist", response_model=BlacklistResponse)
 async def add_blacklist(item: BlacklistCreate, db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(NumberBlacklist).where(NumberBlacklist.number == item.number))
     existing = result.scalar_one_or_none()
@@ -292,7 +358,7 @@ async def add_blacklist(item: BlacklistCreate, db: AsyncSession = Depends(get_db
     await db.refresh(db_item)
     return db_item
 
-@router.delete("/blacklist/{id}")
+@protected_router.delete("/blacklist/{id}")
 async def remove_blacklist(id: int, db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(NumberBlacklist).where(NumberBlacklist.id == id))
     item = result.scalar_one_or_none()
@@ -304,14 +370,13 @@ async def remove_blacklist(id: int, db: AsyncSession = Depends(get_db)):
     await db.commit()
     return {"msg": "Deleted"}
 
-@router.get("/fraud-cases", summary="获取被判定为诈骗的通话记录")
+@protected_router.get("/fraud-cases", summary="获取被判定为诈骗的通话记录")
 async def get_fraud_cases(skip: int = 0, limit: int = 50, db: AsyncSession = Depends(get_db)):
     """
     供管理员审核，获取那些 detected_result 为 FAKE 的高危通话
     """
     result = await db.execute(
-        select(CallRecord, AIDetectionLog)
-        .outerjoin(AIDetectionLog, CallRecord.call_id == AIDetectionLog.call_id)
+        select(CallRecord)
         .where(CallRecord.detected_result == DetectionResult.FAKE)
         .order_by(CallRecord.start_time.desc())
         .offset(skip).limit(limit)
@@ -319,20 +384,18 @@ async def get_fraud_cases(skip: int = 0, limit: int = 50, db: AsyncSession = Dep
     
     # 格式化返回数据，提取有用的信息
     response_data = []
-    for case, ai_log in result.all():
+    for case in result.scalars().all():
         # 适配真实的 CallRecord 字段
         contact_info = case.caller_number or case.target_name or "未知号码"
         
         # 获取AI分析摘要（如果有LLM分析结果）
         details = case.analysis or f"检测到与 {contact_info} 的风险通话"
-        if ai_log and ai_log.overall_score:
-            details = f"[风险评分:{ai_log.overall_score}] {details}"
         
         response_data.append({
             "call_id": case.call_id,
             "user_id": case.user_id,
             "target_number": contact_info,
-            "start_time": case.start_time.isoformat() if case.start_time else None,
+            "start_time": isoformat_bj(case.start_time),
             "duration": case.duration,
             "risk_level": "高危",
             "fraud_type": case.fraud_type or "未分类拦截",  # 使用真实的fraud_type
@@ -340,7 +403,7 @@ async def get_fraud_cases(skip: int = 0, limit: int = 50, db: AsyncSession = Dep
         })
     return response_data
 
-@router.post("/fraud-cases/{call_id}/learn", summary="将案例加入待学习队列")
+@protected_router.post("/fraud-cases/{call_id}/learn", summary="将案例加入待学习队列")
 async def learn_fraud_case(call_id: int, db: AsyncSession = Depends(get_db)):
     """
     管理员核实后，将此记录转换为 JSON 文件，放入 pending_cases 目录
@@ -369,7 +432,7 @@ async def learn_fraud_case(call_id: int, db: AsyncSession = Depends(get_db)):
     # 2. 确定文件保存路径
     os.makedirs(PENDING_DIR, exist_ok=True)
     
-    file_name = f"manual_learn_{call_id}_{datetime.now().strftime('%Y%m%d%H%M%S')}.json"
+    file_name = f"manual_learn_{call_id}_{now_bj().strftime('%Y%m%d%H%M%S')}.json"
     file_path = os.path.join(PENDING_DIR, file_name)
     
     # 3. 写入 JSON 文件
@@ -382,7 +445,7 @@ async def learn_fraud_case(call_id: int, db: AsyncSession = Depends(get_db)):
         raise HTTPException(status_code=500, detail=f"文件生成失败: {str(e)}")
 
 
-@router.post("/fraud-cases/{call_id}/learn-with-edit", summary="编辑并加入待学习队列")
+@protected_router.post("/fraud-cases/{call_id}/learn-with-edit", summary="编辑并加入待学习队列")
 async def learn_fraud_case_with_edit(
     call_id: int,
     data: dict,
@@ -413,12 +476,12 @@ async def learn_fraud_case_with_edit(
         "tags": data.get('tags', []),
         "uploader": data.get('uploader', 'admin'),
         "call_id": call_id,
-        "uploaded_at": datetime.now().isoformat()
+        "uploaded_at": now_bj().isoformat()
     }
     
     # 保存到日期的文件中
     os.makedirs(PENDING_DIR, exist_ok=True)
-    today_str = datetime.now().strftime("%Y%m%d")
+    today_str = now_bj().strftime("%Y%m%d")
     file_name = f"edited_cases_{today_str}.json"
     file_path = os.path.join(PENDING_DIR, file_name)
     
@@ -457,7 +520,7 @@ async def learn_fraud_case_with_edit(
 # =======================
 # 5. 案例上传与管理 (新增功能)
 # =======================
-@router.post("/cases/upload", summary="上传案例到待学习队列")
+@protected_router.post("/cases/upload", summary="上传案例到待学习队列")
 async def upload_case(
     request: CaseUploadRequest,
     db: AsyncSession = Depends(get_db)
@@ -471,7 +534,7 @@ async def upload_case(
         os.makedirs(PENDING_DIR, exist_ok=True)
         
         # 生成文件名 (按日期)
-        today_str = datetime.now().strftime("%Y%m%d")
+        today_str = now_bj().strftime("%Y%m%d")
         file_name = f"uploaded_cases_{today_str}.json"
         file_path = os.path.join(PENDING_DIR, file_name)
         
@@ -481,9 +544,9 @@ async def upload_case(
             "fraud_type": request.fraud_type,
             "risk_level": request.risk_level,
             "content": request.content,
-            "source": request.source or f"用户上传_{datetime.now().strftime('%Y%m%d%H%M%S')}",
+            "source": request.source or f"用户上传_{now_bj().strftime('%Y%m%d%H%M%S')}",
             "tags": request.tags or [],
-            "uploaded_at": datetime.now().isoformat(),
+            "uploaded_at": now_bj().isoformat(),
             "uploader": request.uploader or "anonymous"
         }
         
@@ -520,7 +583,7 @@ async def upload_case(
         raise HTTPException(status_code=500, detail=f"案例上传失败: {str(e)}")
 
 
-@router.post("/cases/suggest-fields", summary="LLM建议案例字段")
+@protected_router.post("/cases/suggest-fields", summary="LLM建议案例字段")
 async def suggest_case_fields(payload: dict):
     """根据案例内容让 LLM 给出字段建议，供前端一键填充。"""
     content = (payload or {}).get("content", "")
@@ -547,7 +610,20 @@ async def suggest_case_fields(payload: dict):
     }
 
 
-@router.get("/cases/pending", summary="获取待学习案例列表")
+@protected_router.post("/cases/rewrite-narrative", summary="LLM改写为案例叙事")
+async def rewrite_case_narrative(payload: dict):
+    """将输入内容改写为案例叙事体，不包含分数与技术指标。"""
+    content = (payload or {}).get("content", "")
+    if not content or not str(content).strip():
+        raise HTTPException(status_code=400, detail="content 不能为空")
+
+    rewritten = await llm_service.rewrite_case_narrative(str(content))
+    return {
+        "content": rewritten
+    }
+
+
+@protected_router.get("/cases/pending", summary="获取待学习案例列表")
 async def get_pending_cases():
     """获取所有待学习的案例文件列表"""
     try:
@@ -571,7 +647,7 @@ async def get_pending_cases():
                 files.append({
                     "filename": filename,
                     "size": stat.st_size,
-                    "modified": datetime.fromtimestamp(stat.st_mtime).isoformat(),
+                    "modified": datetime.fromtimestamp(stat.st_mtime, BEIJING_TZ).isoformat(),
                     "case_count": case_count
                 })
         
@@ -584,7 +660,7 @@ async def get_pending_cases():
         raise HTTPException(status_code=500, detail=f"获取失败: {str(e)}")
 
 
-@router.get("/cases/learned", summary="获取已学习案例列表")
+@protected_router.get("/cases/learned", summary="获取已学习案例列表")
 async def get_learned_cases():
     """获取所有已学习的案例文件列表"""
     try:
@@ -599,7 +675,7 @@ async def get_learned_cases():
                 files.append({
                     "filename": filename,
                     "size": stat.st_size,
-                    "learned_at": datetime.fromtimestamp(stat.st_mtime).isoformat()
+                    "learned_at": datetime.fromtimestamp(stat.st_mtime, BEIJING_TZ).isoformat()
                 })
         
         # 按时间倒序
@@ -611,7 +687,7 @@ async def get_learned_cases():
         raise HTTPException(status_code=500, detail=f"获取失败: {str(e)}")
 
 
-@router.get("/cases/pending/{filename}", summary="获取待学习案例详情")
+@protected_router.get("/cases/pending/{filename}", summary="获取待学习案例详情")
 async def get_pending_case_detail(filename: str):
     """获取指定待学习案例文件的详细内容"""
     try:
@@ -636,7 +712,7 @@ async def get_pending_case_detail(filename: str):
         raise HTTPException(status_code=500, detail=f"读取失败: {str(e)}")
 
 
-@router.delete("/cases/pending/{filename}", summary="删除待学习案例文件")
+@protected_router.delete("/cases/pending/{filename}", summary="删除待学习案例文件")
 async def delete_pending_case(filename: str):
     """删除指定的待学习案例文件"""
     try:
@@ -662,7 +738,7 @@ async def delete_pending_case(filename: str):
 # =======================
 # 6. 系统监控与日志
 # =======================
-@router.get("/system/logs", summary="获取系统操作日志")
+@protected_router.get("/system/logs", summary="获取系统操作日志")
 async def get_system_logs(
     skip: int = 0,
     limit: int = 50,
@@ -686,11 +762,11 @@ async def get_system_logs(
         "resource_id": log.resource_id,
         "details": log.details,
         "ip_address": log.ip_address,
-        "created_at": log.created_at.isoformat() if log.created_at else None
+        "created_at": isoformat_bj(log.created_at)
     } for log in logs]
 
 
-@router.get("/system/health", summary="获取系统健康状态")
+@protected_router.get("/system/health", summary="获取系统健康状态")
 async def get_system_health():
     """获取系统健康状态详情"""
     try:
@@ -708,17 +784,17 @@ async def get_system_health():
             "status": "healthy",
             "pending_cases": pending_count,
             "learned_cases": learned_count,
-            "timestamp": datetime.now().isoformat()
+            "timestamp": now_bj().isoformat()
         }
     except Exception as e:
         return {
             "status": "error",
             "message": str(e),
-            "timestamp": datetime.now().isoformat()
+            "timestamp": now_bj().isoformat()
         }
 
 
-@router.get("/detection/recent", summary="获取最近检测记录")
+@protected_router.get("/detection/recent", summary="获取最近检测记录")
 async def get_recent_detections(
     limit: int = Query(20, ge=1, le=100),
     db: AsyncSession = Depends(get_db)
@@ -741,14 +817,14 @@ async def get_recent_detections(
             "voice_confidence": log.voice_confidence,
             "video_confidence": log.video_confidence,
             "text_confidence": log.text_confidence,
-            "created_at": log.created_at.isoformat() if log.created_at else None,
+            "created_at": isoformat_bj(log.created_at),
             "caller_number": call.caller_number if call else None
         })
     
     return detections
 
 
-@router.get("/calls/recent-summaries", summary="获取最近通话记录与建议")
+@protected_router.get("/calls/recent-summaries", summary="获取最近通话记录与建议")
 async def get_recent_call_summaries(
     limit: int = Query(6, ge=1, le=30),
     db: AsyncSession = Depends(get_db)
@@ -772,8 +848,8 @@ async def get_recent_call_summaries(
             "risk_score": score_map.get(detected_result, 0),
             "analysis": call.analysis or "",
             "advice": call.advice or "建议保持警惕，勿转账、勿透露验证码。",
-            "created_at": call.start_time.isoformat() if call.start_time else (
-                call.created_at.isoformat() if call.created_at else None
+            "created_at": isoformat_bj(call.start_time) if call.start_time else (
+                isoformat_bj(call.created_at) if call.created_at else None
             )
         })
 
@@ -783,7 +859,7 @@ async def get_recent_call_summaries(
 # =======================
 # 7. 用户管理
 # =======================
-@router.get("/users", summary="获取用户列表")
+@protected_router.get("/users", summary="获取用户列表")
 async def get_users(
     skip: int = 0,
     limit: int = 100,
@@ -811,11 +887,11 @@ async def get_users(
         "family_id": u.family_id,
         "is_active": u.is_active,
         "is_admin": u.is_admin,
-        "created_at": u.created_at.isoformat() if u.created_at else None
+        "created_at": isoformat_bj(u.created_at)
     } for u in users]
 
 
-@router.get("/users/{user_id}", summary="获取用户详情")
+@protected_router.get("/users/{user_id}", summary="获取用户详情")
 async def get_user_detail(user_id: int, db: AsyncSession = Depends(get_db)):
     """获取单个用户详情"""
     result = await db.execute(select(User).where(User.user_id == user_id))
@@ -837,11 +913,11 @@ async def get_user_detail(user_id: int, db: AsyncSession = Depends(get_db)):
         "family_id": user.family_id,
         "is_active": user.is_active,
         "is_admin": user.is_admin,
-        "created_at": user.created_at.isoformat() if user.created_at else None
+        "created_at": isoformat_bj(user.created_at)
     }
 
 
-@router.put("/users/{user_id}", summary="更新用户信息")
+@protected_router.put("/users/{user_id}", summary="更新用户信息")
 async def update_user(
     user_id: int,
     user_data: dict,
@@ -866,7 +942,7 @@ async def update_user(
     return {"msg": "更新成功"}
 
 
-@router.patch("/users/{user_id}/status", summary="更新用户状态")
+@protected_router.patch("/users/{user_id}/status", summary="更新用户状态")
 async def update_user_status(
     user_id: int,
     status_data: dict,
@@ -887,7 +963,7 @@ async def update_user_status(
     return {"msg": "状态更新成功", "is_active": user.is_active}
 
 
-@router.delete("/users/{user_id}", summary="删除用户")
+@protected_router.delete("/users/{user_id}", summary="删除用户")
 async def delete_user(user_id: int, db: AsyncSession = Depends(get_db)):
     """删除用户"""
     result = await db.execute(select(User).where(User.user_id == user_id))
@@ -902,7 +978,7 @@ async def delete_user(user_id: int, db: AsyncSession = Depends(get_db)):
     return {"msg": "删除成功"}
 
 
-@router.get("/users/{user_id}/call-stats", summary="获取用户通话统计")
+@protected_router.get("/users/{user_id}/call-stats", summary="获取用户通话统计")
 async def get_user_call_stats(user_id: int, db: AsyncSession = Depends(get_db)):
     """获取用户的通话统计信息"""
     # 总通话数
@@ -935,7 +1011,7 @@ async def get_user_call_stats(user_id: int, db: AsyncSession = Depends(get_db)):
     }
 
 
-@router.get("/family-groups", summary="获取家庭组列表")
+@protected_router.get("/family-groups", summary="获取家庭组列表")
 async def get_family_groups(
     skip: int = 0,
     limit: int = 100,
@@ -990,13 +1066,13 @@ async def get_family_groups(
                 "primary_admins": primary_count,
                 "secondary_admins": secondary_count
             },
-            "created_at": g.created_at.isoformat() if g.created_at else None
+            "created_at": isoformat_bj(g.created_at)
         })
     
     return {"items": group_list, "total": len(group_list)}
 
 
-@router.get("/family-groups/{family_id}/members", summary="获取家庭组成员列表")
+@protected_router.get("/family-groups/{family_id}/members", summary="获取家庭组成员列表")
 async def get_family_group_members(
     family_id: int,
     db: AsyncSession = Depends(get_db)
@@ -1044,7 +1120,7 @@ async def get_family_group_members(
     }
 
 
-@router.get("/family-stats", summary="获取家庭组统计")
+@protected_router.get("/family-stats", summary="获取家庭组统计")
 async def get_family_stats(
     db: AsyncSession = Depends(get_db)
 ):
@@ -1077,7 +1153,7 @@ async def get_family_stats(
 # 全过程记录接口（管理后台）
 # =======================
 
-@router.get("/call-records/{call_id}/detection-timeline", summary="获取检测时间轴（管理员）")
+@protected_router.get("/call-records/{call_id}/detection-timeline", summary="获取检测时间轴（管理员）")
 async def admin_get_detection_timeline(
     call_id: int,
     db: AsyncSession = Depends(get_db)
@@ -1106,7 +1182,7 @@ async def admin_get_detection_timeline(
     for log in ai_logs:
         timeline.append({
             "time_offset": log.time_offset,
-            "timestamp": log.created_at.isoformat() if log.created_at else None,
+            "timestamp": isoformat_bj(log.created_at),
             "modalities": {
                 "text": {
                     "confidence": log.text_confidence,
@@ -1159,7 +1235,7 @@ def _get_risk_level(score: float) -> str:
 # 用户长期记忆管理接口
 # =======================
 
-@router.get("/users/{user_id}/memories", summary="获取用户长期记忆")
+@protected_router.get("/users/{user_id}/memories", summary="获取用户长期记忆")
 async def get_user_memories(
     user_id: int,
     memory_type: Optional[str] = None,
@@ -1182,14 +1258,14 @@ async def get_user_memories(
                 "content": m.content,
                 "importance": m.importance,
                 "source_call_id": m.source_call_id,
-                "created_at": m.created_at.isoformat() if m.created_at else None
+                "created_at": isoformat_bj(m.created_at)
             }
             for m in memories
         ]
     }
 
 
-@router.post("/users/{user_id}/memories", summary="添加用户长期记忆")
+@protected_router.post("/users/{user_id}/memories", summary="添加用户长期记忆")
 async def add_user_memory(
     user_id: int,
     memory_type: str = Query(..., description="记忆类型: fraud_experience/alert_response/preference/risk_pattern"),
@@ -1218,7 +1294,7 @@ async def add_user_memory(
         return {"code": 200, "message": "相似记忆已存在，无需重复添加"}
 
 
-@router.delete("/memories/{memory_id}", summary="删除长期记忆")
+@protected_router.delete("/memories/{memory_id}", summary="删除长期记忆")
 async def delete_memory(
     memory_id: int,
     db: AsyncSession = Depends(get_db)
@@ -1243,7 +1319,7 @@ async def delete_memory(
     return {"code": 200, "message": "记忆删除成功"}
 
 
-@router.get("/users/{user_id}/memory-summary", summary="获取用户记忆摘要")
+@protected_router.get("/users/{user_id}/memory-summary", summary="获取用户记忆摘要")
 async def get_user_memory_summary(
     user_id: int,
     db: AsyncSession = Depends(get_db)
@@ -1269,7 +1345,7 @@ async def get_user_memory_summary(
     }
 
 
-@router.post("/users/{user_id}/refresh-memory-summary", summary="刷新用户记忆摘要")
+@protected_router.post("/users/{user_id}/refresh-memory-summary", summary="刷新用户记忆摘要")
 async def refresh_memory_summary(
     user_id: int,
     db: AsyncSession = Depends(get_db)
@@ -1286,7 +1362,7 @@ async def refresh_memory_summary(
     }
 
 
-@router.get("/call-records/{call_id}/chat-history", summary="获取对话历史（管理员）")
+@protected_router.get("/call-records/{call_id}/chat-history", summary="获取对话历史（管理员）")
 async def admin_get_chat_history(
     call_id: int,
     db: AsyncSession = Depends(get_db)
@@ -1321,14 +1397,14 @@ async def admin_get_chat_history(
                 "sequence": m.sequence,
                 "speaker": m.speaker,
                 "content": m.content,
-                "timestamp": m.timestamp.isoformat() if m.timestamp else None
+                "timestamp": isoformat_bj(m.timestamp)
             }
             for m in messages
         ]
     }
 
 
-@router.get("/detection/{log_id}/evidence", summary="获取检测证据详情（管理员）")
+@protected_router.get("/detection/{log_id}/evidence", summary="获取检测证据详情（管理员）")
 async def admin_get_evidence_detail(
     log_id: int,
     db: AsyncSession = Depends(get_db)
@@ -1347,7 +1423,7 @@ async def admin_get_evidence_detail(
         "log_id": log.log_id,
         "call_id": log.call_id,
         "time_offset": log.time_offset,
-        "created_at": log.created_at.isoformat() if log.created_at else None,
+        "created_at": isoformat_bj(log.created_at),
         "detection_type": log.detection_type,
         "modalities": {
             "text": {
@@ -1376,3 +1452,8 @@ async def admin_get_evidence_detail(
             "model_version": log.model_version
         }
     }
+
+
+router = APIRouter()
+router.include_router(auth_router)
+router.include_router(protected_router)

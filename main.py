@@ -12,6 +12,7 @@ os.environ["POSTHOG_DISABLED"] = "1"
 os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 os.environ["DISABLE_TELEMETRY"] = "1"
 os.environ["CHROMA_DISABLE_TELEMETRY"] = "true"
+os.environ["TZ"] = "Asia/Shanghai"
 
 # 创建一个模拟的telemetry模块，让它返回可调用对象
 class MockTelemetry:

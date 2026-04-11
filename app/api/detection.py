@@ -23,6 +23,16 @@ from app.schemas import ResponseModel
 from app.core.config import settings
 
 from app.core.redis import get_all_user_preferences, get_redis
+from app.core.time_utils import now_bj
+from app.core.detection_guards import (
+    get_call_env_type,
+    env_type_is_text_chat,
+    is_env_recognition_ready,
+    release_env_classify_inflight,
+    release_ocr_dialogue_inflight,
+    try_acquire_env_classify_inflight,
+    try_acquire_ocr_dialogue_inflight,
+)
 from PIL import Image
 
 # 导入检测任务
@@ -38,6 +48,20 @@ from app.tasks.detection_tasks import (
 router = APIRouter(prefix="/api/detection", tags=["实时检测"])
 logger = get_logger(__name__)
 
+def _safe_duration_seconds(end_time: datetime, start_time: Optional[datetime]) -> int:
+    """兼容 naive/aware 混用，安全计算通话时长。"""
+    if not start_time:
+        return 0
+    end = end_time
+    start = start_time
+    if start.tzinfo and not end.tzinfo:
+        end = end.replace(tzinfo=start.tzinfo)
+    elif not start.tzinfo and end.tzinfo:
+        start = start.replace(tzinfo=end.tzinfo)
+    duration = int((end - start).total_seconds())
+    return duration if duration > 0 else 0
+
+
 async def _can_dispatch_audio_task(user_id: int, call_id: int) -> bool:
     """
     同一用户音频任务节流：
@@ -46,6 +70,10 @@ async def _can_dispatch_audio_task(user_id: int, call_id: int) -> bool:
     """
     redis = await get_redis()
     audio_interval = max(1, int(getattr(settings, "AUDIO_TASK_MIN_INTERVAL_SECONDS", 2)))
+    inflight_ttl = max(
+        30,
+        int(getattr(settings, "AUDIO_TASK_INFLIGHT_TIMEOUT_SECONDS", 120)),
+    )
     text_preempt_window = max(1, int(getattr(settings, "TEXT_PREEMPT_AUDIO_SECONDS", 1)))
 
     # 文本任务优先窗口：若命中则暂不派发音频任务
@@ -53,9 +81,18 @@ async def _can_dispatch_audio_task(user_id: int, call_id: int) -> bool:
     if await redis.get(text_preempt_key):
         return False
 
+    # 同一通话仅允许 1 个进行中的音频检测任务
+    inflight_key = f"user:{user_id}:call:{call_id}:audio_task_inflight"
+    lock_ok = await redis.set(inflight_key, "1", ex=inflight_ttl, nx=True)
+    if not lock_ok:
+        return False
+
     # 音频最小间隔节流
     audio_guard_key = f"user:{user_id}:call:{call_id}:audio_task_guard"
     ok = await redis.set(audio_guard_key, "1", ex=audio_interval, nx=True)
+    if not ok:
+        # 本次未派发，回收 inflight 锁，避免误阻塞后续任务
+        await redis.delete(inflight_key)
     return bool(ok)
 
 
@@ -100,24 +137,6 @@ def _compress_image_for_ocr(
         return content, "image/jpeg"
 
 
-async def _should_route_dialogue_only(
-    call_id: int, requested_dialogue_only: bool
-) -> bool:
-    """
-    优先使用客户端参数；若未指定 dialogue_only，则根据 Redis 中的环境识别状态自动分流。
-    """
-    if requested_dialogue_only:
-        return True
-
-    try:
-        redis = await get_redis()
-        env_type = await redis.get(f"call:{call_id}:env_type")
-        return bool(env_type)
-    except Exception as e:
-        logger.warning(f"读取环境识别状态失败，按默认流程处理: {e}")
-        return False
-
-
 async def _enforce_image_upload_rate_limit(call_id: int, interval_seconds: float) -> None:
     """按 call_id 进行图片上传限流，避免 OCR 任务排队导致尾延迟放大。"""
     if interval_seconds <= 0:
@@ -140,9 +159,8 @@ async def _fallback_end_call_record(call_id: int) -> None:
         result = await db.execute(select(CallRecord).where(CallRecord.call_id == call_id))
         record = result.scalar_one_or_none()
         if record and record.end_time is None:
-            record.end_time = datetime.now()
-            if record.start_time:
-                record.duration = int((record.end_time - record.start_time).total_seconds())
+            record.end_time = now_bj()
+            record.duration = _safe_duration_seconds(record.end_time, record.start_time)
             await db.commit()
 
 @router.websocket("/ws/{user_id}/{call_id}")
@@ -206,16 +224,23 @@ async def websocket_endpoint(
                 # --- A. 音频处理 ---
                 if msg_type == "audio":
                     if payload:
-                        # 异步投递任务到 Celery（带用户级时间锁 + 文本优先抑制）
-                        if await _can_dispatch_audio_task(user_id, call_id):
-                            detect_audio_task.delay(payload, user_id, call_id)
-                        
-                        # 回复 ACK
-                        await websocket.send_json({
+                        ack_audio: dict = {
                             "type": "ack",
                             "msg_type": "audio",
-                            "timestamp": datetime.now().isoformat()
-                        })
+                            "timestamp": now_bj().isoformat(),
+                        }
+                        if not await is_env_recognition_ready(call_id):
+                            ack_audio["skipped"] = "env_not_ready"
+                        elif await env_type_is_text_chat(call_id):
+                            ack_audio["skipped"] = "text_chat_no_audio"
+                        elif await _can_dispatch_audio_task(user_id, call_id):
+                            detect_audio_task.apply_async(
+                                args=[payload, user_id, call_id],
+                                priority=settings.CELERY_PRIORITY_AUDIO,
+                            )
+                        else:
+                            ack_audio["skipped"] = "rate_limited"
+                        await websocket.send_json(ack_audio)
 
                 # --- B. 视频处理 ---
                 elif msg_type == "video":
@@ -228,7 +253,15 @@ async def websocket_endpoint(
                         logger.info(f"Video batch ready, sending to Celery. User: {user_id}")
                         
                         face_batch = result["celery_payload"]
-                        detect_video_task.delay(face_batch, user_id, call_id)
+                        if await is_env_recognition_ready(call_id):
+                            detect_video_task.apply_async(
+                                args=[face_batch, user_id, call_id],
+                                priority=settings.CELERY_PRIORITY_VIDEO,
+                            )
+                        else:
+                            logger.info(
+                                f"环境识别未完成，跳过视频检测入队 call_id={call_id}"
+                            )
                         
                         local_video_processor.clear_buffer(user_id) 
                         
@@ -240,7 +273,7 @@ async def websocket_endpoint(
                         "type": "ack",
                         "msg_type": "video",
                         "status": result["status"], 
-                        "timestamp": datetime.now().isoformat()
+                        "timestamp": now_bj().isoformat()
                     })
 
                 # --- C. 文本处理 ---
@@ -254,22 +287,27 @@ async def websocket_endpoint(
                     
                     if text_content and len(text_content.strip()) > 1:
                         logger.info(f"Received text (User: {user_id}): {text_content[:20]}...")
-                        # 文本任务抢跑：短时间抑制音频任务派发
-                        await _mark_text_preempt_audio(user_id, call_id)
-                        detect_text_task.delay(text_content, user_id, call_id)
-                        
-                        # 回复 ACK
-                        await websocket.send_json({
+                        ack_text: dict = {
                             "type": "ack",
                             "msg_type": "text",
-                            "timestamp": datetime.now().isoformat()
-                        })
+                            "timestamp": now_bj().isoformat(),
+                        }
+                        if not await is_env_recognition_ready(call_id):
+                            ack_text["skipped"] = "env_not_ready"
+                        else:
+                            # 文本任务抢跑：短时间抑制音频任务派发
+                            await _mark_text_preempt_audio(user_id, call_id)
+                            detect_text_task.apply_async(
+                                args=[text_content, user_id, call_id],
+                                priority=settings.CELERY_PRIORITY_TEXT,
+                            )
+                        await websocket.send_json(ack_text)
 
                 # --- D. 心跳维持 ---
                 elif msg_type == "heartbeat":
                     await websocket.send_json({
                         "type": "heartbeat_ack",
-                        "timestamp": datetime.now().isoformat()
+                        "timestamp": now_bj().isoformat()
                     })
                     
             except json.JSONDecodeError:
@@ -384,9 +422,8 @@ async def upload_image(
         description="为 true 时仅排队增量聊天 OCR（detect_image_dialogue），不再重复做环境分类（detect_image）",
     ),
     current_user_id: int = Depends(get_current_user_id),
-    db: AsyncSession = Depends(get_db),
 ):
-    """上传图片并触发 OCR：默认识别环境；dialogue_only 时仅做通话内增量对话提取与文本检测。"""
+    """上传图片并触发 OCR：默认识别环境；dialogue_only 由服务端根据是否已完成环境识别决定。"""
     allowed_types = ["image/jpeg", "image/png", "image/jpg", "image/webp"]
     if file.content_type not in allowed_types:
         raise HTTPException(
@@ -425,14 +462,47 @@ async def upload_image(
     import base64
 
     image_base64 = base64.b64encode(compressed_content).decode("utf-8")
-    route_dialogue_only = await _should_route_dialogue_only(call_id, dialogue_only)
+    env_ready = await is_env_recognition_ready(call_id)
 
-    if route_dialogue_only:
-        task = detect_image_dialogue_task.delay(image_base64, current_user_id, call_id)
-        msg = "图片上传成功，正在进行增量聊天 OCR（已跳过环境分类）"
+    # 未完成环境识别：仅允许 detect_image；完成后仅允许 detect_image_dialogue（忽略 dialogue_only）
+    if not env_ready:
+        if not await try_acquire_env_classify_inflight(call_id):
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="环境识别任务进行中，请稍后再上传截图",
+            )
+        try:
+            task = detect_image_task.apply_async(
+                args=[image_base64, current_user_id, call_id],
+                priority=settings.CELERY_PRIORITY_IMAGE,
+            )
+        except Exception:
+            await release_env_classify_inflight(call_id)
+            raise
+        msg = "图片上传成功，正在进行截图环境识别（完成后方可进行音视频与文本检测）"
+        route_dialogue_only = False
     else:
-        task = detect_image_task.delay(image_base64, current_user_id, call_id)
-        msg = "图片上传成功，正在进行截图环境识别（文字聊天将另行提取对话并检测）"
+        env_type = await get_call_env_type(call_id)
+        if env_type != "text_chat":
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"当前环境为 {env_type}，不开启 OCR 聊天提取任务",
+            )
+        if not await try_acquire_ocr_dialogue_inflight(call_id):
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="聊天文字提取任务进行中，请待完成后再上传截图",
+            )
+        try:
+            task = detect_image_dialogue_task.apply_async(
+                args=[image_base64, current_user_id, call_id],
+                priority=settings.CELERY_PRIORITY_IMAGE,
+            )
+        except Exception:
+            await release_ocr_dialogue_inflight(call_id)
+            raise
+        msg = "图片上传成功，正在进行增量聊天 OCR"
+        route_dialogue_only = True
 
     return ResponseModel(
         code=200,

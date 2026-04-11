@@ -8,6 +8,7 @@ from app.models.family_group import FamilyGroup, FamilyApplication, FamilyAdmin,
 from app.models.user import User
 from app.schemas import ResponseModel
 from app.core.logger import get_logger
+from app.core.time_utils import now_bj, isoformat_bj
 
 logger = get_logger(__name__)
 router = APIRouter(prefix="/api/family", tags=["家庭组管理"])
@@ -370,16 +371,31 @@ async def get_family_members(
     target_family_id = family_id
     
     if target_family_id is None:
-        # 未传入family_id，使用当前用户的family_id
+        # 普通成员用 users.family_id；监护人可能只在 family_admins 登记，无 users.family_id
         user_result = await db.execute(select(User).where(User.user_id == current_user_id))
         current_user = user_result.scalar_one_or_none()
-        
-        if not current_user or not current_user.family_id:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST, 
-                detail="您还未加入任何家庭组"
+        if not current_user:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="用户不存在")
+
+        if current_user.family_id:
+            target_family_id = current_user.family_id
+        else:
+            managed_result = await db.execute(
+                select(FamilyAdmin.family_id).where(FamilyAdmin.user_id == current_user_id)
             )
-        target_family_id = current_user.family_id
+            managed_ids = [row[0] for row in managed_result.all()]
+            if len(managed_ids) == 1:
+                target_family_id = managed_ids[0]
+            elif len(managed_ids) > 1:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="您管理多个家庭组，请指定 family_id 查询参数",
+                )
+            else:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="您还未加入任何家庭组",
+                )
     else:
         # 传入了family_id，需要验证当前用户是否有权限查看该家庭组
         # 检查当前用户是否是该家庭组的管理员
@@ -702,48 +718,75 @@ async def leave_family_group(
 # =======================
 @router.get("/info", response_model=ResponseModel)
 async def get_family_info(
+    family_id: int = Query(None, description="家庭组ID；监护人未在 users 登记 family_id 时须传入或仅管理一个家庭时可省略"),
     current_user_id: int = Depends(get_current_user_id),
     db: AsyncSession = Depends(get_db)
 ):
-    """获取当前用户所在家庭组的详细信息"""
-    # 1. 查找当前用户
+    """获取当前用户所在家庭组的详细信息（成员以 users.family_id 为准；监护人以 FamilyAdmin 为准）"""
     user_result = await db.execute(select(User).where(User.user_id == current_user_id))
     current_user = user_result.scalar_one_or_none()
-    
-    if not current_user or not current_user.family_id:
-        return ResponseModel(code=400, message="您还未加入任何家庭组")
-    
-    # 2. 获取家庭组信息
+    if not current_user:
+        return ResponseModel(code=404, message="用户不存在")
+
+    target_family_id: int
+    if family_id is not None:
+        if current_user.family_id == family_id:
+            target_family_id = family_id
+        else:
+            fa = await db.execute(
+                select(FamilyAdmin).where(
+                    and_(
+                        FamilyAdmin.user_id == current_user_id,
+                        FamilyAdmin.family_id == family_id,
+                    )
+                )
+            )
+            if not fa.scalar_one_or_none():
+                return ResponseModel(code=403, message="您无权查看该家庭组信息")
+            target_family_id = family_id
+    elif current_user.family_id:
+        target_family_id = current_user.family_id
+    else:
+        managed_result = await db.execute(
+            select(FamilyAdmin.family_id).where(FamilyAdmin.user_id == current_user_id)
+        )
+        managed_ids = [row[0] for row in managed_result.all()]
+        if len(managed_ids) == 1:
+            target_family_id = managed_ids[0]
+        elif len(managed_ids) > 1:
+            return ResponseModel(
+                code=400,
+                message="您管理多个家庭组，请通过 family_id 参数指定要查看的家庭组",
+            )
+        else:
+            return ResponseModel(code=400, message="您还未加入任何家庭组")
+
     family_result = await db.execute(
-        select(FamilyGroup).where(FamilyGroup.id == current_user.family_id)
+        select(FamilyGroup).where(FamilyGroup.id == target_family_id)
     )
     family = family_result.scalar_one_or_none()
-    
+
     if not family:
         return ResponseModel(code=404, message="家庭组不存在")
-    
-    # 3. 获取主管理员信息
+
     admin_result = await db.execute(
         select(User).where(User.user_id == family.admin_id)
     )
     primary_admin = admin_result.scalar_one_or_none()
-    
-    # 4. 统计成员数量
+
     count_result = await db.execute(
-        select(User).where(User.family_id == current_user.family_id)
+        select(User).where(User.family_id == target_family_id)
     )
     members = count_result.scalars().all()
-    
-    # 5. 统计管理员数量
+
     admins_result = await db.execute(
-        select(FamilyAdmin).where(FamilyAdmin.family_id == current_user.family_id)
+        select(FamilyAdmin).where(FamilyAdmin.family_id == target_family_id)
     )
     admins = admins_result.scalars().all()
     primary_count = sum(1 for a in admins if a.admin_role == "primary")
     secondary_count = sum(1 for a in admins if a.admin_role == "secondary")
-    
-    # 6. 获取当前用户在该组的角色
-    my_role = await get_user_family_role(db, current_user_id, current_user.family_id)
+
+    my_role = await get_user_family_role(db, current_user_id, target_family_id)
     
     return ResponseModel(
         code=200,
@@ -751,7 +794,7 @@ async def get_family_info(
         data={
             "family_id": family.id,
             "group_name": family.group_name,
-            "created_at": family.created_at.isoformat() if family.created_at else None,
+            "created_at": isoformat_bj(family.created_at),
             "my_role": my_role or "member",
             "primary_admin": {
                 "user_id": primary_admin.user_id,
@@ -796,7 +839,7 @@ async def get_my_admin_families(
             "group_name": family.group_name,
             "my_role": admin_record.admin_role,
             "member_count": count,
-            "created_at": family.created_at.isoformat() if family.created_at else None
+            "created_at": isoformat_bj(family.created_at)
         })
     
     return ResponseModel(code=200, message="获取成功", data={"items": data})
@@ -854,7 +897,7 @@ async def send_sos_alert(
             "victim_phone": user.phone,
             "call_id": call_id,
             "family_id": user.family_id,
-            "timestamp": datetime.now().isoformat(),
+            "timestamp": now_bj().isoformat(),
             "display_mode": "popup",
             "action": "vibrate",  # 前端执行震动
             "urgency": "high"
@@ -883,7 +926,7 @@ async def send_sos_alert(
         data={
             "notified_count": notified_count,
             "call_id": call_id,
-            "timestamp": datetime.now().isoformat()
+            "timestamp": now_bj().isoformat()
         }
     )
 
@@ -912,27 +955,30 @@ async def remote_intervene(
     from datetime import datetime
     from app.core.config import settings
     
-    # 1. 验证操作者是管理员
+    # 1. 加载操作者（监护人姓名等仅来自 User；family 归属以 FamilyAdmin 为准）
     admin_result = await db.execute(select(User).where(User.user_id == current_user_id))
     admin_user = admin_result.scalar_one_or_none()
     
     if not admin_user:
         raise HTTPException(status_code=404, detail="用户不存在")
     
-    # 2. 验证目标用户与操作者在同一家庭组
+    # 2. 加载被干预用户（普通成员在 users.family_id 登记所属家庭）
     target_result = await db.execute(select(User).where(User.user_id == target_user_id))
     target_user = target_result.scalar_one_or_none()
     
     if not target_user:
         raise HTTPException(status_code=404, detail="目标用户不存在")
     
-    # 3. 权限检查：操作者必须是目标用户所在家庭组的管理员
-    if not admin_user.family_id or admin_user.family_id != target_user.family_id:
-        raise HTTPException(status_code=403, detail="您无权干预该用户")
+    # 3. 权限：被监护人须已加入家庭；操作者须在 FamilyAdmin 中登记为该家庭的管理员（不要求管理员 users.family_id）
+    if not target_user.family_id:
+        raise HTTPException(status_code=403, detail="目标用户未加入家庭组，无法干预")
     
     admin_role_result = await db.execute(
         select(FamilyAdmin).where(
-            and_(FamilyAdmin.user_id == current_user_id, FamilyAdmin.family_id == admin_user.family_id)
+            and_(
+                FamilyAdmin.user_id == current_user_id,
+                FamilyAdmin.family_id == target_user.family_id,
+            )
         )
     )
     admin_role = admin_role_result.scalar_one_or_none()
@@ -949,7 +995,7 @@ async def remote_intervene(
             "from_admin_name": admin_user.name or admin_user.username,
             "target_user_id": target_user_id,
             "message": message,
-            "timestamp": datetime.now().isoformat()
+            "timestamp": now_bj().isoformat()
         }
     }
     
@@ -994,6 +1040,6 @@ async def remote_intervene(
             "action": action,
             "target_user_id": target_user_id,
             "target_user_name": target_user.name or target_user.username,
-            "timestamp": datetime.now().isoformat()
+            "timestamp": now_bj().isoformat()
         }
     )

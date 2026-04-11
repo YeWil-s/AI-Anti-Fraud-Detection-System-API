@@ -25,6 +25,7 @@ from app.core.security import verify_password, get_password_hash, create_access_
 from app.core.sms import verify_sms_code, send_sms_code
 from app.core.email_code import send_email_code, verify_email_code
 from app.core.logger import get_logger, bind_context
+from app.core.time_utils import now_bj
 
 logger = get_logger(__name__)
 
@@ -396,7 +397,7 @@ async def get_user_security_report(
                 "data": {
                     "user_id": user_id,
                     "username": user.username,
-                    "report_generated_at": datetime.now().isoformat(),
+                    "report_generated_at": now_bj().isoformat(),
                     "stats": stats
                 }
             }
@@ -421,7 +422,7 @@ async def get_user_security_report(
                 "data": {
                     "user_id": user_id,
                     "username": user.username,
-                    "report_generated_at": datetime.now().isoformat(),
+                    "report_generated_at": now_bj().isoformat(),
                     "report_content": content_buffer,
                     "stats": stats
                 }
@@ -444,7 +445,7 @@ async def get_user_security_report(
     return {
         "user_id": user_id,
         "username": user.username,
-        "report_generated_at": datetime.now().isoformat(),
+        "report_generated_at": now_bj().isoformat(),
         "report_content": report_markdown,
         "stats": stats
     }
@@ -489,7 +490,7 @@ async def _get_user_call_stats(db: AsyncSession, user_id: int) -> dict:
     suspicious_calls = suspicious_calls_result.scalar() or 0
     
     # 最近7天通话趋势
-    seven_days_ago = datetime.now() - timedelta(days=7)
+    seven_days_ago = now_bj() - timedelta(days=7)
     
     daily_stats_result = await db.execute(
         select(

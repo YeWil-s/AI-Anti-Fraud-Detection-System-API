@@ -465,6 +465,8 @@ export default {
             // 确保数据格式正确
             let data = this.fraudTypeData || [];
             data = data.filter(item => item && item.type && typeof item.value === 'number');
+            // 仅展示数量前 10 的诈骗类型，避免图例过多导致重叠
+            data = data.sort((a, b) => b.value - a.value).slice(0, 10);
             
             if (data.length === 0) {
                 data = [
@@ -478,14 +480,17 @@ export default {
             this.charts.fraudType.setOption({
                 tooltip: { trigger: 'item', formatter: '{b}: {c} ({d}%)' },
                 legend: { 
-                    orient: 'horizontal', 
-                    bottom: '5%',
-                    left: 'center'
+                    type: 'scroll',
+                    orient: 'vertical',
+                    top: 'middle',
+                    right: '4%',
+                    itemGap: 10,
+                    textStyle: { fontSize: 12 }
                 },
                 series: [{
                     type: 'pie',
-                    radius: ['35%', '60%'],
-                    center: ['50%', '45%'],
+                    radius: ['40%', '62%'],
+                    center: ['33%', '50%'],
                     avoidLabelOverlap: false,
                     itemStyle: {
                         borderRadius: 10,

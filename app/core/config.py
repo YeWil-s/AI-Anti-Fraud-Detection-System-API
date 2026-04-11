@@ -30,7 +30,10 @@ class Settings(BaseSettings):
     # JWT配置
     JWT_SECRET_KEY: str = "dev-jwt-secret-key-change-in-production"  
     JWT_ALGORITHM: str = "HS256"
-    ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
+    # 访问令牌有效期（分钟）。默认 30 天；过期后须重新登录。可按需在 .env 中调整。
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24 * 30
+    # 管理员自助注册时须校验的密钥（务必在生产环境改为独立强密钥并通过 .env 配置）
+    ADMIN_REGISTER_SECRET: str = "w5s45w4fs6dv1df5mujkb5xf2b1cxc9ds62"
     
     # 短信服务配置
     SMS_ACCESS_KEY: Optional[str] = None
@@ -48,6 +51,11 @@ class Settings(BaseSettings):
     # Celery配置
     CELERY_BROKER_URL: str = "redis://localhost:6379/1"  
     CELERY_RESULT_BACKEND: str = "redis://localhost:6379/2"  
+    CELERY_TASK_MAX_PRIORITY: int = 9
+    CELERY_PRIORITY_TEXT: int = 9
+    CELERY_PRIORITY_AUDIO: int = 6
+    CELERY_PRIORITY_VIDEO: int = 6
+    CELERY_PRIORITY_IMAGE: int = 7
     
     # AI模型路径 - 音频检测
     VOICE_MODEL_PATH: str = "./models/voice_detection.onnx"  # 旧版ONNX模型（备用）

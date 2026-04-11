@@ -8,6 +8,8 @@ import hashlib
 import re
 from typing import Optional, Dict, List, Set
 import aiohttp
+import cv2
+import numpy as np
 from app.core.config import settings
 from app.core.logger import get_logger
 
@@ -165,6 +167,31 @@ class ImageOCRService:
         except json.JSONDecodeError:
             return None
 
+    @staticmethod
+    def _has_human_face(image_bytes: bytes) -> bool:
+        """使用 OpenCV Haar Cascade 做轻量人脸检测。"""
+        try:
+            arr = np.frombuffer(image_bytes, dtype=np.uint8)
+            img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+            if img is None:
+                return False
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            classifier = cv2.CascadeClassifier(
+                cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+            )
+            if classifier.empty():
+                return False
+            faces = classifier.detectMultiScale(
+                gray,
+                scaleFactor=1.1,
+                minNeighbors=5,
+                minSize=(40, 40),
+            )
+            return len(faces) > 0
+        except Exception as e:
+            logger.warning(f"本地人脸检测失败，回退仅使用多模态分类: {e}")
+            return False
+
     async def classify_screenshot_environment(self, image_bytes: bytes) -> Optional[dict]:
         """
         第一步：仅识别平台、号码/昵称与沟通方式（文字/语音/视频/电话），不提取对话正文。
@@ -175,6 +202,12 @@ class ImageOCRService:
 
         base64_image = self._encode_image(image_bytes)
         system_prompt = """你是通话/聊天截图分析助手。请仅根据界面判断以下信息，不要编造对话内容。
+
+【硬规则（必须遵守）】
+- 如果截图中能看到任意真人人脸（完整/局部都算），直接判定：
+  - platform = "video_call"
+  - communication_mode = "video"
+- 该规则优先级最高，覆盖其他线索。
 
 1. platform（必选）：
    - wechat: 微信界面
@@ -201,34 +234,75 @@ class ImageOCRService:
 }"""
 
         try:
-            content = await self._post_vision_chat(
-                base64_image,
-                system_prompt,
-                "请分析这张截图的平台与沟通方式，只输出 JSON。",
-            )
-            if not content:
-                return None
-            parsed = self._parse_json_object(content)
-            if not parsed:
-                logger.warning(f"环境分类 JSON 解析失败: {content[:200]}")
+            vote_rounds = 5
+            face_detected = self._has_human_face(image_bytes)
+            parsed_candidates: List[dict] = []
+            mode_counts: Dict[str, int] = {}
+            platform_counts: Dict[str, int] = {}
+
+            for i in range(vote_rounds):
+                content = await self._post_vision_chat(
+                    base64_image,
+                    system_prompt,
+                    "请分析这张截图的平台与沟通方式，只输出 JSON。",
+                )
+                if not content:
+                    continue
+                parsed = self._parse_json_object(content)
+                if not parsed:
+                    logger.warning(f"环境分类 JSON 解析失败(第{i+1}次): {content[:200]}")
+                    continue
+
+                platform = (parsed.get("platform") or "other").lower()
+                mode = (parsed.get("communication_mode") or "unknown").lower()
+                if mode not in ("text", "voice", "video", "phone", "unknown"):
+                    mode = "unknown"
+
+                parsed_candidates.append(
+                    {
+                        "platform": platform,
+                        "communication_mode": mode,
+                        "caller_number": parsed.get("caller_number") or "",
+                        "target_name": parsed.get("target_name") or "",
+                    }
+                )
+                mode_counts[mode] = mode_counts.get(mode, 0) + 1
+                platform_counts[platform] = platform_counts.get(platform, 0) + 1
+
+            if not parsed_candidates:
                 return None
 
-            platform = (parsed.get("platform") or "other").lower()
-            mode = (parsed.get("communication_mode") or "unknown").lower()
-            if mode not in ("text", "voice", "video", "phone", "unknown"):
-                mode = "unknown"
+            voted_mode = max(mode_counts.items(), key=lambda kv: kv[1])[0]
+            voted_platform = max(platform_counts.items(), key=lambda kv: kv[1])[0]
+            winner = parsed_candidates[-1]
+            for c in reversed(parsed_candidates):
+                if c["platform"] == voted_platform and c["communication_mode"] == voted_mode:
+                    winner = c
+                    break
+
+            platform = winner["platform"]
+            mode = winner["communication_mode"]
+            caller_number = winner["caller_number"]
+            target_name = winner["target_name"]
+
+            # 本地规则兜底：检测到人脸时强制视为视频通话
+            if face_detected:
+                platform = "video_call"
+                mode = "video"
 
             is_text_chat = mode == "text"
 
             logger.info(
-                f"截图环境分类: platform={platform}, communication_mode={mode}, is_text_chat={is_text_chat}"
+                "截图环境分类(5次投票): "
+                f"platform={platform}, communication_mode={mode}, is_text_chat={is_text_chat}, "
+                f"face_detected={face_detected}, mode_votes={mode_counts}, platform_votes={platform_counts}"
             )
 
             return {
                 "environment": {
                     "platform": platform,
-                    "caller_number": parsed.get("caller_number") or "",
-                    "target_name": parsed.get("target_name") or "",
+                    "caller_number": caller_number,
+                    "target_name": target_name,
                     "communication_mode": mode,
                 },
                 "is_text_chat": is_text_chat,

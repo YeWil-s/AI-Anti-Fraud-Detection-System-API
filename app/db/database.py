@@ -6,6 +6,7 @@ from sqlalchemy.orm import declarative_base
 from sqlalchemy.pool import NullPool 
 from app.core.config import settings
 from app.core.logger import get_logger
+from fastapi import HTTPException
 import sys
 # 初始化模块级 logger
 logger = get_logger(__name__)
@@ -38,6 +39,10 @@ async def get_db():
         try:
             yield session
             await session.commit()
+        except HTTPException:
+            # 业务层 4xx/3xx 控制流，不应记为数据库故障
+            await session.rollback()
+            raise
         except Exception as e:
             # 发生异常回滚前，记录具体的数据库错误堆栈
             logger.error(f"Database transaction failed, rolling back: {e}", exc_info=True)

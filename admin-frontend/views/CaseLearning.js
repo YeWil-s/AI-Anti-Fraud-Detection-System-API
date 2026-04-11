@@ -268,27 +268,49 @@ export default {
             </el-tabs>
 
             <!-- 案例详情对话框 -->
-            <el-dialog v-model="detailDialogVisible" title="案例详情" width="700px">
-                <el-descriptions :column="2" border v-if="currentDetail && currentDetail.length > 0">
-                    <el-descriptions-item label="模态">{{ currentDetail[0].modality }}</el-descriptions-item>
-                    <el-descriptions-item label="诈骗类型">{{ currentDetail[0].fraud_type }}</el-descriptions-item>
-                    <el-descriptions-item label="风险等级">
-                        <el-tag :type="currentDetail[0].risk_level === '高危' ? 'danger' : 'warning'">
-                            {{ currentDetail[0].risk_level }}
-                        </el-tag>
-                    </el-descriptions-item>
-                    <el-descriptions-item label="来源">{{ currentDetail[0].source }}</el-descriptions-item>
-                    <el-descriptions-item label="标签" :span="2">
-                        <el-tag v-for="tag in currentDetail[0].tags" :key="tag" style="margin-right: 5px;">{{ tag }}</el-tag>
-                    </el-descriptions-item>
-                    <el-descriptions-item label="内容" :span="2">
-                        <div style="white-space: pre-wrap; background: #f5f7fa; padding: 10px; border-radius: 4px;">
-                            {{ currentDetail[0].content }}
-                        </div>
-                    </el-descriptions-item>
-                    <el-descriptions-item label="上传时间">{{ formatTime(currentDetail[0].uploaded_at) }}</el-descriptions-item>
-                    <el-descriptions-item label="上传者">{{ currentDetail[0].uploader }}</el-descriptions-item>
-                </el-descriptions>
+            <el-dialog v-model="detailDialogVisible" title="案例详情" width="900px">
+                <el-table
+                    v-if="currentDetail && currentDetail.length > 0"
+                    :data="currentDetail"
+                    border
+                    stripe
+                    max-height="520">
+                    <el-table-column type="index" label="#" width="55" align="center"></el-table-column>
+                    <el-table-column prop="modality" label="模态" width="90" align="center"></el-table-column>
+                    <el-table-column prop="fraud_type" label="诈骗类型" width="150" align="center"></el-table-column>
+                    <el-table-column prop="risk_level" label="风险等级" width="100" align="center">
+                        <template #default="scope">
+                            <el-tag :type="scope.row.risk_level === '高危' ? 'danger' : (scope.row.risk_level === '中危' ? 'warning' : 'success')">
+                                {{ scope.row.risk_level || '-' }}
+                            </el-tag>
+                        </template>
+                    </el-table-column>
+                    <el-table-column prop="source" label="来源" min-width="180"></el-table-column>
+                    <el-table-column label="标签" width="170">
+                        <template #default="scope">
+                            <el-tag
+                                v-for="tag in (Array.isArray(scope.row.tags) ? scope.row.tags : [])"
+                                :key="tag"
+                                size="small"
+                                style="margin: 2px 4px 2px 0;">
+                                {{ tag }}
+                            </el-tag>
+                            <span v-if="!Array.isArray(scope.row.tags) || scope.row.tags.length === 0" style="color:#999;">-</span>
+                        </template>
+                    </el-table-column>
+                    <el-table-column prop="content" label="内容" min-width="280">
+                        <template #default="scope">
+                            <div style="white-space: pre-wrap; line-height: 1.5;">{{ scope.row.content || '-' }}</div>
+                        </template>
+                    </el-table-column>
+                    <el-table-column prop="uploaded_at" label="上传时间" width="170">
+                        <template #default="scope">
+                            {{ formatTime(scope.row.uploaded_at) }}
+                        </template>
+                    </el-table-column>
+                    <el-table-column prop="uploader" label="上传者" width="90" align="center"></el-table-column>
+                </el-table>
+                <el-empty v-else description="暂无案例详情"></el-empty>
             </el-dialog>
 
             <!-- 编辑并提交对话框 -->
@@ -341,11 +363,22 @@ export default {
                         />
                     </el-form-item>
                     <el-form-item label="完整内容">
+                        <div style="display:flex; justify-content:flex-end; margin-bottom: 8px;">
+                            <el-button
+                                size="small"
+                                type="primary"
+                                plain
+                                :loading="rewriteLoading"
+                                :disabled="!(editForm.content || editForm.details)"
+                                @click="rewriteEditContentByLLM">
+                                LLM一键改写为案例
+                            </el-button>
+                        </div>
                         <el-input 
                             v-model="editForm.content" 
                             type="textarea" 
                             :rows="6"
-                            placeholder="案例完整内容..."
+                            placeholder="案例完整内容（建议为案例叙事体，仅描述发生了什么）..."
                         />
                     </el-form-item>
                     <el-form-item label="标签">
@@ -382,6 +415,7 @@ export default {
             uploading: false,
             llmFilling: false,
             editLoading: false,
+            rewriteLoading: false,
             cases: [],
             pendingFiles: [],
             learnedFiles: [],
@@ -670,7 +704,8 @@ export default {
         },
         async viewPendingDetail(row) {
             try {
-                this.currentDetail = await api.getPendingCaseDetail(row.filename);
+                const detail = await api.getPendingCaseDetail(row.filename);
+                this.currentDetail = Array.isArray(detail) ? detail : (detail ? [detail] : []);
                 this.detailDialogVisible = true;
             } catch (error) {
                 console.error('获取详情失败:', error);
@@ -702,6 +737,59 @@ export default {
                 tags: ['系统拦截', '高危']
             };
             this.editDialogVisible = true;
+        },
+        async rewriteEditContentByLLM() {
+            const rawText = [this.editForm.content, this.editForm.details]
+                .filter(Boolean)
+                .join('\n')
+                .trim();
+            if (!rawText) {
+                ElementPlus.ElMessage.warning('请先填写或保留原始内容再改写');
+                return;
+            }
+            this.rewriteLoading = true;
+            try {
+                const fallback = await api.suggestCaseFields(rawText);
+                const rewritten = this.buildNarrativeFromSuggestion(rawText, fallback);
+                if (!rewritten) {
+                    ElementPlus.ElMessage.warning('改写结果为空，请稍后重试');
+                    return;
+                }
+                this.editForm.content = rewritten;
+                this.editForm.details = rewritten;
+                ElementPlus.ElMessage.success('已改写为案例叙事文本（不含分数信息）');
+            } catch (error) {
+                console.error('LLM改写失败:', error);
+                if (error?.code === 'ECONNABORTED') {
+                    const localNarrative = this.buildNarrativeFromSuggestion(rawText, {});
+                    if (localNarrative) {
+                        this.editForm.content = localNarrative;
+                        this.editForm.details = localNarrative;
+                        ElementPlus.ElMessage.warning('LLM响应超时，已使用本地规则完成改写');
+                        return;
+                    }
+                }
+                ElementPlus.ElMessage.error(error?.response?.data?.detail || 'LLM改写失败，请稍后重试');
+            } finally {
+                this.rewriteLoading = false;
+            }
+        },
+        buildNarrativeFromSuggestion(rawText, suggestion = {}) {
+            const clean = (txt) => String(txt || '')
+                .replace(/\b\d+(\.\d+)?\s*%/g, '')
+                .replace(/\b\d+(\.\d+)?\s*(分|score|评分|置信度)\b/gi, '')
+                .replace(/(置信度|概率|评分|score|模型|算法|系统判定|AI判断)/gi, '')
+                .replace(/\s+/g, ' ')
+                .trim();
+            const analysis = clean(suggestion.analysis);
+            const advice = clean(suggestion.advice);
+            const source = clean(rawText);
+            const parts = [
+                analysis,
+                source ? `事件经过：${source}` : '',
+                advice ? `风险提示：${advice}` : ''
+            ].filter(Boolean);
+            return parts.join('。').replace(/。{2,}/g, '。');
         },
         async submitEditLearn() {
             this.$refs.editFormRef.validate(async (valid) => {
